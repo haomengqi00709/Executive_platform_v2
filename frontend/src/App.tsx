@@ -179,7 +179,7 @@ function SettingsPage() {
             method: 'POST',
             credentials: 'include',
           });
-          setBotSuccess('Bot connected! You can now chat with Audrey in Microsoft Teams.');
+          setBotSuccess('AI assistant connected! Open Microsoft Teams to start chatting.');
           setBotPolling(false);
           setBotConnecting(false);
           setDeviceCode(null);
@@ -322,26 +322,27 @@ function SettingsPage() {
             <div className="flex items-center gap-3 p-4 bg-emerald-500/8 border border-emerald-500/20 rounded-xl">
               <CheckCircle2 size={18} className="text-emerald-500 shrink-0" />
               <div>
-                <p className="text-sm font-semibold text-emerald-600 dark:text-emerald-400">Audrey is active</p>
+                <p className="text-sm font-semibold text-emerald-600 dark:text-emerald-400">AI assistant connected</p>
                 <p className="text-xs text-executive-muted">
                   {botStatus?.peer_email
-                    ? `Chatting as ${botStatus.peer_email}`
-                    : 'Open Microsoft Teams and start a 1:1 chat with Audrey.'}
+                    ? `Signed in as ${botStatus.peer_email}`
+                    : 'Open Microsoft Teams and start a 1:1 chat with your AI assistant.'}
                 </p>
               </div>
             </div>
             <button
               onClick={disconnectBot}
-              className="self-start text-xs font-mono text-executive-muted hover:text-rose-500 transition-colors"
+              className="self-start flex items-center gap-1.5 px-4 py-2 rounded-lg border border-rose-300 text-rose-500 text-xs font-mono hover:bg-rose-50 dark:hover:bg-rose-950/30 transition-all"
             >
-              Disconnect bot
+              <LogOut size={12} />
+              Disconnect
             </button>
           </div>
         ) : deviceCode ? (
           /* Device code pending state */
           <div className="flex flex-col gap-4">
             <p className="text-sm text-executive-muted">
-              Go to the link below and enter the code to connect Audrey to Teams:
+              Go to the link below and enter the code to connect your AI assistant to Teams:
             </p>
             <a
               href={deviceCode.verification_url}
@@ -385,8 +386,8 @@ function SettingsPage() {
           /* Not connected state */
           <div className="flex flex-col gap-4">
             <p className="text-sm text-executive-muted leading-relaxed">
-              Connect the Audrey bot account to enable two-way AI chat in Microsoft Teams.
-              You'll be asked to sign in as Audrey using a device code.
+              Connect an AI assistant account to enable two-way AI chat in Microsoft Teams.
+              You'll be asked to sign in as the assistant using a device code.
             </p>
             {botError && <ErrorBanner message={botError} />}
             {botSuccess && <SuccessBanner message={botSuccess} />}
@@ -396,7 +397,7 @@ function SettingsPage() {
               className="flex items-center gap-2 self-start px-5 py-2.5 bg-sky-500 text-white rounded-xl text-sm font-semibold hover:bg-sky-400 disabled:opacity-50 transition-all"
             >
               {botConnecting ? <Loader2 size={15} className="animate-spin" /> : <Bot size={15} />}
-              {botConnecting ? 'Starting...' : 'Connect Audrey Bot'}
+              {botConnecting ? 'Starting...' : 'Connect AI Assistant'}
             </button>
           </div>
         )}
