@@ -11,6 +11,7 @@ from pathlib import Path
 from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -560,6 +561,11 @@ def health():
 
 
 # ── Startup ───────────────────────────────────────────────
+
+_frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"
+if _frontend_dist.exists():
+    app.mount("/", StaticFiles(directory=str(_frontend_dist), html=True), name="static")
+
 
 @app.on_event("startup")
 def startup_event():
