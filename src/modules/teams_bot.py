@@ -138,6 +138,11 @@ def _handle_teams_receipt(msg: dict, chat_id: str, graph, ai,
     Returns (reply_str | None, pending_expense | None).
     pending_expense is non-None only when a field-duplicate is detected.
     """
+    # Check for attachment bytes first — no heavy imports until we know there's a receipt
+    img_bytes, mime, filename = _extract_receipt_bytes(msg, chat_id, graph, owner_graph)
+    if not img_bytes:
+        return None, None
+
     import openpyxl
     from datetime import datetime
     from src.modules.m05_expense import (
@@ -161,10 +166,6 @@ def _handle_teams_receipt(msg: dict, chat_id: str, graph, ai,
     dedup_key = f"teams_chat::{msg_id}"
     seen      = _load_seen(seen_file)
     if dedup_key in seen:
-        return None, None
-
-    img_bytes, mime, filename = _extract_receipt_bytes(msg, chat_id, graph, owner_graph)
-    if not img_bytes:
         return None, None
 
     hashes = _load_hashes(hashes_file)
