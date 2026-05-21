@@ -525,6 +525,48 @@ def disable_bot(session: dict = Depends(require_session)):
 
 # ── Graph test endpoint ───────────────────────────────────
 
+@app.get("/api/admin/bot-bindings")
+def admin_bot_bindings(session: dict = Depends(require_session)):
+    sessions_dir = auth.DATA_DIR / "_sessions"
+    results = []
+    for tf in sessions_dir.glob("*.json"):
+        bid = tf.stem
+        bp  = _bot_state_path(bid)
+        if not bp.exists():
+            continue
+        bs        = json.loads(bp.read_text())
+        bot_email = (auth.load_user_tokens(bid) or {}).get("username", "")
+        owner_uid = bs.get("owner_uid")
+        owner_email = ""
+        if owner_uid:
+            ot = auth.load_user_tokens(owner_uid) or {}
+            owner_email = ot.get("username", owner_uid)
+        results.append({
+            "bot_uid":      bid,
+            "bot_email":    bot_email,
+            "enabled":      bs.get("enabled", False),
+            "owner_uid":    owner_uid,
+            "owner_email":  owner_email,
+            "peer_email":   bs.get("peer_email", ""),
+            "last_seen_ts": bs.get("last_seen_ts"),
+        })
+    return results
+
+
+@app.post("/api/admin/bot/unbind/{bot_uid}")
+def admin_unbind_bot(bot_uid: str, session: dict = Depends(require_session)):
+    bp = _bot_state_path(bot_uid)
+    if not bp.exists():
+        raise HTTPException(404, "Bot not found")
+    bs = json.loads(bp.read_text())
+    prev_owner = bs.get("owner_uid")
+    bs.update({"owner_uid": None, "peer_email": None, "chat_id": None, "last_seen_ts": None})
+    _write_json(bp, bs)
+    if prev_owner:
+        _user_bot_link_path(prev_owner).unlink(missing_ok=True)
+    return {"ok": True, "bot_uid": bot_uid, "message": "Bot unbound successfully"}
+
+
 @app.get("/api/test/graph")
 def test_graph(session: dict = Depends(require_session)):
     uid = session["user_id"]
