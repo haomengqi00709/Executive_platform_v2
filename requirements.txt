@@ -6,3 +6,4 @@ requests
 PyJWT
 python-dotenv
 httpx
+apscheduler

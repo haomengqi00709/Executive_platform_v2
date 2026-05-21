@@ -1,0 +1,48 @@
+@import "tailwindcss";
+
+:root {
+  --color-executive-bg: #f8fafc;
+  --color-executive-card: #ffffff;
+  --color-executive-border: #e2e8f0;
+  --color-executive-accent: #10b981;
+  --color-executive-muted: #64748b;
+  --color-executive-text: #0f172a;
+  --executive-grid-dot: #e2e8f0;
+  --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
+}
+
+[data-theme="dark"] {
+  --color-executive-bg: #0c0c0e;
+  --color-executive-card: #151518;
+  --color-executive-border: #232326;
+  --color-executive-accent: #10b981;
+  --color-executive-muted: #71717a;
+  --color-executive-text: #f4f4f5;
+  --executive-grid-dot: #1a1a1c;
+}
+
+@theme {
+  --color-executive-bg: var(--color-executive-bg);
+  --color-executive-card: var(--color-executive-card);
+  --color-executive-border: var(--color-executive-border);
+  --color-executive-accent: var(--color-executive-accent);
+  --color-executive-muted: var(--color-executive-muted);
+  --color-executive-text: var(--color-executive-text);
+  --font-sans: var(--font-sans);
+}
+
+@layer base {
+  body {
+    @apply bg-executive-bg text-executive-text antialiased;
+    font-family: var(--font-sans);
+  }
+}
+
+.glass {
+  @apply bg-executive-card border border-executive-border;
+}
+
+.executive-grid {
+  background-image: radial-gradient(circle at 1px 1px, var(--executive-grid-dot) 1px, transparent 0);
+  background-size: 40px 40px;
+}
