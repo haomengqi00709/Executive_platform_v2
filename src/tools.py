@@ -186,7 +186,7 @@ def search_web(query: str, user_context: str = "") -> str:
     try:
         gc     = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
         result = gc.models.generate_content(
-            model   = "gemini-2.0-flash",
+            model   = "gemini-2.5-flash",
             contents= preamble + "\n" + query,
             config  = types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())],

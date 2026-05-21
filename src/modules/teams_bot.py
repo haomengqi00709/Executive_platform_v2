@@ -266,17 +266,10 @@ def poll_and_reply(bot_state: dict, graph, ai, owner_graph=None,
                    owner_settings_path=None, owner_context_path=None,
                    owner_data_dir=None, bot_state_path=None) -> dict:
     """
-    Poll Teams chat for new messages and process each through the bot graph.
-
-    bot_state contains only activation fields:
-      enabled, is_registered_bot, peer_email, chat_id, owner_uid,
-      last_seen_ts, last_digest_time, digest_snooze_until, last_receipt_scan_time
-
-    All conversation state (pending_draft, pending_expense, chat_history, etc.)
-    lives in the SqliteSaver at .data/{user_id}/bot.sqlite.
+    Poll Teams chat for new messages and reply using Gemini function calling bot.
+    Conversation state (pending_draft, pending_expense, etc.) lives in bot_state.json.
     """
-    from src.bot.state import get_app, get_thread_config
-    from src.bot.events import inject_event
+    from src import bot as _bot
 
     peer_email = bot_state.get("peer_email", "")
     if not peer_email:
@@ -318,31 +311,20 @@ def poll_and_reply(bot_state: dict, graph, ai, owner_graph=None,
     if not new_msgs:
         return bot_state
 
-    # Build LangGraph thread config for this session
-    owner_uid  = bot_state.get("owner_uid") or ""
-    thread_cfg = get_thread_config(
-        chat_id,
-        graph,
-        ai,
-        owner_graph=owner_graph,
-        owner_wiki_dir=owner_wiki_dir,
-        owner_settings=owner_settings,
-        owner_settings_path=owner_settings_path,
-        owner_context_path=owner_context_path,
-        owner_data_dir=owner_data_dir,
-        bot_state_path=bot_state_path,
-    )
-    bot_app = get_app(owner_uid or bot_state.get("owner_uid", ""))
+    owner_uid    = bot_state.get("owner_uid") or ""
+    wiki_dir     = Path(owner_wiki_dir)    if owner_wiki_dir    else None
+    data_dir     = Path(owner_data_dir)    if owner_data_dir    else None
+    settings     = owner_settings or {}
 
     for msg in new_msgs:
         last_seen_ts = msg["createdDateTime"]
 
-        # Receipt attachment: extract, process, inject expense event if duplicate
+        # Receipt attachment handling
         expense_reply, pending_expense = _handle_teams_receipt(
             msg, chat_id, graph, ai, owner_graph, owner_data_dir
         )
         if pending_expense:
-            inject_event(owner_uid, chat_id, "expense_pending", pending_expense)
+            bot_state["pending_expense"] = pending_expense
         if expense_reply is not None:
             graph.send_chat_message(chat_id, expense_reply)
             continue
@@ -355,21 +337,17 @@ def poll_and_reply(bot_state: dict, graph, ai, owner_graph=None,
         print(f"[TeamsBot] {sender}: {text[:80]}")
 
         try:
-            bot_app.invoke(
-                {
-                    "text":    text,
-                    "sender":  sender,
-                    "intent":  None,
-                    "reply":   None,
-                },
-                config=thread_cfg,
+            reply_text, bot_state = _bot.reply(
+                bot_state, text, graph, owner_graph,
+                settings, wiki_dir, data_dir,
             )
+            graph.send_chat_message(chat_id, reply_text)
         except Exception as e:
             import traceback
-            print(f"[TeamsBot] Graph invoke error: {e}")
+            print(f"[TeamsBot] Bot error: {e}")
             traceback.print_exc()
             try:
-                graph.send_chat_message(chat_id, f"Sorry, I hit an error processing that: {e}")
+                graph.send_chat_message(chat_id, f"Sorry, I hit an error: {e}")
             except Exception:
                 pass
 

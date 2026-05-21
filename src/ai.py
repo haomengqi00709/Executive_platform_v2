@@ -11,7 +11,7 @@ load_dotenv(override=True)
 class AIClient:
     def __init__(self):
         self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        self.model = "gemini-2.0-flash"
+        self.model = "gemini-2.5-flash"
 
     def generate(self, prompt: str) -> str:
         for attempt in range(4):

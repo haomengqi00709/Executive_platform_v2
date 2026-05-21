@@ -7,3 +7,6 @@ PyJWT
 python-dotenv
 httpx
 apscheduler
+google-genai
+openpyxl
+pyyaml
