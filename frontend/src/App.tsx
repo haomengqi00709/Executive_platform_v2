@@ -143,7 +143,7 @@ function SettingsPage() {
       if (!r.ok) throw new Error('Failed to start device flow');
       const d = await r.json();
       setDeviceCode(d);
-      pollBotAuth(d.bot_uid);
+      pollBotAuth();
     } catch (e: any) {
       setBotError(e.message || 'Could not start bot authentication');
       setBotConnecting(false);
@@ -152,10 +152,10 @@ function SettingsPage() {
 
   // ── Bot: poll until complete ───────────────────────────────────────────
 
-  const pollBotAuth = useCallback(async (botUid: string) => {
+  const pollBotAuth = useCallback(async () => {
     setBotPolling(true);
     const start = Date.now();
-    const timeout = 5 * 60 * 1000; // 5 min
+    const timeout = 5 * 60 * 1000;
 
     const tick = async () => {
       if (Date.now() - start > timeout) {
@@ -169,13 +169,11 @@ function SettingsPage() {
         const r = await fetch('/api/teams/bot/auth-poll', {
           method: 'POST',
           credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ bot_uid: botUid }),
         });
         const d = await r.json();
-        if (d.status === 'success' || d.connected) {
-          // Activate bot for this user
-          await fetch(`/api/teams/bot/activate?bot_uid=${botUid}`, {
+        if (d.status === 'success') {
+          // Auto-activate: bind the bot account to current user
+          await fetch(`/api/teams/bot/activate?bot_uid=${d.bot_uid}`, {
             method: 'POST',
             credentials: 'include',
           });
