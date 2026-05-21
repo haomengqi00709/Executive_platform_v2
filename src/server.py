@@ -355,6 +355,7 @@ def _send_activation_greeting(bot_uid: str, peer_email: str, display_name: str):
 # ── Teams bot polling (scheduler) ─────────────────────────
 
 def _poll_teams_bot_all_users():
+    from src.modules.teams_bot import poll_and_reply
     sessions_dir = auth.DATA_DIR / "_sessions"
     if not sessions_dir.exists():
         return
@@ -371,26 +372,22 @@ def _poll_teams_bot_all_users():
             graph       = GraphClient(token)
             owner_uid   = state.get("owner_uid") or uid
             owner_settings = _read_json(_user_settings(owner_uid))
+            owner_graph = None
             try:
-                from src.modules.teams_bot import poll_and_reply
-                owner_graph = None
-                try:
-                    owner_graph = GraphClient(auth.get_valid_access_token(owner_uid))
-                except Exception:
-                    pass
-                new_state = poll_and_reply(
-                    state, graph, None,
-                    owner_graph=owner_graph,
-                    owner_wiki_dir=_udir(owner_uid) / "wiki",
-                    owner_settings=owner_settings,
-                    owner_settings_path=_user_settings(owner_uid),
-                    owner_context_path=_udir(owner_uid) / "context.json",
-                    owner_data_dir=_udir(owner_uid),
-                    bot_state_path=path,
-                )
-                path.write_text(json.dumps(new_state, indent=2, ensure_ascii=False))
-            except ImportError:
+                owner_graph = GraphClient(auth.get_valid_access_token(owner_uid))
+            except Exception:
                 pass
+            new_state = poll_and_reply(
+                state, graph, None,
+                owner_graph=owner_graph,
+                owner_wiki_dir=_udir(owner_uid) / "wiki",
+                owner_settings=owner_settings,
+                owner_settings_path=_user_settings(owner_uid),
+                owner_context_path=_udir(owner_uid) / "context.json",
+                owner_data_dir=_udir(owner_uid),
+                bot_state_path=path,
+            )
+            path.write_text(json.dumps(new_state, indent=2, ensure_ascii=False))
         except Exception as e:
             msg = str(e)
             if not any(c in msg for c in ("502", "503", "504", "ConnectionError", "Timeout")):

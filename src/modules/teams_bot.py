@@ -290,13 +290,18 @@ def poll_and_reply(bot_state: dict, graph, ai, owner_graph=None,
     my_id = me.get("id", "")
 
     messages = graph.get_chat_messages(chat_id, top=25)
+    print(f"[TeamsBot] Fetched {len(messages)} msgs | last_seen_ts={last_seen_ts!r} | my_id={my_id!r}")
 
     # First activation: fast-forward past existing messages
     if not last_seen_ts:
         timestamps = [m.get("createdDateTime", "") for m in messages if m.get("createdDateTime")]
         if timestamps:
             bot_state["last_seen_ts"] = max(timestamps)
+        print(f"[TeamsBot] Fast-forward → last_seen_ts={bot_state.get('last_seen_ts')!r}")
         return bot_state
+
+    for m in messages[:5]:
+        print(f"[TeamsBot]   msg type={m.get('messageType')} from={m.get('from',{}).get('user',{}).get('id','?')!r} ts={m.get('createdDateTime','?')!r}")
 
     new_msgs = sorted(
         [
@@ -307,6 +312,7 @@ def poll_and_reply(bot_state: dict, graph, ai, owner_graph=None,
         ],
         key=lambda m: m.get("createdDateTime", ""),
     )
+    print(f"[TeamsBot] {len(new_msgs)} new msgs after filter")
 
     if not new_msgs:
         return bot_state
