@@ -15,8 +15,8 @@ from pathlib import Path
 from google import genai
 from google.genai import types
 
-REPLY_MODEL = "gemini-2.5-pro"
-TOOL_MODEL  = "gemini-2.5-flash"
+REPLY_MODEL = "gemini-3.5-pro"
+TOOL_MODEL  = "gemini-3.5-flash"
 MAX_ROUNDS  = 6
 HISTORY_LIMIT = 20
 
