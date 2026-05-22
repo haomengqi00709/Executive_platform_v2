@@ -132,6 +132,9 @@ def auth_callback(code: str = None, state: str = None, error: str = None,
     resp.set_cookie("session_token", jwt_token, httponly=True, secure=False, max_age=60*60*24*7, samesite="lax")
     resp.delete_cookie("oauth_state")
     resp.delete_cookie("oauth_redirect")
+    if not (_udir(user_id) / "crm.json").exists():
+        threading.Thread(target=_build_crm_for_user, args=(user_id,), daemon=True).start()
+        print(f"[CRM] First login for {user_id} — CRM build started in background")
     return resp
 
 
@@ -205,6 +208,9 @@ def auth_poll(response: Response):
                 jwt_token = auth.create_jwt(user_id, username)
                 response.set_cookie("session_token", jwt_token, httponly=True,
                                     secure=False, max_age=60*60*24*7, samesite="lax")
+                if not (_udir(user_id) / "crm.json").exists():
+                    threading.Thread(target=_build_crm_for_user, args=(user_id,), daemon=True).start()
+                    print(f"[CRM] First login (device code) for {user_id} — CRM build started in background")
             return {"status": "success"}
         except Exception as e:
             msg = str(e)
@@ -220,13 +226,16 @@ def get_settings(request: Request, session: dict = Depends(require_session)):
     uid      = session["user_id"]
     path     = _user_settings(uid)
     settings = _read_json(path)
-    if not settings.get("report_email"):
-        ms_email = (auth.load_user_tokens(uid) or {}).get("username", "")
-        settings.setdefault("report_email", ms_email)
+    ms_email = (auth.load_user_tokens(uid) or {}).get("username", "")
+    if not settings.get("report_email") and ms_email:
+        settings["report_email"] = ms_email
+    if not settings.get("display_name") and ms_email:
+        local = ms_email.split("@")[0]
+        settings["display_name"] = " ".join(p.capitalize() for p in local.replace(".", " ").split())
     tz = request.headers.get("X-Timezone", "").strip()
     if tz and settings.get("timezone") != tz:
         settings["timezone"] = tz
-        _write_json(path, settings)
+    _write_json(path, settings)
     return settings
 
 
@@ -599,6 +608,48 @@ def test_graph(session: dict = Depends(require_session)):
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 
+# ── CRM lifecycle helpers ─────────────────────────────────
+
+def _get_market_segments(uid: str) -> str:
+    return _read_json(_user_settings(uid)).get("business_context", "")
+
+
+def _build_crm_for_user(uid: str) -> None:
+    from src.modules.crm import build_crm, save_crm
+    try:
+        token  = auth.get_valid_access_token(uid)
+        graph  = GraphClient(token)
+        ai     = AIClient()
+        result = build_crm(graph, ai, _udir(uid), market_segments_content=_get_market_segments(uid))
+        save_crm(_udir(uid), result)
+        print(f"[CRM] Initial build done for {uid} — {len(result.get('contacts', {}))} contacts")
+    except Exception as e:
+        print(f"[CRM] Initial build failed for {uid}: {e}")
+
+
+def _refresh_crm_for_user(uid: str) -> None:
+    from src.modules.crm import refresh_crm, save_crm
+    if not (_udir(uid) / "crm.json").exists():
+        return
+    try:
+        token  = auth.get_valid_access_token(uid)
+        graph  = GraphClient(token)
+        ai     = AIClient()
+        result = refresh_crm(graph, ai, _udir(uid), market_segments_content=_get_market_segments(uid))
+        save_crm(_udir(uid), result)
+        print(f"[CRM] Daily refresh done for {uid}")
+    except Exception as e:
+        print(f"[CRM] Daily refresh failed for {uid}: {e}")
+
+
+def _refresh_crm_all_users() -> None:
+    sessions_dir = auth.DATA_DIR / "_sessions"
+    if not sessions_dir.exists():
+        return
+    for f in sessions_dir.glob("*.json"):
+        threading.Thread(target=_refresh_crm_for_user, args=(f.stem,), daemon=True).start()
+
+
 # ── Section registry ─────────────────────────────────────
 # Add entries here as sections are implemented.
 
@@ -830,4 +881,12 @@ def startup_event():
         replace_existing=True,
         max_instances=1,
     )
-    print("[TeamsBot] Polling every 10 seconds")
+    _scheduler.add_job(
+        _refresh_crm_all_users,
+        trigger="cron",
+        hour=6, minute=0,
+        id="crm_daily_refresh",
+        replace_existing=True,
+        max_instances=1,
+    )
+    print("[Scheduler] Teams bot polling every 10s | CRM refresh daily at 06:00 UTC")
