@@ -1,31 +1,38 @@
 """
-Bot — Gemini 2.5 Pro with native function calling.
-Replaces LangGraph StateGraph entirely.
+Bot — Gemini function calling orchestrator.
 
-Entry point: reply(state, text, graph, owner_graph, settings, wiki_dir, data_dir)
+Entry point: reply(state, text, graph, owner_graph, settings, wiki_dir, data_dir, user_model_path)
 Returns: (reply_text, updated_state)
 """
 import json
 import os
 import sqlite3
 import time
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from google import genai
 from google.genai import types
 
-REPLY_MODEL = "gemini-3.5-flash"
-TOOL_MODEL  = "gemini-3.5-flash"
-MAX_ROUNDS  = 6
+MODEL        = "gemini-3.5-flash"
+MAX_ROUNDS   = 8
 HISTORY_LIMIT = 20
+
+SKILL_NAMES = {
+    "morning_briefing":    "Morning Briefing (M01)",
+    "email_intelligence":  "Email Intelligence (M02)",
+    "meeting_intelligence":"Meeting Intelligence (M03)",
+    "business_insights":   "Business Insights (M04)",
+    "expense_capture":     "Expense Capture (M05)",
+}
 
 
 def _client() -> genai.Client:
     return genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 
-# ── Conversation history (plain SQLite) ───────────────────
+# ── Conversation history ───────────────────────────────────
 
 def _load_history(db_path: Path, limit: int = HISTORY_LIMIT) -> list:
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -40,28 +47,41 @@ def _load_history(db_path: Path, limit: int = HISTORY_LIMIT) -> list:
     ).fetchall()
     con.close()
     rows.reverse()
-    contents = []
-    for role, content in rows:
-        contents.append(types.Content(role=role, parts=[types.Part(text=content)]))
-    return contents
+    return [
+        types.Content(role=role, parts=[types.Part(text=content)])
+        for role, content in rows
+    ]
 
 
 def _save_turn(db_path: Path, user_text: str, assistant_text: str):
     con = sqlite3.connect(str(db_path))
     ts = time.time()
-    con.execute(
-        "INSERT INTO history (role, content, ts) VALUES (?, ?, ?)",
-        ("user", user_text, ts),
-    )
-    con.execute(
-        "INSERT INTO history (role, content, ts) VALUES (?, ?, ?)",
-        ("model", assistant_text, ts + 0.001),
-    )
+    con.execute("INSERT INTO history (role, content, ts) VALUES (?, ?, ?)", ("user",  user_text,       ts))
+    con.execute("INSERT INTO history (role, content, ts) VALUES (?, ?, ?)", ("model", assistant_text,  ts + 0.001))
     con.commit()
     con.close()
 
 
-# ── Core reply function ───────────────────────────────────
+# ── User Model (persistent structured preferences) ─────────
+
+def _load_user_model(path: Path) -> dict:
+    if path and path.exists():
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_user_model(path: Path, model: dict):
+    if not path:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    model["updated_at"] = datetime.now(timezone.utc).isoformat()
+    path.write_text(json.dumps(model, indent=2, ensure_ascii=False))
+
+
+# ── Core reply function ────────────────────────────────────
 
 def reply(
     state: dict,
@@ -71,9 +91,11 @@ def reply(
     settings: dict,
     wiki_dir: Path,
     data_dir: Path,
+    user_model_path: Path = None,
 ) -> tuple[str, dict]:
-    db_path = data_dir / "bot_history.db"
-    history = _load_history(db_path)
+    db_path    = data_dir / "bot_history.db"
+    history    = _load_history(db_path)
+    user_model = _load_user_model(user_model_path)
 
     # ── System prompt ──────────────────────────────────────
     display_name     = settings.get("display_name", "the executive")
@@ -81,6 +103,17 @@ def reply(
     timezone_str     = settings.get("timezone", "UTC")
     now_str          = datetime.now(timezone.utc).strftime("%A, %B %d, %Y %H:%M UTC")
     bc_line          = f"\n\nBusiness context: {business_context}" if business_context else ""
+
+    # Inject user model state so AI can answer config questions without tool calls
+    ignored    = user_model.get("ignored_senders", [])
+    rules      = user_model.get("behavioral_rules", [])
+    user_ctx   = ""
+    if ignored or rules:
+        user_ctx  = "\n\nUser preferences (already configured):\n"
+        if ignored:
+            user_ctx += f"- Ignored senders: {', '.join(ignored)}\n"
+        if rules:
+            user_ctx += "- Behavioral rules:\n" + "".join(f"  • {r}\n" for r in rules)
 
     pending_note = ""
     pending_draft   = state.get("pending_draft")
@@ -112,10 +145,13 @@ def reply(
         f"Be concise, professional, and action-oriented. Use bullet points for lists.\n"
         f"When asked about emails, meetings, or contacts — always call the relevant tool first. "
         f"Never invent data. Respond in the same language the user writes in."
+        f"{user_ctx}"
         f"{pending_note}"
     )
 
     # ── Tool definitions ───────────────────────────────────
+
+    # --- Query tools ---
 
     def get_recent_emails(hours_back: int = 48, top: int = 15) -> str:
         """Get emails received in the last N hours. Returns subject, sender, received time, preview, is_read, importance."""
@@ -200,12 +236,55 @@ def reply(
         except Exception as e:
             return f"Error: {e}"
 
+    def get_email_frequency_report(days_back: int = 30, top_n: int = 10) -> str:
+        """Analyze email frequency by sender over the past N days. Shows who you communicate with most."""
+        if owner_graph is None:
+            return "Owner account not available."
+        try:
+            msgs   = owner_graph.get_messages(top=200)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
+            counts: Counter = Counter()
+            for m in msgs:
+                recv = m.get("receivedDateTime", "")
+                try:
+                    dt = datetime.fromisoformat(recv.replace("Z", "+00:00"))
+                    if dt < cutoff:
+                        continue
+                except Exception:
+                    pass
+                sender = m.get("from", {}).get("emailAddress", {}).get("address", "")
+                if sender:
+                    counts[sender] += 1
+            result = [
+                {"email": email, "email_count": count}
+                for email, count in counts.most_common(top_n)
+            ]
+            print(f"[Bot] get_email_frequency_report({days_back}d) → {len(result)} contacts")
+            return json.dumps(result, ensure_ascii=False)
+        except Exception as e:
+            return f"Error: {e}"
+
+    def read_module_result(module_name: str) -> str:
+        """Read the latest cached result for a module. module_name must be one of: m01, m02, m03, m04, m05."""
+        valid = {"m01", "m02", "m03", "m04", "m05"}
+        if module_name not in valid:
+            return f"Invalid module name. Use one of: {', '.join(sorted(valid))}"
+        result_path = data_dir / "results" / f"{module_name}.json"
+        if not result_path.exists():
+            return f"No results for {module_name} yet. Run the skill first with run_skill()."
+        try:
+            data = json.loads(result_path.read_text())
+            print(f"[Bot] read_module_result({module_name})")
+            return json.dumps(data, ensure_ascii=False)
+        except Exception as e:
+            return f"Error reading {module_name}: {e}"
+
     def search_web(query: str) -> str:
         """Search the web for current news, market data, or any information not in the user's inbox/calendar."""
         try:
             client = _client()
             resp   = client.models.generate_content(
-                model=TOOL_MODEL,
+                model=MODEL,
                 contents=query,
                 config=types.GenerateContentConfig(
                     tools=[types.Tool(google_search=types.GoogleSearch())],
@@ -217,10 +296,92 @@ def reply(
         except Exception as e:
             return f"Search error: {e}"
 
+    # --- Config tools ---
+
+    def read_settings(key: str = None) -> str:
+        """Read current settings and user preferences. Optionally pass a key to get one value.
+        Top-level keys include: display_name, business_context, timezone, check_interval_hours.
+        User model keys include: ignored_senders, behavioral_rules, key_relationships."""
+        combined = {**settings, "user_model": user_model}
+        if key:
+            if key in settings:
+                return json.dumps({key: settings[key]}, ensure_ascii=False)
+            if key in user_model:
+                return json.dumps({key: user_model[key]}, ensure_ascii=False)
+            return f"Key '{key}' not found in settings or user model."
+        print(f"[Bot] read_settings()")
+        return json.dumps(combined, ensure_ascii=False)
+
+    def update_setting(key: str, value) -> str:
+        """Update a user preference. Writes to user_model.json.
+        Supported keys: ignored_senders (list of email strings), behavioral_rules (list of rule strings),
+        key_relationships (dict of email→note), check_interval_hours (number), briefing_style (string)."""
+        nonlocal user_model
+        user_model = {**user_model, key: value}
+        _save_user_model(user_model_path, user_model)
+        print(f"[Bot] update_setting({key}={value!r})")
+        return f"✅ Preference updated: {key}"
+
+    def read_skill_instruction(skill_name: str) -> str:
+        """Read the instruction/configuration for a specific skill.
+        skill_name must be one of: morning_briefing, email_intelligence, meeting_intelligence, business_insights, expense_capture."""
+        if skill_name not in SKILL_NAMES:
+            return f"Unknown skill. Available: {', '.join(SKILL_NAMES)}"
+        skill_path = data_dir / "skills" / f"{skill_name}.md"
+        if not skill_path.exists():
+            return f"No instruction file for '{skill_name}' yet. Use update_skill_instruction to create one."
+        print(f"[Bot] read_skill_instruction({skill_name})")
+        return skill_path.read_text()
+
+    def update_skill_instruction(skill_name: str, content: str) -> str:
+        """Update (overwrite) the instruction file for a specific skill. The content is a markdown document
+        describing how the skill should behave. skill_name must be one of: morning_briefing, email_intelligence,
+        meeting_intelligence, business_insights, expense_capture."""
+        if skill_name not in SKILL_NAMES:
+            return f"Unknown skill. Available: {', '.join(SKILL_NAMES)}"
+        skill_dir = data_dir / "skills"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / f"{skill_name}.md").write_text(content)
+        print(f"[Bot] update_skill_instruction({skill_name}) → {len(content)} chars")
+        return f"✅ Skill instruction updated: {skill_name}"
+
+    # --- Trigger tool ---
+
+    def run_skill(skill_name: str) -> str:
+        """Trigger a skill to run immediately in the background. Results appear in the dashboard when done.
+        skill_name must be one of: morning_briefing, email_intelligence, meeting_intelligence, business_insights, expense_capture."""
+        if skill_name not in SKILL_NAMES:
+            return f"Unknown skill. Available: {', '.join(SKILL_NAMES)}"
+
+        MODULE_MAP = {
+            "morning_briefing":    "src.modules.m01_briefing",
+            "email_intelligence":  "src.modules.m02_email",
+            "meeting_intelligence":"src.modules.m03_meeting",
+            "business_insights":   "src.modules.m04_intelligence",
+            "expense_capture":     "src.modules.m05_expense",
+        }
+
+        def _run():
+            import importlib
+            try:
+                mod = importlib.import_module(MODULE_MAP[skill_name])
+                mod.run(owner_graph=owner_graph, data_dir=data_dir, settings=settings)
+            except ModuleNotFoundError:
+                print(f"[Bot] run_skill: {MODULE_MAP[skill_name]} not yet implemented")
+            except Exception as e:
+                print(f"[Bot] run_skill {skill_name} error: {e}")
+
+        import threading
+        threading.Thread(target=_run, daemon=True).start()
+        print(f"[Bot] run_skill({skill_name}) → started")
+        return f"✅ {SKILL_NAMES[skill_name]} is running. Results will appear in your dashboard shortly."
+
+    # --- Action tools (existing) ---
+
     def list_pending_drafts() -> str:
         """List all pending email drafts waiting for approval."""
         nonlocal state
-        queue = list(state.get("pending_queue") or [])
+        queue   = list(state.get("pending_queue") or [])
         current = state.get("pending_draft")
         if not current and not queue:
             return "No pending drafts."
@@ -245,7 +406,7 @@ def reply(
                 subject = draft.get("subject", ""),
                 body    = draft.get("body", ""),
             )
-            queue = list(state.get("pending_queue") or [])
+            queue      = list(state.get("pending_queue") or [])
             next_draft = queue[0] if queue else None
             state = {**state, "pending_draft": next_draft, "pending_queue": queue[1:] if queue else []}
             print(f"[Bot] approve_draft → '{draft.get('subject')}'")
@@ -260,7 +421,7 @@ def reply(
         draft = state.get("pending_draft")
         if not draft:
             return "No pending draft to skip."
-        queue = list(state.get("pending_queue") or [])
+        queue      = list(state.get("pending_queue") or [])
         next_draft = queue[0] if queue else None
         state = {**state, "pending_draft": next_draft, "pending_queue": queue[1:] if queue else []}
         print(f"[Bot] skip_draft → '{draft.get('subject')}'")
@@ -301,10 +462,21 @@ def reply(
         return "Expense discarded."
 
     all_tools = [
+        # Query
         get_recent_emails,
         get_upcoming_meetings,
         get_contact_history,
+        get_email_frequency_report,
+        read_module_result,
         search_web,
+        # Config
+        read_settings,
+        update_setting,
+        read_skill_instruction,
+        update_skill_instruction,
+        # Trigger
+        run_skill,
+        # Action
         list_pending_drafts,
         approve_draft,
         skip_draft,
@@ -320,7 +492,7 @@ def reply(
     final_text = ""
     for _ in range(MAX_ROUNDS):
         response = client.models.generate_content(
-            model   = REPLY_MODEL,
+            model   = MODEL,
             contents= contents,
             config  = types.GenerateContentConfig(
                 system_instruction = system,
@@ -329,7 +501,7 @@ def reply(
             ),
         )
 
-        candidate = response.candidates[0] if response.candidates else None
+        candidate  = response.candidates[0] if response.candidates else None
         parts      = (candidate.content.parts if candidate and candidate.content else None) or []
         fn_calls   = [p for p in parts if p.function_call]
         text_parts = [p.text for p in parts if p.text]

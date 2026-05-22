@@ -318,10 +318,11 @@ def poll_and_reply(bot_state: dict, graph, ai, owner_graph=None,
     if not new_msgs:
         return bot_state
 
-    owner_uid    = bot_state.get("owner_uid") or ""
-    wiki_dir     = Path(owner_wiki_dir)    if owner_wiki_dir    else None
-    data_dir     = Path(owner_data_dir)    if owner_data_dir    else None
-    settings     = owner_settings or {}
+    owner_uid       = bot_state.get("owner_uid") or ""
+    wiki_dir        = Path(owner_wiki_dir)    if owner_wiki_dir    else None
+    data_dir        = Path(owner_data_dir)    if owner_data_dir    else None
+    settings        = owner_settings or {}
+    user_model_path = (data_dir / "user_model.json") if data_dir else None
 
     for msg in new_msgs:
         last_seen_ts = msg["createdDateTime"]
@@ -347,6 +348,7 @@ def poll_and_reply(bot_state: dict, graph, ai, owner_graph=None,
             reply_text, bot_state = _bot.reply(
                 bot_state, text, graph, owner_graph,
                 settings, wiki_dir, data_dir,
+                user_model_path=user_model_path,
             )
             graph.send_chat_message(chat_id, reply_text)
         except Exception as e:
