@@ -57,7 +57,7 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
-    fetch('/api/auth/me', { credentials: 'include' })
+    fetch('/api/auth/me', { credentials: 'include', headers: { 'X-Timezone': Intl.DateTimeFormat().resolvedOptions().timeZone } })
       .then(r => r.json())
       .then(d => setUser(d?.user_id ? d : null))
       .catch(() => setUser(null))

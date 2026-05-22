@@ -151,9 +151,16 @@ def logout(session_token: str = Cookie(None)):
 # ── Auth info endpoints ───────────────────────────────────
 
 @app.get("/api/auth/me")
-def auth_me(session: dict | None = Depends(get_current_session)):
+def auth_me(request: Request, session: dict | None = Depends(get_current_session)):
     if not session:
         return {"authenticated": False}
+    tz = request.headers.get("X-Timezone", "").strip()
+    if tz and session.get("user_id"):
+        path     = _user_settings(session["user_id"])
+        settings = _read_json(path)
+        if settings.get("timezone") != tz:
+            settings["timezone"] = tz
+            _write_json(path, settings)
     return {"authenticated": True, "username": session.get("username"), "user_id": session.get("user_id")}
 
 
