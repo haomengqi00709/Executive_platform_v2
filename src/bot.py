@@ -81,6 +81,44 @@ def _save_user_model(path: Path, model: dict):
     path.write_text(json.dumps(model, indent=2, ensure_ascii=False))
 
 
+def _build_session_context(data_dir: Path) -> str:
+    """Read cached module results and return a short status summary for the system prompt.
+    Zero API cost — silently skips any missing or malformed files."""
+    lines = []
+    try:
+        m02 = json.loads((data_dir / "results" / "m02.json").read_text())
+        reply    = m02.get("reply_needed", [])
+        followup = m02.get("followup_needed", [])
+        if reply:
+            oldest = reply[0]
+            lines.append(
+                f"Reply needed: {len(reply)} emails"
+                f" — oldest: \"{oldest.get('subject','')}\" from {oldest.get('from','')} ({oldest.get('days_waiting',0)}d)"
+            )
+        if followup:
+            lines.append(f"Follow-up needed: {len(followup)} sent emails with no response")
+    except Exception:
+        pass
+    try:
+        m03 = json.loads((data_dir / "results" / "m03.json").read_text())
+        open_items = [a for a in (m03.get("action_items") or []) if not a.get("completed")]
+        if open_items:
+            lines.append(f"Open meeting action items: {len(open_items)} unresolved")
+    except Exception:
+        pass
+    try:
+        m04 = json.loads((data_dir / "results" / "m04.json").read_text())
+        at_risk = [c for c in (m04.get("contacts") or []) if c.get("status") in ("at_risk", "dormant")][:3]
+        if at_risk:
+            names = ", ".join(c.get("name") or c.get("email", "") for c in at_risk)
+            lines.append(f"Relationship alerts: {names}")
+    except Exception:
+        pass
+    if not lines:
+        return ""
+    return "Current status (from last run):\n" + "\n".join(f"• {l}" for l in lines)
+
+
 # ── Core reply function ────────────────────────────────────
 
 def reply(
@@ -104,16 +142,23 @@ def reply(
     now_str          = datetime.now(timezone.utc).strftime("%A, %B %d, %Y %H:%M UTC")
     bc_line          = f"\n\nBusiness context: {business_context}" if business_context else ""
 
-    # Inject user model state so AI can answer config questions without tool calls
-    ignored    = user_model.get("ignored_senders", [])
-    rules      = user_model.get("behavioral_rules", [])
-    user_ctx   = ""
+    # Inject user model state — AI answers config questions without tool calls
+    ignored  = user_model.get("ignored_senders", [])
+    rules    = user_model.get("behavioral_rules", [])
+    user_ctx = ""
     if ignored or rules:
-        user_ctx  = "\n\nUser preferences (already configured):\n"
+        user_ctx = "\n\nUser preferences (already configured):\n"
         if ignored:
             user_ctx += f"- Ignored senders: {', '.join(ignored)}\n"
         if rules:
             user_ctx += "- Behavioral rules:\n" + "".join(f"  • {r}\n" for r in rules)
+
+    # Zero-cost session status from cached module results
+    session_ctx = ""
+    if data_dir:
+        session_ctx = _build_session_context(data_dir)
+    if session_ctx:
+        session_ctx = f"\n\n{session_ctx}"
 
     pending_note = ""
     pending_draft   = state.get("pending_draft")
@@ -141,11 +186,26 @@ def reply(
 
     system = (
         f"You are an AI executive assistant for {display_name}.{bc_line}\n\n"
-        f"Today: {now_str}. Timezone: {timezone_str}.\n\n"
-        f"Be concise, professional, and action-oriented. Use bullet points for lists.\n"
-        f"When asked about emails, meetings, or contacts — always call the relevant tool first. "
-        f"Never invent data. Respond in the same language the user writes in."
+        f"Today: {now_str}. Timezone: {timezone_str}.\n"
+        f"Be concise, professional, action-oriented. Use bullet points for lists.\n"
+        f"Never invent data. Respond in the same language the user writes in.\n\n"
+        f"TOOL ROUTING:\n"
+        f"  get_recent_emails          → 'show my emails', 'what did X send', 'unread messages'\n"
+        f"  get_upcoming_meetings      → 'what meetings do I have', 'who is in my next call'\n"
+        f"  get_contact_history        → 'history with X', 'last email from John'\n"
+        f"  get_email_frequency_report → 'who do I email most', 'most active contacts'\n"
+        f"  read_module_result         → 'what did the briefing say', 'show last email analysis'\n"
+        f"  search_web                 → 'news about X', 'industry trends' (NOT own inbox/calendar)\n"
+        f"  read_settings              → 'what are my settings', 'show my ignore list'\n"
+        f"  update_setting             → 'ignore emails from X', 'add rule Y'\n"
+        f"  read_skill_instruction     → 'how is briefing configured', 'show skill for X'\n"
+        f"  update_skill_instruction   → 'make briefing more concise', 'change skill behavior'\n"
+        f"  run_skill                  → 'run morning briefing now', 'trigger email analysis'\n"
+        f"  dismiss_item               → 'ignore this', 'skip X', 'don't show me this again'\n"
+        f"  approve_draft / skip_draft → only when a pending draft is shown above\n"
+        f"  confirm_expense / discard_expense → only when a pending expense is shown above"
         f"{user_ctx}"
+        f"{session_ctx}"
         f"{pending_note}"
     )
 
@@ -376,7 +436,21 @@ def reply(
         print(f"[Bot] run_skill({skill_name}) → started")
         return f"✅ {SKILL_NAMES[skill_name]} is running. Results will appear in your dashboard shortly."
 
-    # --- Action tools (existing) ---
+    # --- Action tools ---
+
+    def dismiss_item(subject_hint: str) -> str:
+        """Permanently suppress an email or item so it no longer appears in action items or briefings.
+        subject_hint: partial subject line, sender name, or any keyword identifying the item."""
+        nonlocal user_model
+        skipped = list(user_model.get("skipped_items", []))
+        skipped.append({
+            "hint":       subject_hint,
+            "dismissed_at": datetime.now(timezone.utc).isoformat(),
+        })
+        user_model = {**user_model, "skipped_items": skipped}
+        _save_user_model(user_model_path, user_model)
+        print(f"[Bot] dismiss_item({subject_hint!r})")
+        return f"✅ Dismissed — '{subject_hint}' will no longer appear in briefings or action items."
 
     def list_pending_drafts() -> str:
         """List all pending email drafts waiting for approval."""
@@ -477,6 +551,7 @@ def reply(
         # Trigger
         run_skill,
         # Action
+        dismiss_item,
         list_pending_drafts,
         approve_draft,
         skip_draft,
