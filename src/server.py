@@ -19,6 +19,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from src import auth
 from src.graph import GraphClient
+from src.ai import AIClient
+from src.sections import ai_summary, expenses
 
 load_dotenv(override=True)
 
@@ -214,12 +216,17 @@ def auth_poll(response: Response):
 # ── Settings ──────────────────────────────────────────────
 
 @app.get("/api/settings")
-def get_settings(session: dict = Depends(require_session)):
+def get_settings(request: Request, session: dict = Depends(require_session)):
     uid      = session["user_id"]
-    settings = _read_json(_user_settings(uid))
+    path     = _user_settings(uid)
+    settings = _read_json(path)
     if not settings.get("report_email"):
         ms_email = (auth.load_user_tokens(uid) or {}).get("username", "")
         settings.setdefault("report_email", ms_email)
+    tz = request.headers.get("X-Timezone", "").strip()
+    if tz and settings.get("timezone") != tz:
+        settings["timezone"] = tz
+        _write_json(path, settings)
     return settings
 
 
@@ -590,6 +597,212 @@ def test_graph(session: dict = Depends(require_session)):
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+
+# ── Section registry ─────────────────────────────────────
+# Add entries here as sections are implemented.
+
+_SECTION_RUNNERS: dict[str, object] = {
+    "ai_summary": lambda graph, ai, data_dir, settings, progress:
+        ai_summary.run(graph, ai, data_dir, settings, progress),
+    "expenses": lambda graph, ai, data_dir, settings, progress:
+        expenses.run(graph, ai, data_dir, progress=progress),
+}
+
+
+def _format_section_for_teams(result: dict) -> str:
+    section_id = result.get("id", "")
+    if section_id == "ai_summary":
+        return result.get("briefing", "")
+    items = result.get("items", [])
+    if not items:
+        return ""
+    title = section_id.replace("_", " ").title()
+    lines = [f"**{title}** — {len(items)} item(s)"]
+    for item in items[:5]:
+        label = item.get("subject") or item.get("vendor") or item.get("title") or str(item)
+        lines.append(f"• {str(label)[:80]}")
+    if len(items) > 5:
+        lines.append(f"• ... and {len(items) - 5} more")
+    return "\n".join(lines)
+
+
+def _send_to_bot(uid: str, result: dict) -> None:
+    bot_uid, chat_id = _find_bot_for_user(uid)
+    if not bot_uid or not chat_id:
+        return
+    message = _format_section_for_teams(result)
+    if not message:
+        return
+    try:
+        bot_token = auth.get_valid_access_token(bot_uid)
+        bot_graph = GraphClient(bot_token)
+        bot_graph.send_chat_message(chat_id, message)
+    except Exception as e:
+        print(f"[Bot] Failed to send {result.get('id')} to {uid}: {e}")
+
+
+@app.post("/api/sections/{section_id}/run")
+def run_section(section_id: str, background_tasks: BackgroundTasks,
+                session: dict = Depends(require_session)):
+    if section_id not in _SECTION_RUNNERS:
+        raise HTTPException(404, detail=f"Section '{section_id}' not implemented yet")
+    uid = session["user_id"]
+
+    results_dir = _udir(uid) / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(results_dir / f"{section_id}.json", {
+        "id": section_id, "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    def _run():
+        logs: list[str] = []
+
+        def _progress(msg: str):
+            logs.append(msg)
+            print(f"[Section:{section_id}] {msg}")
+            _write_json(results_dir / f"{section_id}.json", {
+                "id": section_id, "status": "running",
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "logs": logs[-20:],
+            })
+
+        try:
+            token    = auth.get_valid_access_token(uid)
+            graph    = GraphClient(token)
+            ai       = AIClient()
+            settings = _read_json(_user_settings(uid))
+
+            result = _SECTION_RUNNERS[section_id](
+                graph, ai, _udir(uid), settings, _progress,
+            )
+            result["logs"] = logs
+            _write_json(results_dir / f"{section_id}.json", result)
+            _send_to_bot(uid, result)
+            print(f"[Section:{section_id}] Done for {uid}")
+        except Exception as e:
+            _write_json(results_dir / f"{section_id}.json", {
+                "id": section_id, "status": "error",
+                "error": str(e),
+                "logs": logs,
+                "last_run": datetime.now(timezone.utc).isoformat(),
+            })
+            print(f"[Section:{section_id}] Failed for {uid}: {e}")
+
+    background_tasks.add_task(_run)
+    return {"ok": True}
+
+
+@app.get("/api/sections/{section_id}")
+def get_section(section_id: str, session: dict = Depends(require_session)):
+    uid  = session["user_id"]
+    path = _udir(uid) / "results" / f"{section_id}.json"
+    if not path.exists():
+        return {"id": section_id, "status": "not_run", "items": [], "count": 0, "empty": True}
+    return _read_json(path)
+
+
+@app.get("/api/sections/{section_id}/instructions")
+def get_section_instructions(section_id: str, session: dict = Depends(require_session)):
+    uid  = session["user_id"]
+    path = _udir(uid) / "instructions" / f"{section_id}.md"
+    return {"content": path.read_text() if path.exists() else ""}
+
+
+@app.put("/api/sections/{section_id}/instructions")
+def update_section_instructions(section_id: str, body: dict, session: dict = Depends(require_session)):
+    uid  = session["user_id"]
+    path = _udir(uid) / "instructions" / f"{section_id}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body.get("content", ""))
+    return {"ok": True}
+
+
+def _run_section_for_user(uid: str, section_id: str) -> None:
+    """Run a section directly (no HTTP). Used by bot.py to trigger sections from Teams chat."""
+    if section_id not in _SECTION_RUNNERS:
+        print(f"[Section:{section_id}] Not implemented — skipping")
+        return
+    results_dir = _udir(uid) / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(results_dir / f"{section_id}.json", {
+        "id": section_id, "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    })
+    try:
+        token    = auth.get_valid_access_token(uid)
+        graph    = GraphClient(token)
+        ai       = AIClient()
+        settings = _read_json(_user_settings(uid))
+        result   = _SECTION_RUNNERS[section_id](graph, ai, _udir(uid), settings, None)
+        _write_json(results_dir / f"{section_id}.json", result)
+        _send_to_bot(uid, result)
+        print(f"[Section:{section_id}] Done (bot-triggered) for {uid}")
+    except Exception as e:
+        _write_json(results_dir / f"{section_id}.json", {
+            "id": section_id, "status": "error", "error": str(e),
+            "last_run": datetime.now(timezone.utc).isoformat(),
+        })
+        print(f"[Section:{section_id}] Failed (bot-triggered) for {uid}: {e}")
+
+
+# ── CRM ──────────────────────────────────────────────────
+
+@app.get("/api/crm")
+def get_crm(session: dict = Depends(require_session)):
+    uid      = session["user_id"]
+    crm_path = _udir(uid) / "crm.json"
+    if not crm_path.exists():
+        return {"last_scan": None, "months_scanned": 0, "total": 0, "contacts": []}
+    try:
+        data     = json.loads(crm_path.read_text())
+        contacts = list(data.get("contacts", {}).values())
+        contacts.sort(key=lambda x: x.get("last_contact", ""), reverse=True)
+        return {
+            "last_scan":      data.get("last_scan"),
+            "months_scanned": data.get("months_scanned", 0),
+            "total":          len(contacts),
+            "contacts":       contacts,
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.patch("/api/crm/{email}")
+def patch_crm_contact(email: str, body: dict, session: dict = Depends(require_session)):
+    uid  = session["user_id"]
+    from src.modules.crm import load_crm, save_crm
+    data = load_crm(_udir(uid))
+    addr = email.lower()
+    if addr not in data.get("contacts", {}):
+        raise HTTPException(404, "Contact not found")
+    data["contacts"][addr].update(body)
+    save_crm(_udir(uid), data)
+    return data["contacts"][addr]
+
+
+@app.post("/api/crm/scan")
+def trigger_crm_scan(background_tasks: BackgroundTasks,
+                     session: dict = Depends(require_session),
+                     months: int = 6):
+    uid = session["user_id"]
+
+    def _run():
+        try:
+            from src.modules.crm import build_crm, save_crm
+            from src.ai import AIClient
+            token = auth.get_valid_access_token(uid)
+            graph = GraphClient(token)
+            ai    = AIClient()
+            result = build_crm(graph, ai, _udir(uid), months=months)
+            save_crm(_udir(uid), result)
+            print(f"[CRM] Scan complete for {uid}: {result['total']} contacts")
+        except Exception as e:
+            print(f"[CRM] Scan failed for {uid}: {e}")
+
+    background_tasks.add_task(_run)
+    return {"ok": True, "message": "CRM scan started"}
 
 
 # ── Health check ──────────────────────────────────────────
