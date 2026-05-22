@@ -372,14 +372,20 @@ def reply(
         print(f"[Bot] read_settings()")
         return json.dumps(combined, ensure_ascii=False)
 
-    def update_setting(key: str, value) -> str:
+    def update_setting(key: str, value: str) -> str:
         """Update a user preference. Writes to user_model.json.
-        Supported keys: ignored_senders (list of email strings), behavioral_rules (list of rule strings),
-        key_relationships (dict of email→note), check_interval_hours (number), briefing_style (string)."""
+        Supported keys: ignored_senders (JSON list of emails), behavioral_rules (JSON list of strings),
+        key_relationships (JSON dict of email→note), check_interval_hours (number as string),
+        briefing_style (string). Pass lists/dicts as JSON strings, e.g. '["a@b.com"]'."""
         nonlocal user_model
-        user_model = {**user_model, key: value}
+        import json as _j
+        try:
+            parsed = _j.loads(value)
+        except Exception:
+            parsed = value
+        user_model = {**user_model, key: parsed}
         _save_user_model(user_model_path, user_model)
-        print(f"[Bot] update_setting({key}={value!r})")
+        print(f"[Bot] update_setting({key}={parsed!r})")
         return f"✅ Preference updated: {key}"
 
     def read_skill_instruction(skill_name: str) -> str:
