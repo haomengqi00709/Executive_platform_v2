@@ -101,7 +101,7 @@ def save_market_segments(data_dir: Path, text: str) -> None:
     path.write_text(text.strip() + "\n")
 
 
-_VALID_STAGES = ("pending", "generating", "draft_ready", "user_confirmed")
+_VALID_STAGES = ("pending", "awaiting_confirmation", "generating", "draft_ready", "user_confirmed")
 _VALID_STEP_STATUSES = ("pending", "in_progress", "done", "failed")
 
 # Order matters — frontend renders this list top-to-bottom.

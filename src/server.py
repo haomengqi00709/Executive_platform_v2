@@ -139,10 +139,13 @@ def auth_callback(code: str = None, state: str = None, error: str = None,
     resp.delete_cookie("oauth_state")
     resp.delete_cookie("oauth_redirect")
     _ensure_onedrive_folders(user_id)
-    from src.modules.profile import is_profile_confirmed
-    if not is_profile_confirmed(_udir(user_id)):
-        threading.Thread(target=_run_first_login_init, args=(user_id,), daemon=True).start()
-        print(f"[init] First-login chain started for {user_id} (CRM → Projects → Profile)")
+    from src.modules.profile import is_profile_confirmed, init_has_started, save_init_status
+    if not is_profile_confirmed(_udir(user_id)) and not init_has_started(_udir(user_id)):
+        # Don't start init yet — wait for the user to confirm the right account is logged in.
+        # Frontend reads init_status, shows a confirmation screen, then POSTs /api/init/start.
+        save_init_status(_udir(user_id), "awaiting_confirmation",
+                         current_message=f"Logged in as {username}. Confirm to start setup.")
+        print(f"[init] Awaiting user confirmation for {user_id} ({username})")
     return resp
 
 
@@ -224,10 +227,11 @@ def auth_poll(response: Response):
                 response.set_cookie("session_token", jwt_token, httponly=True,
                                     secure=False, max_age=60*60*24*7, samesite="lax")
                 _ensure_onedrive_folders(user_id)
-                from src.modules.profile import is_profile_confirmed
-                if not is_profile_confirmed(_udir(user_id)):
-                    threading.Thread(target=_run_first_login_init, args=(user_id,), daemon=True).start()
-                    print(f"[init] First-login chain (device code) started for {user_id}")
+                from src.modules.profile import is_profile_confirmed, init_has_started, save_init_status
+                if not is_profile_confirmed(_udir(user_id)) and not init_has_started(_udir(user_id)):
+                    save_init_status(_udir(user_id), "awaiting_confirmation",
+                                     current_message=f"Logged in as {username}. Confirm to start setup.")
+                    print(f"[init] Awaiting user confirmation for {user_id} ({username}) — device code")
             return {"status": "success"}
         except Exception as e:
             msg = str(e)
@@ -2227,13 +2231,15 @@ def get_profile_status(session: dict = Depends(require_session)):
     from src.modules.profile import load_init_status, init_has_started, save_init_status
     uid  = session["user_id"]
     udir = _udir(uid)
-    # Auto-kick: if init has never been triggered for this user (e.g. existing
-    # session predating this feature), start the chain now so the OnboardingPage
-    # actually shows progress instead of frozen "pending" dots.
+    # If init has never been triggered for this user (e.g. existing session predating
+    # this feature, or fresh OAuth that hasn't been confirmed yet), surface the
+    # confirmation gate so the frontend can show "Logged in as X — start setup?"
     if not init_has_started(udir):
-        save_init_status(udir, "generating")  # creates the status file so we only kick once
-        threading.Thread(target=_run_first_login_init, args=(uid,), daemon=True).start()
-        print(f"[init] Auto-started init chain for {uid} (existing session, no prior init)")
+        token_data = auth.load_user_tokens(uid) or {}
+        username = token_data.get("username", "")
+        save_init_status(udir, "awaiting_confirmation",
+                         current_message=f"Logged in as {username}. Confirm to start setup." if username
+                                         else "Confirm to start setup.")
     return load_init_status(udir)
 
 
@@ -2242,6 +2248,29 @@ def confirm_profile(session: dict = Depends(require_session)):
     from src.modules.profile import save_init_status
     save_init_status(_udir(session["user_id"]), "user_confirmed")
     return {"ok": True}
+
+
+@app.post("/api/init/start")
+def start_init(session: dict = Depends(require_session)):
+    """User has confirmed the right account is logged in — start the first-login init chain.
+    Idempotent: if init is already running or completed, returns the current stage without re-triggering."""
+    from src.modules.profile import load_init_status, save_init_status
+    uid = session["user_id"]
+    stage = load_init_status(_udir(uid)).get("stage", "pending")
+    if stage in ("generating", "draft_ready", "user_confirmed"):
+        return {"ok": True, "stage": stage, "message": "Init already started or complete"}
+    # awaiting_confirmation or pending → kick off
+    save_init_status(_udir(uid), "generating")
+    threading.Thread(target=_run_first_login_init, args=(uid,), daemon=True).start()
+    print(f"[init] User confirmed — starting first-login chain for {uid}")
+    return {"ok": True, "stage": "generating"}
+
+
+@app.get("/api/init/status")
+def get_init_status(session: dict = Depends(require_session)):
+    """Frontend polls this to know what to show: awaiting_confirmation / generating / draft_ready / user_confirmed."""
+    from src.modules.profile import load_init_status
+    return load_init_status(_udir(session["user_id"]))
 
 
 @app.post("/api/profile/regenerate")
