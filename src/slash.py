@@ -33,7 +33,6 @@ SKILL_SLUGS: dict[str, str] = {
     "reply_needed_skill":           "📬 Reply Needed Skill",
     "followup_needed_skill":        "📤 Follow-up Needed Skill",
     "invoices_contracts_skill":     "🧾 Invoices & Contracts Skill",
-    "followup_tracking_skill":      "🔁 Follow-up Tracking Skill",
     "commitments_extract_skill":    "📋 Commitments Extract Skill",
     "upcoming_commitments_skill":   "📅 Upcoming Commitments Skill",
     "recent_meetings_skill":        "🤝 Recent Meetings Skill",
@@ -216,17 +215,19 @@ def _context(args: list, ctx: "Path | None", sett: "Path | None", ai) -> str:
 # ── /settings ─────────────────────────────────────────────────────────────────
 
 def _settings(sett: "Path | None") -> str:
+    from src.modules.profile import load_profile_context
     s = _read_json(sett)
 
     name    = s.get("display_name") or "—"
     email   = s.get("report_email") or "—"
     webhook = s.get("teams_webhook_url") or ""
-    bc      = s.get("business_context") or ""
+    data_dir = sett.parent if sett else None
+    bc      = load_profile_context(data_dir) if data_dir else ""
     ws      = s.get("writing_style_note") or ""
     focus   = s.get("briefing_focus") or ""
 
     wh_disp = "✅ configured" if webhook else "⬜ not set"
-    bc_disp = bc[:150] if bc else "⬜ not set — save a Business Profile to populate"
+    bc_disp = bc[:300] if bc else "⬜ not set — edit profile/business_profile.md and profile/market_segments.md"
     ws_disp = ws[:150] if ws else "⬜ not set — save a Writing Style doc to populate"
 
     return (
@@ -234,7 +235,7 @@ def _settings(sett: "Path | None") -> str:
         f"Name: {name}\n"
         f"Report Email: {email}\n"
         f"Teams Webhook: {wh_disp}\n\n"
-        f"Business Context (injected into AI):\n{bc_disp}\n\n"
+        f"Profile (injected into AI):\n{bc_disp}\n\n"
         f"Writing Style Note (injected into AI):\n{ws_disp}\n\n"
         f"Briefing Focus: {focus or '(default)'}"
     )
@@ -311,8 +312,6 @@ Available actions:
    - reply_urgent_days: days before flagging as urgent (default 14)
    - followup_after_days: days before sent emails with no reply are flagged (default 3)
    - followup_urgent_days: days before follow-up marked urgent (default 14)
-   - followup_tracking_min_days: days for normal contacts tracking (default 2)
-   - followup_tracking_low_days: days for low-priority contacts tracking (default 7)
    - upcoming_commitments_days: how many days ahead to show commitments (default 7)
    - upcoming_commitments_urgent_days: days threshold for urgent commitments (default 2)
    - bi_lookback_days: days of email/meeting history for business intelligence (default 30)
@@ -505,8 +504,6 @@ _PARAM_MAP: dict[str, tuple] = {
     "reply_urgent_days":                ("reply_needed_skill",       r'(##\s*Urgent After\s*\nDays:\s*)\d+',                  "reply urgent threshold",    "days", "int"),
     "followup_after_days":              ("followup_needed_skill",    r'(##\s*Flag After\s*\nDays:\s*)\d+',                    "follow-up flag threshold",  "days", "int"),
     "followup_urgent_days":             ("followup_needed_skill",    r'(##\s*Urgent After\s*\nDays:\s*)\d+',                  "follow-up urgent threshold","days", "int"),
-    "followup_tracking_min_days":       ("followup_tracking_skill",  r'(##\s*Normal Contacts\s*\nFlag after:\s*)\d+',         "normal contacts follow-up", "days", "int"),
-    "followup_tracking_low_days":       ("followup_tracking_skill",  r'(##\s*Low-Priority Contacts\s*\nFlag after:\s*)\d+',   "low-priority follow-up",    "days", "int"),
     "upcoming_commitments_days":        ("upcoming_commitments_skill",r'(Show commitments due within:\s*)\d+',                "commitments window",        "days", "int"),
     "upcoming_commitments_urgent_days": ("upcoming_commitments_skill",r'(Mark as urgent if due within:\s*)\d+',               "urgent commitments",        "days", "int"),
     "bi_lookback_days":                 ("business_insights_skill",  r'(Lookback window:\s*)\d+',                            "BI lookback window",        "days", "int"),

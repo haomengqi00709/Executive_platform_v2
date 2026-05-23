@@ -15,16 +15,32 @@ from pathlib import Path
 from google import genai
 from google.genai import types
 
+from src.modules.profile import load_profile_context
+
 MODEL        = "gemini-3.5-flash"
 MAX_ROUNDS   = 8
 HISTORY_LIMIT = 20
 
-SKILL_NAMES = {
-    "morning_briefing":    "Morning Briefing (M01)",
-    "email_intelligence":  "Email Intelligence (M02)",
-    "meeting_intelligence":"Meeting Intelligence (M03)",
-    "business_insights":   "Business Insights (M04)",
-    "expense_capture":     "Expense Capture (M05)",
+SECTION_IDS = {
+    "ai_summary":           "Morning Briefing — daily summary of calendar, emails, priorities, and key relationships",
+    "market_intelligence":  "Market Intelligence — current industry news, competitor updates, market trends",
+    "company_intelligence": "Company Intelligence — targeted signals on CRM companies, project participants, watchlist (LinkedIn, X, news)",
+    "reply_needed":         "Emails Awaiting Reply — inbox emails where the sender is waiting for your response",
+    "followup_needed":      "Sent — No Response — emails YOU sent that the other party hasn't replied to yet",
+    "commitments_extract":  "Commitments Extracted — all promises and deadlines found in emails (yours and others')",
+    "upcoming_commitments": "Upcoming Commitments — forward-looking view of deadlines and commitments in the next 2 weeks",
+    "recent_meetings":      "Recent Meetings — summaries and decisions from recorded meetings",
+    "meeting_action_items": "Meeting Action Items — open action items extracted from meeting recordings",
+    "relationship_health":  "Relationship Health — health scores and alerts for key business contacts",
+    "business_insights":    "Business Insights — AI-generated analysis of business patterns and opportunities",
+    "expenses":             "Document Capture — receipts (→ Excel), invoices, and contracts from email attachments",
+    "email_monitor":        "Email Monitor Triage — custom rules for classifying incoming emails as priority, review, or skip",
+    "project_status":              "Project Status — portfolio view of all active projects with status and momentum",
+    "projects_needing_attention":  "Projects Needing Attention — projects flagged as needs_attention or early_stage",
+    "meetings_today":              "Today's Meetings — calendar view of meetings scheduled for today",
+    "due_today":                   "Due Today — commitments the user owes today",
+    "yesterday_recap":             "Yesterday's Recap — emails, meetings, and commitments from yesterday",
+    "meeting_prep":                "Meeting Prep — pre-meeting context auto-fired ~30 min before each meeting",
 }
 
 
@@ -82,36 +98,50 @@ def _save_user_model(path: Path, model: dict):
 
 
 def _build_session_context(data_dir: Path) -> str:
-    """Read cached module results and return a short status summary for the system prompt.
+    """Read cached section results and return a short status summary for the system prompt.
     Zero API cost — silently skips any missing or malformed files."""
     lines = []
     try:
-        m02 = json.loads((data_dir / "results" / "m02.json").read_text())
-        reply    = m02.get("reply_needed", [])
-        followup = m02.get("followup_needed", [])
-        if reply:
-            oldest = reply[0]
+        d = json.loads((data_dir / "results" / "reply_needed.json").read_text())
+        items = d.get("items", [])
+        if items:
+            oldest = items[0]
             lines.append(
-                f"Reply needed: {len(reply)} emails"
-                f" — oldest: \"{oldest.get('subject','')}\" from {oldest.get('from','')} ({oldest.get('days_waiting',0)}d)"
+                f"Reply needed: {len(items)} emails"
+                f" — oldest: \"{oldest.get('subject','')}\" from {oldest.get('from_name', oldest.get('from_email',''))} ({oldest.get('days_waiting',0)}d)"
             )
-        if followup:
-            lines.append(f"Follow-up needed: {len(followup)} sent emails with no response")
     except Exception:
         pass
     try:
-        m03 = json.loads((data_dir / "results" / "m03.json").read_text())
-        open_items = [a for a in (m03.get("action_items") or []) if not a.get("completed")]
+        d = json.loads((data_dir / "results" / "followup_needed.json").read_text())
+        items = d.get("items", [])
+        if items:
+            lines.append(f"Follow-up needed: {len(items)} sent emails with no response")
+    except Exception:
+        pass
+    try:
+        d = json.loads((data_dir / "results" / "meeting_action_items.json").read_text())
+        open_items = [a for a in d.get("items", []) if not a.get("completed")]
         if open_items:
             lines.append(f"Open meeting action items: {len(open_items)} unresolved")
     except Exception:
         pass
     try:
-        m04 = json.loads((data_dir / "results" / "m04.json").read_text())
-        at_risk = [c for c in (m04.get("contacts") or []) if c.get("status") in ("at_risk", "dormant")][:3]
+        d = json.loads((data_dir / "results" / "relationship_health.json").read_text())
+        at_risk = [h for h in d.get("items", []) if h.get("status") in ("at_risk", "dormant")][:3]
         if at_risk:
-            names = ", ".join(c.get("name") or c.get("email", "") for c in at_risk)
+            names = ", ".join(h.get("name") or h.get("email", "") for h in at_risk)
             lines.append(f"Relationship alerts: {names}")
+    except Exception:
+        pass
+    try:
+        d = json.loads((data_dir / "email_monitor.json").read_text())
+        notified = (d.get("last_notified_emails") or [])[-5:]
+        if notified:
+            items = "; ".join(
+                f'"{e["subject"]}" from {e["from"]}' for e in notified
+            )
+            lines.append(f"Recently notified emails (last {len(notified)}): {items}")
     except Exception:
         pass
     if not lines:
@@ -137,10 +167,15 @@ def reply(
 
     # ── System prompt ──────────────────────────────────────
     display_name     = settings.get("display_name", "the executive")
-    business_context = settings.get("business_context", "")
-    timezone_str     = settings.get("timezone", "UTC")
-    now_str          = datetime.now(timezone.utc).strftime("%A, %B %d, %Y %H:%M UTC")
-    bc_line          = f"\n\nBusiness context: {business_context}" if business_context else ""
+    business_context  = load_profile_context(data_dir)
+    writing_style     = settings.get("writing_style_note", "").strip()
+    timezone_str      = settings.get("timezone", "UTC")
+    now_str           = datetime.now(timezone.utc).strftime("%A, %B %d, %Y %H:%M UTC")
+    bc_line           = f"\n\nBusiness context: {business_context}" if business_context else ""
+    style_line        = (
+        f"\n\nWriting style for all email drafts:\n{writing_style}"
+        f"\nIf get_contact_history returns a writing_style_note for a specific contact, use that instead — it takes priority over the global style above."
+    ) if writing_style else ""
 
     # Inject user model state — AI answers config questions without tool calls
     ignored  = user_model.get("ignored_senders", [])
@@ -171,8 +206,9 @@ def reply(
         extra = f" ({len(pending_queue)} more in queue)" if pending_queue else ""
         pending_note += (
             f"\n\n⚠️ PENDING EMAIL DRAFT — Subject: '{subj}', To: {to}{extra}. "
-            f"If the user says approve/yes/send/ok → call approve_draft(). "
-            f"If they say skip/no/dismiss → call skip_draft()."
+            f"If the user is clearly responding to THIS draft (approve/yes/send/ok) → call approve_draft(). "
+            f"If they clearly want to skip THIS draft (skip/no/not now, with no item numbers) → call skip_draft(). "
+            f"If the user mentions item numbers or commitments, they are NOT responding to the draft — handle accordingly."
         )
 
     if pending_expense:
@@ -185,7 +221,7 @@ def reply(
         )
 
     system = (
-        f"You are an AI executive assistant for {display_name}.{bc_line}\n\n"
+        f"You are an AI executive assistant for {display_name}.{bc_line}{style_line}\n\n"
         f"Today: {now_str}. Timezone: {timezone_str}.\n"
         f"Be concise, professional, action-oriented. Use bullet points for lists.\n"
         f"Never invent data. Respond in the same language the user writes in.\n\n"
@@ -198,15 +234,35 @@ def reply(
         f"  search_web                 → 'news about X', 'industry trends' (NOT own inbox/calendar)\n"
         f"  read_settings              → 'what are my settings', 'show my ignore list'\n"
         f"  update_setting             → 'ignore emails from X', 'add rule Y'\n"
-        f"  read_skill_instruction     → 'how is briefing configured', 'show skill for X'\n"
-        f"  update_skill_instruction   → 'make briefing more concise', 'change skill behavior'\n"
-        f"  run_skill                  → 'run morning briefing now', 'trigger email analysis'\n"
-        f"  dismiss_item               → 'ignore this', 'skip X', 'don't show me this again'\n"
+        f"  read_skill_instruction     → 'how is X configured', 'show instructions for X'\n"
+        f"  update_skill_instruction   → 'don't show X', 'ignore emails from Y', 'change how Z works'\n"
+        f"  run_skill                  → 'run morning briefing now', 'refresh my emails section'\n"
+        f"  dismiss_item               → 'ignore this', 'don't show me this again' (no item numbers)\n"
+        f"  dismiss_commitment         → 'skip 2', 'skip 3 4', 'skip 2 3 4' — skip means permanent dismiss\n"
+        f"  snooze_commitment          → 'snooze 2', 'remind me in 3 days about 3', 'snooze 2 3 4 for 5 days'\n"
+        f"  create_reply_draft         → 'draft a reply to X', 'write an email to Y', 'compose a response'\n"
+        f"                               First call get_recent_emails to find the email, compose the full body, then save.\n"
+        f"                               Draft is saved immediately to Outlook — no approval step needed.\n"
         f"  approve_draft / skip_draft → only when a pending draft is shown above\n"
-        f"  confirm_expense / discard_expense → only when a pending expense is shown above"
-        f"{user_ctx}"
-        f"{session_ctx}"
-        f"{pending_note}"
+        f"  confirm_expense / discard_expense → only when a pending expense is shown above\n"
+        f"  update_crm_contact         → 'mark X as high priority', 'add note to Sarah', 'set company for John'\n"
+        f"  create_calendar_event      → 'schedule meeting with X', 'block my calendar Friday', 'create Teams call'\n"
+        f"  run_outreach               → 'draft outreach emails for the people I met at X', 'batch email contacts from OneDrive folder'\n"
+        f"                               Always confirm the OneDrive folder and a brief context note with the user first.\n\n"
+        f"AVAILABLE SECTIONS (use these exact section_id values for run_skill, "
+        f"read_skill_instruction, update_skill_instruction):\n"
+        + "".join(
+            f"  {sid:30s} → {desc.split(' — ', 1)[1] if ' — ' in desc else desc}\n"
+            for sid, desc in SECTION_IDS.items()
+        )
+        + (
+            f"\nHONESTY RULE: When a tool returns an error or an unexpected result, "
+            f"REPORT IT honestly to the user. Do NOT reply 'Done' or pretend success "
+            f"when the tool failed. Show what went wrong and what you did/didn't do."
+        )
+        + f"{user_ctx}"
+        + f"{session_ctx}"
+        + f"{pending_note}"
     )
 
     # ── Tool definitions ───────────────────────────────────
@@ -291,6 +347,17 @@ def reply(
                                 proj_data = json.loads(proj_path.read_text())
                                 result["meetings"].extend(proj_data.get("meetings", [])[:5])
                                 result["emails"].extend(proj_data.get("emails", [])[:5])
+            # Attach CRM writing style if available — used by Gemini when drafting emails to this contact
+            if data_dir:
+                try:
+                    from src.modules.crm import load_crm
+                    crm = load_crm(data_dir)
+                    contact = crm.get("contacts", {}).get(email.lower(), {})
+                    ws = contact.get("writing_style", "").strip()
+                    if ws:
+                        result["writing_style_note"] = ws
+                except Exception:
+                    pass
             print(f"[Bot] get_contact_history({email})")
             return json.dumps(result, ensure_ascii=False)
         except Exception as e:
@@ -324,20 +391,22 @@ def reply(
         except Exception as e:
             return f"Error: {e}"
 
-    def read_module_result(module_name: str) -> str:
-        """Read the latest cached result for a module. module_name must be one of: m01, m02, m03, m04, m05."""
-        valid = {"m01", "m02", "m03", "m04", "m05"}
-        if module_name not in valid:
-            return f"Invalid module name. Use one of: {', '.join(sorted(valid))}"
-        result_path = data_dir / "results" / f"{module_name}.json"
+    def read_module_result(section_id: str) -> str:
+        """Read the latest cached result for a section.
+        section_id must be one of: ai_summary, market_intelligence, company_intelligence,
+        reply_needed, followup_needed, commitments_extract, upcoming_commitments,
+        recent_meetings, meeting_action_items, relationship_health, business_insights, expenses"""
+        if section_id not in SECTION_IDS:
+            return f"Unknown section '{section_id}'. Available: {', '.join(SECTION_IDS)}"
+        result_path = data_dir / "results" / f"{section_id}.json"
         if not result_path.exists():
-            return f"No results for {module_name} yet. Run the skill first with run_skill()."
+            return f"No results for '{section_id}' yet. Run the section first with run_skill()."
         try:
             data = json.loads(result_path.read_text())
-            print(f"[Bot] read_module_result({module_name})")
+            print(f"[Bot] read_module_result({section_id})")
             return json.dumps(data, ensure_ascii=False)
         except Exception as e:
-            return f"Error reading {module_name}: {e}"
+            return f"Error reading {section_id}: {e}"
 
     def search_web(query: str) -> str:
         """Search the web for current news, market data, or any information not in the user's inbox/calendar."""
@@ -360,7 +429,8 @@ def reply(
 
     def read_settings(key: str = None) -> str:
         """Read current settings and user preferences. Optionally pass a key to get one value.
-        Top-level keys include: display_name, business_context, timezone, check_interval_hours.
+        Top-level keys include: display_name, timezone, check_interval_hours.
+        Business profile and market segments live in profile/business_profile.md and profile/market_segments.md.
         User model keys include: ignored_senders, behavioral_rules, key_relationships."""
         combined = {**settings, "user_model": user_model}
         if key:
@@ -376,7 +446,10 @@ def reply(
         """Update a user preference. Writes to user_model.json.
         Supported keys: ignored_senders (JSON list of emails), behavioral_rules (JSON list of strings),
         key_relationships (JSON dict of email→note), check_interval_hours (number as string),
-        briefing_style (string). Pass lists/dicts as JSON strings, e.g. '["a@b.com"]'."""
+        briefing_style (string),
+        email_digest_interval_hours (number as string, 0=disable digest, default 2),
+        email_realtime_push (true/false — whether priority emails push immediately).
+        Pass lists/dicts as JSON strings, e.g. '["a@b.com"]'."""
         nonlocal user_model
         import json as _j
         try:
@@ -388,59 +461,75 @@ def reply(
         print(f"[Bot] update_setting({key}={parsed!r})")
         return f"✅ Preference updated: {key}"
 
-    def read_skill_instruction(skill_name: str) -> str:
-        """Read the instruction/configuration for a specific skill.
-        skill_name must be one of: morning_briefing, email_intelligence, meeting_intelligence, business_insights, expense_capture."""
-        if skill_name not in SKILL_NAMES:
-            return f"Unknown skill. Available: {', '.join(SKILL_NAMES)}"
-        skill_path = data_dir / "skills" / f"{skill_name}.md"
-        if not skill_path.exists():
-            return f"No instruction file for '{skill_name}' yet. Use update_skill_instruction to create one."
-        print(f"[Bot] read_skill_instruction({skill_name})")
-        return skill_path.read_text()
+    def read_skill_instruction(section_id: str) -> str:
+        """Read the current custom instructions for a section. Always call this BEFORE updating,
+        so you can append new rules rather than overwrite existing ones.
 
-    def update_skill_instruction(skill_name: str, content: str) -> str:
-        """Update (overwrite) the instruction file for a specific skill. The content is a markdown document
-        describing how the skill should behave. skill_name must be one of: morning_briefing, email_intelligence,
-        meeting_intelligence, business_insights, expense_capture."""
-        if skill_name not in SKILL_NAMES:
-            return f"Unknown skill. Available: {', '.join(SKILL_NAMES)}"
-        skill_dir = data_dir / "skills"
-        skill_dir.mkdir(parents=True, exist_ok=True)
-        (skill_dir / f"{skill_name}.md").write_text(content)
-        print(f"[Bot] update_skill_instruction({skill_name}) → {len(content)} chars")
-        return f"✅ Skill instruction updated: {skill_name}"
+        section_id must be one of:
+          ai_summary           — Morning Briefing (daily summary of calendar, emails, priorities)
+          market_intelligence  — Market Intelligence (industry news, competitor updates)
+          company_intelligence — Company Intelligence (targeted signals on CRM/watchlist companies)
+          reply_needed         — Emails Awaiting Reply (inbox emails waiting for your response)
+          followup_needed      — Sent — No Response (emails you sent, other party hasn't replied)
+          commitments_extract  — Commitments Extracted (promises and deadlines from emails)
+          upcoming_commitments — Upcoming Commitments (deadlines and commitments in next 2 weeks)
+          recent_meetings      — Recent Meetings (summaries from recorded meetings)
+          meeting_action_items — Meeting Action Items (open action items from meetings)
+          relationship_health  — Relationship Health (health scores for key business contacts)
+          business_insights    — Business Insights (AI analysis of business patterns)
+          expenses             — Expense Capture (receipts and invoices)
+          email_monitor        — Email Monitor Triage (rules for priority/review/skip classification)
+        """
+        if section_id not in SECTION_IDS:
+            return f"Unknown section '{section_id}'. Available: {', '.join(SECTION_IDS)}"
+        path = data_dir / "instructions" / f"{section_id}.md"
+        content = path.read_text().strip() if path.exists() else ""
+        print(f"[Bot] read_skill_instruction({section_id})")
+        return content if content else "(no custom instructions yet)"
+
+    def update_skill_instruction(section_id: str, content: str) -> str:
+        """Update the custom instructions for a section. These instructions override the default
+        AI behavior for that section on the next run. IMPORTANT: always call read_skill_instruction
+        first, then append your new rules to the existing content — do not discard prior rules.
+
+        section_id must be one of the keys in SECTION_IDS — see the TOOL ROUTING list
+        above for the catalog of available sections.
+        """
+        if section_id not in SECTION_IDS:
+            return f"Unknown section '{section_id}'. Available: {', '.join(SECTION_IDS)}"
+        path = data_dir / "instructions" / f"{section_id}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        print(f"[Bot] update_skill_instruction({section_id}) → {len(content)} chars")
+        return f"✅ Instructions updated for: {SECTION_IDS[section_id].split(' — ')[0]}"
 
     # --- Trigger tool ---
 
-    def run_skill(skill_name: str) -> str:
-        """Trigger a skill to run immediately in the background. Results appear in the dashboard when done.
-        skill_name must be one of: morning_briefing, email_intelligence, meeting_intelligence, business_insights, expense_capture."""
-        if skill_name not in SKILL_NAMES:
-            return f"Unknown skill. Available: {', '.join(SKILL_NAMES)}"
+    def run_skill(section_id: str) -> str:
+        """Trigger a section to run immediately in the background. When done, the
+        formatted result is auto-pushed to Teams chat AND written to the dashboard.
 
-        MODULE_MAP = {
-            "morning_briefing":    "src.modules.m01_briefing",
-            "email_intelligence":  "src.modules.m02_email",
-            "meeting_intelligence":"src.modules.m03_meeting",
-            "business_insights":   "src.modules.m04_intelligence",
-            "expense_capture":     "src.modules.m05_expense",
-        }
+        section_id must be one of the keys in SECTION_IDS — see the TOOL ROUTING
+        list above for the catalog of available sections."""
+        if section_id not in SECTION_IDS:
+            return f"Unknown section '{section_id}'. Available: {', '.join(SECTION_IDS)}"
+
+        owner_uid = bot_state.get("owner_uid", "")
+        if not owner_uid:
+            return "Cannot run section — owner user ID not found in bot state."
 
         def _run():
-            import importlib
             try:
-                mod = importlib.import_module(MODULE_MAP[skill_name])
-                mod.run(owner_graph=owner_graph, data_dir=data_dir, settings=settings)
-            except ModuleNotFoundError:
-                print(f"[Bot] run_skill: {MODULE_MAP[skill_name]} not yet implemented")
+                from src.server import _run_section_for_user
+                _run_section_for_user(owner_uid, section_id)
             except Exception as e:
-                print(f"[Bot] run_skill {skill_name} error: {e}")
+                print(f"[Bot] run_skill {section_id} error: {e}")
 
         import threading
         threading.Thread(target=_run, daemon=True).start()
-        print(f"[Bot] run_skill({skill_name}) → started")
-        return f"✅ {SKILL_NAMES[skill_name]} is running. Results will appear in your dashboard shortly."
+        label = SECTION_IDS[section_id].split(" — ")[0]
+        print(f"[Bot] run_skill({section_id}) → started")
+        return f"✅ {label} is running. Results will appear in your dashboard shortly."
 
     # --- Action tools ---
 
@@ -457,6 +546,126 @@ def reply(
         _save_user_model(user_model_path, user_model)
         print(f"[Bot] dismiss_item({subject_hint!r})")
         return f"✅ Dismissed — '{subject_hint}' will no longer appear in briefings or action items."
+
+    def _resolve_commitment(index_or_hint: str) -> tuple[str | None, str]:
+        """Return (commitment_id, description) by 1-based index or keyword match."""
+        try:
+            path = data_dir / "results" / "commitments_extract.json"
+            if not path.exists():
+                return None, ""
+            data = json.loads(path.read_text())
+            items = data.get("items", [])
+            try:
+                idx = int(index_or_hint) - 1
+                if 0 <= idx < len(items):
+                    return items[idx]["id"], items[idx].get("description", "")
+            except ValueError:
+                hint = index_or_hint.lower()
+                for item in items:
+                    if hint in (item.get("description") or "").lower():
+                        return item["id"], item.get("description", "")
+        except Exception:
+            pass
+        return None, ""
+
+    def mark_commitment_done(index_or_hint: str) -> str:
+        """Mark a commitment as completed so it no longer appears in the commitments list.
+        index_or_hint: the number shown in the commitments list (e.g. "2"), or a keyword from the description.
+        Use "all" to mark everything currently flagged as stale as done."""
+        from src.modules.commitments_state import mark_done as _mark_done, load_state as _load_state
+        if index_or_hint.strip().lower() == "all":
+            state = _load_state(data_dir)
+            asked_ids = list(state.get("asked", {}).keys())
+            for cid in asked_ids:
+                _mark_done(data_dir, cid, method="user")
+            print(f"[Bot] mark_commitment_done(all) → {len(asked_ids)} items")
+            return f"✅ Marked {len(asked_ids)} commitments as done."
+        cid, desc = _resolve_commitment(index_or_hint)
+        if not cid:
+            return f"⚠️ Couldn't find commitment '{index_or_hint}'. Run commitments_extract first."
+        _mark_done(data_dir, cid, method="user")
+        print(f"[Bot] mark_commitment_done({index_or_hint!r}) → {cid}")
+        return f"✅ Done: \"{desc}\""
+
+    def snooze_commitment(index_or_hint: str, days: int = 3) -> str:
+        """Snooze one or more commitments — hide them for N days, then resurface automatically.
+        index_or_hint: single number, space/comma-separated numbers ("2 3 4"), or keyword.
+        days: how many days to snooze (default 3)."""
+        from src.modules.commitments_state import mark_snoozed as _mark_snoozed
+        from datetime import date, timedelta
+        # Support multiple indices: "2 3 4" or "2,3,4"
+        tokens = [t.strip() for t in index_or_hint.replace(",", " ").split() if t.strip()]
+        if len(tokens) > 1 and all(t.isdigit() for t in tokens):
+            snoozed = []
+            for t in tokens:
+                cid, desc = _resolve_commitment(t)
+                if cid:
+                    _mark_snoozed(data_dir, cid, days=days)
+                    snoozed.append(desc)
+            if not snoozed:
+                return f"⚠️ Couldn't find commitments '{index_or_hint}'."
+            until = (date.today() + timedelta(days=days)).strftime("%B %d")
+            print(f"[Bot] snooze_commitment({tokens}, {days}d)")
+            return f"⏰ Snoozed {len(snoozed)} commitments until {until}."
+        cid, desc = _resolve_commitment(index_or_hint)
+        if not cid:
+            return f"⚠️ Couldn't find commitment '{index_or_hint}'."
+        _mark_snoozed(data_dir, cid, days=days)
+        print(f"[Bot] snooze_commitment({index_or_hint!r}, {days}d) → {cid}")
+        until = (date.today() + timedelta(days=days)).strftime("%B %d")
+        return f"⏰ Snoozed until {until}: \"{desc}\""
+
+    def dismiss_commitment(index_or_hint: str) -> str:
+        """Permanently remove one or more commitments — they will never appear again.
+        Use for 'skip X', 'skip 2 3 4', or when a commitment is cancelled/irrelevant.
+        index_or_hint: number, space/comma-separated numbers ("2 3 4"), keyword, or "all"."""
+        from src.modules.commitments_state import mark_done as _mark_done, load_state as _load_state
+        if index_or_hint.strip().lower() == "all":
+            state = _load_state(data_dir)
+            asked_ids = list(state.get("asked", {}).keys())
+            for cid in asked_ids:
+                _mark_done(data_dir, cid, method="user_dismissed")
+            return f"✅ Dismissed {len(asked_ids)} commitments."
+        # Support multiple indices: "2 3 4" or "2,3,4"
+        tokens = [t.strip() for t in index_or_hint.replace(",", " ").split() if t.strip()]
+        if len(tokens) > 1 and all(t.isdigit() for t in tokens):
+            dismissed = []
+            for t in tokens:
+                cid, desc = _resolve_commitment(t)
+                if cid:
+                    _mark_done(data_dir, cid, method="user_dismissed")
+                    dismissed.append(desc)
+            if not dismissed:
+                return f"⚠️ Couldn't find commitments '{index_or_hint}'."
+            print(f"[Bot] dismiss_commitment({tokens})")
+            return f"🗑️ Skipped {len(dismissed)} commitments."
+        cid, desc = _resolve_commitment(index_or_hint)
+        if not cid:
+            return f"⚠️ Couldn't find commitment '{index_or_hint}'."
+        _mark_done(data_dir, cid, method="user_dismissed")
+        print(f"[Bot] dismiss_commitment({index_or_hint!r}) → {cid}")
+        return f"🗑️ Skipped: \"{desc}\""
+
+    def create_reply_draft(to: str, subject: str, body: str) -> str:
+        """Compose and immediately save a new email draft to Outlook Drafts.
+        Call this when the user asks to draft, write, or compose an email reply.
+        to: recipient email address
+        subject: email subject line (prefix 'Re: ' for replies)
+        body: full plain-text email body in the user's writing style
+        IMPORTANT: after this tool succeeds, respond with ONE short sentence only —
+        e.g. 'Done, draft saved to your Outlook Drafts.' Do NOT repeat To/Subject/Body.
+        Do NOT generate any links or URLs yourself — a link is appended automatically."""
+        if owner_graph is None:
+            return "Owner account not available."
+        try:
+            result = owner_graph.create_draft(to=to, subject=subject, body=body)
+            web_link = result.get("webLink", "")
+            print(f"[Bot] create_reply_draft saved → '{subject}'")
+            if web_link:
+                state["_last_draft_web_link"] = web_link
+            return f"✅ Draft saved to Outlook Drafts: '{subject}' to {to}."
+        except Exception as e:
+            return f"Error saving draft: {e}"
 
     def list_pending_drafts() -> str:
         """List all pending email drafts waiting for approval."""
@@ -481,7 +690,7 @@ def reply(
         if owner_graph is None:
             return "Owner account not available."
         try:
-            owner_graph.create_draft(
+            result = owner_graph.create_draft(
                 to      = draft.get("to", ""),
                 subject = draft.get("subject", ""),
                 body    = draft.get("body", ""),
@@ -490,7 +699,10 @@ def reply(
             next_draft = queue[0] if queue else None
             state = {**state, "pending_draft": next_draft, "pending_queue": queue[1:] if queue else []}
             print(f"[Bot] approve_draft → '{draft.get('subject')}'")
+            web_link = result.get("webLink", "")
             nxt = f"\n\nNext draft ready: '{next_draft.get('subject')}'" if next_draft else ""
+            if web_link:
+                return f"✅ Draft saved — <a href='{web_link}'>Open in Outlook to review and send</a>{nxt}"
             return f"✅ Draft saved to Outlook Drafts: '{draft.get('subject')}'{nxt}"
         except Exception as e:
             return f"Error saving draft: {e}"
@@ -526,7 +738,7 @@ def reply(
             wb = openpyxl.load_workbook(master_file) if master_file.exists() else _init_workbook()
             _append_row(wb.active, pending["new_row"])
             wb.save(master_file)
-            if hashes_file and pending.get("hash"):
+            if hashes_file and pending.get("hash") and not pending.get("is_hash_dup"):
                 hashes = _load_hashes(hashes_file)
                 hashes[pending["hash"]] = pending["new_row"].get("Attachment", "")
                 _save_hashes(hashes, hashes_file)
@@ -540,6 +752,129 @@ def reply(
         nonlocal state
         state = {**state, "pending_expense": None}
         return "Expense discarded."
+
+    def update_crm_contact(email: str, field: str, value: str) -> str:
+        """Update a field on a CRM contact. Creates the contact if it doesn't exist.
+        Fields:
+          priority    — high / medium / low / none
+          notes       — free text, APPENDED with date stamp (not overwritten)
+          company     — company name string
+          name        — display name string
+          ignore      — true / false (blocks email notifications from this sender)
+        Use get_contact_history first to confirm the correct email address."""
+        if not data_dir:
+            return "No data directory available."
+        try:
+            from src.modules.crm import update_contact
+            contact = update_contact(data_dir, email, field, value)
+            return f"✅ Updated {field} for {email}: {value}"
+        except Exception as e:
+            return f"Error updating CRM contact: {e}"
+
+    def create_calendar_event(subject: str, start_iso: str, end_iso: str,
+                              attendee_emails: str = "",
+                              location: str = "",
+                              is_online_meeting: bool = False) -> str:
+        """Create a calendar event in the user's Outlook calendar.
+        start_iso / end_iso: ISO 8601 format in the user's local timezone
+          e.g. '2026-05-30T14:00:00' — convert natural language time using the timezone in your context.
+        attendee_emails: comma-separated email addresses (leave empty for solo blocks).
+        is_online_meeting: set true to add a Teams meeting link."""
+        if owner_graph is None:
+            return "Owner account not available."
+        try:
+            attendees = [a.strip() for a in attendee_emails.split(",") if a.strip()] if attendee_emails else []
+            result = owner_graph.create_event(
+                subject=subject,
+                start=start_iso,
+                end=end_iso,
+                attendees=attendees or None,
+                location=location or None,
+                timezone=settings.get("timezone", "UTC"),
+                is_online=is_online_meeting,
+            )
+            event_id = result.get("id", "")
+            web_link = result.get("webLink", "")
+            msg = f"✅ Event created: '{subject}' from {start_iso} to {end_iso}"
+            if attendees:
+                msg += f" · Invites sent to: {', '.join(attendees)}"
+            if web_link:
+                state["_last_draft_web_link"] = web_link
+            return msg
+        except Exception as e:
+            return f"Error creating event: {e}"
+
+    def run_outreach(context_note: str = "", folder: str = "") -> str:
+        """Batch-generate personalized email drafts from contacts in a OneDrive folder.
+        Use after a conference, networking event, or any time the user has a batch of new contacts to reach out to.
+
+        context_note: short context to inject into each draft
+                      (e.g. 'met at TechConf 2026', 'introduced by John at the Acme dinner').
+                      Always ask the user for this if not obvious from the conversation.
+        folder: OneDrive folder path (relative to drive root, e.g. 'Conferences/TechConf').
+                Leave empty to use the default from settings (outreach_folder).
+
+        Supported file types: business card photos (jpg/png), PDF rosters, CSV/Excel contact lists.
+        Drafts are saved to Outlook Drafts — user manually reviews and sends each one.
+        Already-processed files are skipped on re-runs."""
+        if owner_graph is None:
+            return "Owner account not available."
+        try:
+            from src.modules.outreach import run as _run_outreach
+            from src.ai import AIClient
+            _ai = AIClient()
+            result = _run_outreach(
+                graph=owner_graph,
+                ai=_ai,
+                data_dir=data_dir,
+                settings=settings,
+                context_note=context_note,
+                folder=folder,
+            )
+            if result.get("status") == "not_run":
+                return f"❌ {result.get('error', 'Unknown error')}"
+            s = result.get("summary", {})
+            msg = (f"✅ Outreach run complete:\n"
+                   f"  • {s.get('drafts', 0)} drafts saved to Outlook\n"
+                   f"  • {s.get('files', 0)} files processed\n"
+                   f"  • {s.get('skipped', 0)} contacts skipped (missing email or generation failed)")
+            if s.get("errors", 0):
+                msg += f"\n  • {s['errors']} errors"
+            return msg
+        except Exception as e:
+            return f"Error running outreach: {e}"
+
+    def dismiss_email_followup(from_name_or_subject: str) -> str:
+        """Remove a specific email from the unreplied follow-up reminder list.
+        Use this when the user says they've already handled an email (by phone, in person, etc.)
+        and no longer wants to be reminded about it.
+        DO NOT use this to permanently block emails from a sender — use update_skill_instruction for that.
+        Match by sender name or subject (partial match, case-insensitive)."""
+        if not data_dir:
+            return "No data directory available."
+        monitor_path = data_dir / "email_monitor.json"
+        if not monitor_path.exists():
+            return "No email monitor state found."
+        try:
+            import json as _j
+            monitor = _j.loads(monitor_path.read_text())
+            followups = monitor.get("pending_priority_followup") or []
+            query = from_name_or_subject.lower()
+            before = len(followups)
+            remaining = [
+                f for f in followups
+                if query not in f.get("from_name", "").lower()
+                and query not in f.get("from", "").lower()
+                and query not in f.get("subject", "").lower()
+            ]
+            removed = before - len(remaining)
+            if removed == 0:
+                return f"No follow-up reminder matched '{from_name_or_subject}'."
+            monitor["pending_priority_followup"] = remaining
+            monitor_path.write_text(_j.dumps(monitor, indent=2, ensure_ascii=False))
+            return f"✅ Removed {removed} follow-up reminder(s) matching '{from_name_or_subject}'."
+        except Exception as e:
+            return f"Error: {e}"
 
     all_tools = [
         # Query
@@ -558,11 +893,19 @@ def reply(
         run_skill,
         # Action
         dismiss_item,
+        mark_commitment_done,
+        snooze_commitment,
+        dismiss_commitment,
+        create_reply_draft,
         list_pending_drafts,
         approve_draft,
         skip_draft,
         confirm_expense,
         discard_expense,
+        dismiss_email_followup,
+        update_crm_contact,
+        create_calendar_event,
+        run_outreach,
     ]
 
     # ── Gemini function calling loop ───────────────────────
@@ -614,6 +957,11 @@ def reply(
 
     if not final_text:
         final_text = "Done."
+
+    # Append Outlook draft link if create_reply_draft saved one this turn
+    web_link = state.pop("_last_draft_web_link", None)
+    if web_link:
+        final_text += f"\n\n<a href='{web_link}'>📬 Open draft in Outlook</a>"
 
     _save_turn(db_path, text, final_text)
     return final_text, state

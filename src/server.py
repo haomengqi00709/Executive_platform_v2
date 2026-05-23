@@ -20,7 +20,13 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from src import auth
 from src.graph import GraphClient
 from src.ai import AIClient
-from src.sections import ai_summary, expenses
+from src.sections import ai_summary, expenses, reply_needed, followup_needed, commitments_extract, upcoming_commitments
+from src.sections import recent_meetings, meeting_action_items
+from src.sections import market_intelligence, company_intelligence
+from src.sections import relationship_health, business_insights
+from src.sections import meetings_today, due_today, yesterday_recap
+from src.sections import projects_needing_attention, project_status
+from src.sections import meeting_prep
 
 load_dotenv(override=True)
 
@@ -132,9 +138,11 @@ def auth_callback(code: str = None, state: str = None, error: str = None,
     resp.set_cookie("session_token", jwt_token, httponly=True, secure=False, max_age=60*60*24*7, samesite="lax")
     resp.delete_cookie("oauth_state")
     resp.delete_cookie("oauth_redirect")
-    if not (_udir(user_id) / "crm.json").exists():
-        threading.Thread(target=_build_crm_for_user, args=(user_id,), daemon=True).start()
-        print(f"[CRM] First login for {user_id} — CRM build started in background")
+    _ensure_onedrive_folders(user_id)
+    from src.modules.profile import is_profile_confirmed
+    if not is_profile_confirmed(_udir(user_id)):
+        threading.Thread(target=_run_first_login_init, args=(user_id,), daemon=True).start()
+        print(f"[init] First-login chain started for {user_id} (CRM → Projects → Profile)")
     return resp
 
 
@@ -215,9 +223,11 @@ def auth_poll(response: Response):
                 jwt_token = auth.create_jwt(user_id, username)
                 response.set_cookie("session_token", jwt_token, httponly=True,
                                     secure=False, max_age=60*60*24*7, samesite="lax")
-                if not (_udir(user_id) / "crm.json").exists():
-                    threading.Thread(target=_build_crm_for_user, args=(user_id,), daemon=True).start()
-                    print(f"[CRM] First login (device code) for {user_id} — CRM build started in background")
+                _ensure_onedrive_folders(user_id)
+                from src.modules.profile import is_profile_confirmed
+                if not is_profile_confirmed(_udir(user_id)):
+                    threading.Thread(target=_run_first_login_init, args=(user_id,), daemon=True).start()
+                    print(f"[init] First-login chain (device code) started for {user_id}")
             return {"status": "success"}
         except Exception as e:
             msg = str(e)
@@ -375,6 +385,26 @@ def _send_activation_greeting(bot_uid: str, peer_email: str, display_name: str):
         print(f"[TeamsBot] Greeting failed for {peer_email}: {e}")
 
 
+# ── OneDrive folder bootstrap ─────────────────────────────
+
+def _ensure_onedrive_folders(user_id: str) -> None:
+    """Create standard platform folders in the user's OneDrive (idempotent)."""
+    def _bg():
+        try:
+            token = auth.get_valid_access_token(user_id)
+            g = GraphClient(token)
+            for folder in [
+                "CEO Platform/Receipts",
+                "CEO Platform/Meetings",
+                "CEO Platform/CRM",
+            ]:
+                g.ensure_folder_path(folder)
+            print(f"[OneDrive] Platform folders ready for {user_id}")
+        except Exception as e:
+            print(f"[OneDrive] Folder setup failed for {user_id}: {e}")
+    threading.Thread(target=_bg, daemon=True).start()
+
+
 # ── Teams bot polling (scheduler) ─────────────────────────
 
 def _poll_teams_bot_all_users():
@@ -401,7 +431,7 @@ def _poll_teams_bot_all_users():
             except Exception:
                 pass
             new_state = poll_and_reply(
-                state, graph, None,
+                state, graph, AIClient(),
                 owner_graph=owner_graph,
                 owner_wiki_dir=_udir(owner_uid) / "wiki",
                 owner_settings=owner_settings,
@@ -415,6 +445,122 @@ def _poll_teams_bot_all_users():
             msg = str(e)
             if not any(c in msg for c in ("502", "503", "504", "ConnectionError", "Timeout")):
                 print(f"[TeamsBot] Error for {uid}: {e}")
+
+
+# ── Email monitor polling (scheduler) ─────────────────────
+
+def _poll_email_monitor_all_users():
+    from src.modules.email_monitor import poll_and_notify
+    sessions_dir = auth.DATA_DIR / "_sessions"
+    if not sessions_dir.exists():
+        return
+    for token_file in sessions_dir.glob("*.json"):
+        uid  = token_file.stem
+        path = _bot_state_path(uid)
+        if not path.exists():
+            continue
+        try:
+            state = _read_json(path)
+            if not state.get("enabled") or not state.get("is_registered_bot"):
+                continue
+            owner_uid = state.get("owner_uid") or uid
+            chat_id   = state.get("chat_id")
+            if not chat_id:
+                continue
+            owner_settings = _read_json(_user_settings(owner_uid))
+            owner_graph = None
+            try:
+                owner_graph = GraphClient(auth.get_valid_access_token(owner_uid))
+            except Exception:
+                continue
+            bot_token = auth.get_valid_access_token(uid)
+            graph = GraphClient(bot_token)
+            poll_and_notify(
+                graph=graph,
+                owner_graph=owner_graph,
+                data_dir=_udir(owner_uid),
+                settings=owner_settings,
+                chat_id=chat_id,
+            )
+        except Exception as e:
+            msg = str(e)
+            if not any(c in msg for c in ("502", "503", "504", "ConnectionError", "Timeout")):
+                print(f"[EmailMonitor] Error for {uid}: {e}")
+
+
+# ── Expense auto-scan polling (scheduler) ─────────────────
+
+def _poll_expense_scan_all_users():
+    """Auto-scan inbox every 10 min for receipt attachments. Notifies via Audrey if new receipts found."""
+    sessions_dir = auth.DATA_DIR / "_sessions"
+    if not sessions_dir.exists():
+        return
+    for token_file in sessions_dir.glob("*.json"):
+        uid = token_file.stem
+        bot_path = _bot_state_path(uid)
+        if bot_path.exists() and _read_json(bot_path).get("is_registered_bot"):
+            continue
+        try:
+            owner_graph = GraphClient(auth.get_valid_access_token(uid))
+            ai          = AIClient()
+            result      = expenses.run(owner_graph, ai, _udir(uid), days=1)
+            new_items   = result.get("items", [])
+            if not new_items:
+                continue
+            print(f"[ExpensePoll] {len(new_items)} new receipt(s) for {uid}")
+            try:
+                bot_uid, chat_id = _find_bot_for_user(uid)
+                if bot_uid and chat_id:
+                    bot_token = auth.get_valid_access_token(bot_uid)
+                    bot_graph = GraphClient(bot_token)
+                    bot_graph.send_chat_message(chat_id, _format_section_for_teams("expenses", result))
+            except Exception as ne:
+                print(f"[ExpensePoll] Teams notify failed for {uid}: {ne}")
+        except Exception as e:
+            msg = str(e)
+            if not any(c in msg for c in ("502", "503", "504", "ConnectionError", "Timeout")):
+                print(f"[ExpensePoll] Error for {uid}: {e}")
+
+
+def _poll_meeting_prep_all_users():
+    """Every 5 min, for each user with meeting.prep_enabled=true, run meeting_prep.
+    For each new prep item, push its teams_message directly to the user's Audrey chat."""
+    sessions_dir = auth.DATA_DIR / "_sessions"
+    if not sessions_dir.exists():
+        return
+    for token_file in sessions_dir.glob("*.json"):
+        uid = token_file.stem
+        bot_path = _bot_state_path(uid)
+        if bot_path.exists() and _read_json(bot_path).get("is_registered_bot"):
+            continue
+        try:
+            from src.modules.schedules import load_schedules
+            sched = load_schedules(_udir(uid))
+            if not sched.get("meeting", {}).get("prep_enabled"):
+                continue
+            owner_graph = GraphClient(auth.get_valid_access_token(uid))
+            ai          = AIClient()
+            settings    = _read_json(_user_settings(uid))
+            result      = meeting_prep.run(owner_graph, ai, _udir(uid), settings)
+            preps       = result.get("items", [])
+            if not preps:
+                continue
+            print(f"[MeetingPrep] {len(preps)} new prep(s) for {uid}")
+            try:
+                bot_uid, chat_id = _find_bot_for_user(uid)
+                if bot_uid and chat_id:
+                    bot_token = auth.get_valid_access_token(bot_uid)
+                    bot_graph = GraphClient(bot_token)
+                    for p in preps:
+                        msg = p.get("teams_message", "")
+                        if msg:
+                            bot_graph.send_chat_message(chat_id, msg)
+            except Exception as ne:
+                print(f"[MeetingPrep] Teams notify failed for {uid}: {ne}")
+        except Exception as e:
+            msg = str(e)
+            if not any(c in msg for c in ("502", "503", "504", "ConnectionError", "Timeout")):
+                print(f"[MeetingPrep] Error for {uid}: {e}")
 
 
 # ── Teams bot API ─────────────────────────────────────────
@@ -615,10 +761,144 @@ def test_graph(session: dict = Depends(require_session)):
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 
+# ── First-login init chain ────────────────────────────────
+
+def _make_progress_cb(uid: str):
+    """Returns a callable that pipes progress messages into init_status.json."""
+    from src.modules.profile import update_init_message
+    def cb(msg: str):
+        try:
+            update_init_message(_udir(uid), msg)
+        except Exception:
+            pass
+    return cb
+
+
+def _generate_profile(uid: str, progress_cb=None) -> None:
+    """Call run_profile_init for a user — no status side-effects."""
+    from src.modules.profile_init import run_profile_init
+    token    = auth.get_valid_access_token(uid)
+    graph    = GraphClient(token)
+    ai       = AIClient()
+    settings = _read_json(_user_settings(uid))
+    run_profile_init(_udir(uid), graph, ai, settings, progress=progress_cb)
+
+
+def _regenerate_profile_for_user(uid: str) -> None:
+    """
+    /api/profile/regenerate worker — runs in background.
+    Preserves user_confirmed status so the user isn't kicked back to Onboarding.
+    """
+    from src.modules.profile import (
+        save_init_status, load_init_status, reset_init_steps,
+        update_init_step,
+    )
+    was_confirmed = load_init_status(_udir(uid)).get("stage") == "user_confirmed"
+    reset_init_steps(_udir(uid))
+    update_init_step(_udir(uid), "crm",      "done")  # already done, skip
+    update_init_step(_udir(uid), "projects", "done")
+    update_init_step(_udir(uid), "profile",  "in_progress", "Re-drafting profile from current data...")
+    try:
+        _generate_profile(uid, progress_cb=_make_progress_cb(uid))
+        update_init_step(_udir(uid), "profile", "done", "Profile updated")
+    except Exception as e:
+        print(f"[profile_init] Regenerate failed for {uid}: {e}")
+        update_init_step(_udir(uid), "profile", "failed", f"Failed: {e}")
+    finally:
+        # Restore prior status if user had already confirmed; otherwise expose the draft.
+        save_init_status(_udir(uid), "user_confirmed" if was_confirmed else "draft_ready")
+
+
+def _build_crm_with_progress(uid: str, progress_cb) -> None:
+    from src.modules.crm import build_crm, save_crm
+    try:
+        token  = auth.get_valid_access_token(uid)
+        graph  = GraphClient(token)
+        ai     = AIClient()
+        result = build_crm(graph, ai, _udir(uid),
+                           market_segments_content=_get_market_segments(uid),
+                           progress_cb=progress_cb)
+        save_crm(_udir(uid), result)
+        print(f"[CRM] Initial build done for {uid} — {len(result.get('contacts', {}))} contacts")
+    except Exception as e:
+        print(f"[CRM] Initial build failed for {uid}: {e}")
+        raise
+
+
+def _build_projects_with_progress(uid: str, progress_cb) -> None:
+    from src.modules.projects import build_projects, save_projects
+    try:
+        token    = auth.get_valid_access_token(uid)
+        graph    = GraphClient(token)
+        ai       = AIClient()
+        settings = _read_json(_user_settings(uid))
+        result   = build_projects(graph, ai, _udir(uid), settings=settings,
+                                  progress_cb=progress_cb)
+        save_projects(_udir(uid), result)
+        print(f"[Projects] Initial build done for {uid} — {len(result.get('projects', {}))} projects")
+    except Exception as e:
+        print(f"[Projects] Initial build failed for {uid}: {e}")
+        raise
+
+
+def _run_first_login_init(uid: str) -> None:
+    """
+    Serial init chain on first OAuth login.
+      1. CRM build (scans 6 months of inbox)
+      2. Projects build (extracts ongoing work)
+      3. Profile init (drafts business_profile + market_segments)
+
+    Each stage updates init_status.json so the OnboardingPage can show
+    a live checklist. Failures don't block the chain — the user still
+    gets to the Onboarding page with whatever was generated.
+    """
+    from src.modules.profile import (
+        save_init_status, reset_init_steps, update_init_step,
+    )
+    progress_cb = _make_progress_cb(uid)
+    try:
+        save_init_status(_udir(uid), "generating")
+        reset_init_steps(_udir(uid))
+
+        # Step 1 — CRM
+        if (_udir(uid) / "crm.json").exists():
+            update_init_step(_udir(uid), "crm", "done", "CRM already built")
+        else:
+            update_init_step(_udir(uid), "crm", "in_progress", "Scanning inbox...")
+            try:
+                _build_crm_with_progress(uid, progress_cb)
+                update_init_step(_udir(uid), "crm", "done", f"Contacts captured")
+            except Exception as e:
+                update_init_step(_udir(uid), "crm", "failed", f"CRM scan failed: {e}")
+
+        # Step 2 — Projects
+        if (_udir(uid) / "projects.json").exists():
+            update_init_step(_udir(uid), "projects", "done", "Projects already built")
+        else:
+            update_init_step(_udir(uid), "projects", "in_progress", "Identifying active projects...")
+            try:
+                _build_projects_with_progress(uid, progress_cb)
+                update_init_step(_udir(uid), "projects", "done", "Projects identified")
+            except Exception as e:
+                update_init_step(_udir(uid), "projects", "failed", f"Project scan failed: {e}")
+
+        # Step 3 — Profile draft
+        update_init_step(_udir(uid), "profile", "in_progress", "Reading email signatures and drafting profile...")
+        try:
+            _generate_profile(uid, progress_cb=progress_cb)
+            update_init_step(_udir(uid), "profile", "done", "Profile draft ready")
+        except Exception as e:
+            print(f"[profile_init] Generate failed for {uid}: {e}")
+            update_init_step(_udir(uid), "profile", "failed", f"Draft generation failed: {e}")
+    finally:
+        save_init_status(_udir(uid), "draft_ready")
+
+
 # ── CRM lifecycle helpers ─────────────────────────────────
 
 def _get_market_segments(uid: str) -> str:
-    return _read_json(_user_settings(uid)).get("business_context", "")
+    from src.modules.profile import load_market_segments
+    return load_market_segments(_udir(uid))
 
 
 def _build_crm_for_user(uid: str) -> None:
@@ -657,32 +937,638 @@ def _refresh_crm_all_users() -> None:
         threading.Thread(target=_refresh_crm_for_user, args=(f.stem,), daemon=True).start()
 
 
+# ── Projects lifecycle helpers ────────────────────────────
+
+def _build_projects_for_user(uid: str) -> None:
+    from src.modules.projects import build_projects, save_projects
+    try:
+        token    = auth.get_valid_access_token(uid)
+        graph    = GraphClient(token)
+        ai       = AIClient()
+        settings = _read_json(_user_settings(uid))
+        result   = build_projects(graph, ai, _udir(uid), settings=settings)
+        save_projects(_udir(uid), result)
+        print(f"[Projects] Initial build done for {uid} — {len(result.get('projects', {}))} projects")
+    except Exception as e:
+        print(f"[Projects] Initial build failed for {uid}: {e}")
+
+
+def _refresh_projects_for_user(uid: str) -> None:
+    from src.modules.projects import refresh_projects, save_projects
+    if not (_udir(uid) / "projects.json").exists():
+        return
+    try:
+        token    = auth.get_valid_access_token(uid)
+        graph    = GraphClient(token)
+        ai       = AIClient()
+        settings = _read_json(_user_settings(uid))
+        result   = refresh_projects(graph, ai, _udir(uid), settings=settings)
+        save_projects(_udir(uid), result)
+        print(f"[Projects] Daily refresh done for {uid}")
+    except Exception as e:
+        print(f"[Projects] Daily refresh failed for {uid}: {e}")
+
+
+def _refresh_projects_all_users() -> None:
+    sessions_dir = auth.DATA_DIR / "_sessions"
+    if not sessions_dir.exists():
+        return
+    for f in sessions_dir.glob("*.json"):
+        threading.Thread(target=_refresh_projects_for_user, args=(f.stem,), daemon=True).start()
+
+
 # ── Section registry ─────────────────────────────────────
 # Add entries here as sections are implemented.
 
 _SECTION_RUNNERS: dict[str, object] = {
     "ai_summary": lambda graph, ai, data_dir, settings, progress:
         ai_summary.run(graph, ai, data_dir, settings, progress),
+    "reply_needed": lambda graph, ai, data_dir, settings, progress:
+        reply_needed.run(graph, ai, data_dir, settings, progress),
+    "followup_needed": lambda graph, ai, data_dir, settings, progress:
+        followup_needed.run(graph, ai, data_dir, settings, progress),
+    "commitments_extract": lambda graph, ai, data_dir, settings, progress:
+        commitments_extract.run(graph, ai, data_dir, settings, progress),
+    "upcoming_commitments": lambda graph, ai, data_dir, settings, progress:
+        upcoming_commitments.run(graph, ai, data_dir, settings, progress),
     "expenses": lambda graph, ai, data_dir, settings, progress:
         expenses.run(graph, ai, data_dir, progress=progress),
+    "recent_meetings": lambda graph, ai, data_dir, settings, progress:
+        recent_meetings.run(data_dir),
+    "meeting_action_items": lambda graph, ai, data_dir, settings, progress:
+        meeting_action_items.run(data_dir),
+    "market_intelligence": lambda graph, ai, data_dir, settings, progress:
+        market_intelligence.run(graph, ai, data_dir, settings, progress),
+    "company_intelligence": lambda graph, ai, data_dir, settings, progress:
+        company_intelligence.run(graph, ai, data_dir, settings, progress),
+    "relationship_health": lambda graph, ai, data_dir, settings, progress:
+        relationship_health.run(graph, ai, data_dir, settings, progress),
+    "business_insights": lambda graph, ai, data_dir, settings, progress:
+        business_insights.run(graph, ai, data_dir, settings, progress),
+    "meetings_today": lambda graph, ai, data_dir, settings, progress:
+        meetings_today.run(graph, ai, data_dir, settings, progress),
+    "due_today": lambda graph, ai, data_dir, settings, progress:
+        due_today.run(graph, ai, data_dir, settings, progress),
+    "yesterday_recap": lambda graph, ai, data_dir, settings, progress:
+        yesterday_recap.run(graph, ai, data_dir, settings, progress),
+    "projects_needing_attention": lambda graph, ai, data_dir, settings, progress:
+        projects_needing_attention.run(graph, ai, data_dir, settings, progress),
+    "project_status": lambda graph, ai, data_dir, settings, progress:
+        project_status.run(graph, ai, data_dir, settings, progress),
+    "meeting_prep": lambda graph, ai, data_dir, settings, progress:
+        meeting_prep.run(graph, ai, data_dir, settings, progress),
+}
+
+
+# Friendly "nothing to report" messages, sent when a section runs but produces
+# no items. Keeps the user informed that the section was checked.
+_EMPTY_SECTION_MESSAGES: dict[str, str] = {
+    "reply_needed":                "📧 **Reply Needed** — inbox is clear, no emails awaiting your reply.",
+    "followup_needed":             "📤 **Sent — No Response** — every email you sent has a reply. No follow-ups pending.",
+    "commitments_extract":         "📋 **Commitments** — no new commitments extracted from recent emails.",
+    "upcoming_commitments":        "📅 **Upcoming Commitments** — no commitments due in the next 7 days.",
+    "due_today":                   "✅ **Due Today** — nothing due today, you're free.",
+    "yesterday_recap":             "📰 **Yesterday's Recap** — quiet day, no activity to report.",
+    "meetings_today":              "📅 **Today's Meetings** — no meetings on your calendar today.",
+    "recent_meetings":             "🎬 **Recent Meetings** — no new meeting recordings captured.",
+    "meeting_action_items":        "📝 **Meeting Action Items** — no open action items.",
+    "expenses":                    "💳 **Expenses** — no new receipts captured.",
+    "market_intelligence":         "📡 **Market Intelligence** — no new market signals worth surfacing.",
+    "company_intelligence":        "🏢 **Company Intelligence** — no new company signals worth surfacing.",
+    "relationship_health":         "💚 **Relationship Health** — all key relationships are healthy. Nothing cooling.",
+    "projects_needing_attention":  "✅ **Projects Needing Attention** — all projects on track.",
+    "project_status":              "📁 **Project Status** — no active projects in your portfolio yet.",
+    "meeting_prep":                "🕐 **Meeting Prep** — no upcoming meetings in the prep window.",
+    "ai_summary":                  "☀️ **Morning Briefing** — no briefing produced (data may still be loading).",
 }
 
 
 def _format_section_for_teams(result: dict) -> str:
     section_id = result.get("id", "")
     if section_id == "ai_summary":
-        return result.get("briefing", "")
+        briefing = result.get("briefing", "")
+        if briefing:
+            return briefing
+        return _EMPTY_SECTION_MESSAGES["ai_summary"]
+
+    if section_id == "business_insights":
+        narrative = result.get("narrative") or ""
+        items = result.get("items", [])
+        week_of = result.get("week_of", "")
+        if not narrative and not items:
+            return f"📊 **Weekly Brief** — quiet week, nothing notable to report." + (f" (week of {week_of})" if week_of else "")
+        cat_tag = {
+            "pipeline":   "🟢 Pipeline",
+            "engagement": "🟡 Engagement",
+            "execution":  "🔵 Execution",
+            "intel":      "📡 Intel",
+        }
+        pri_tag = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+        header = f"**Weekly Brief** — week of {week_of}" if week_of else "**Weekly Brief**"
+        lines = [header]
+        if narrative:
+            lines.append("")
+            lines.append(narrative)
+        if items:
+            lines.append("")
+            lines.append(f"**Headlines ({len(items)})**")
+            for it in items[:8]:
+                cat = cat_tag.get(it.get("category", ""), it.get("category", "").title())
+                pri = pri_tag.get(it.get("priority", ""), "")
+                title = it.get("title", "")
+                detail = (it.get("detail") or "")[:240]
+                lines.append("")
+                lines.append(f"{pri} {cat} — **{title}**")
+                if detail:
+                    lines.append(detail)
+            if len(items) > 8:
+                lines.append(f"\n+{len(items) - 8} more")
+        # Deltas snippet
+        deltas = (result.get("stats") or {}).get("deltas") or {}
+        notable_deltas = [
+            (k, v) for k, v in deltas.items()
+            if v.get("pct") is not None and abs(v.get("pct", 0)) >= 25
+        ]
+        if notable_deltas:
+            lines.append("")
+            lines.append("**Notable week-over-week changes**")
+            for k, v in notable_deltas[:6]:
+                label = k.replace("_", " ")
+                pct = v.get("pct", 0)
+                arrow = "↑" if pct > 0 else "↓"
+                lines.append(f"  {arrow} {label}: {v['previous']} → {v['current']} ({pct:+d}%)")
+        return "\n".join(lines)
+
     items = result.get("items", [])
     if not items:
-        return ""
+        return _EMPTY_SECTION_MESSAGES.get(
+            section_id,
+            f"**{section_id.replace('_', ' ').title()}** — nothing to report.",
+        )
+
+    if section_id == "reply_needed":
+        lines = [f"**Reply Needed** — {len(items)} email(s)"]
+        priority_tag = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+        for i, item in enumerate(items[:10], start=1):
+            tag = priority_tag.get(item.get("priority", "medium"), "🟡")
+            subject = (item.get("subject") or "(no subject)")[:80]
+            from_name = (item.get("from_name") or "").strip()
+            from_email = (item.get("from_email") or "").strip()
+            sender = from_name or from_email or "Unknown sender"
+            summary = (item.get("reason") or item.get("preview") or "").strip()
+            summary = " ".join(summary.split())[:200]
+            lines.append("")
+            lines.append(f"{i}. {tag} **{subject}** — {sender}")
+            if summary:
+                lines.append(f"   {summary}")
+        if len(items) > 10:
+            lines.append("")
+            lines.append(f"... and {len(items) - 10} more")
+        return "\n".join(lines)
+
+    if section_id == "followup_needed":
+        lines = [f"**Follow-up Needed** — {len(items)} email(s)"]
+        urgency_tag = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+        for i, item in enumerate(items[:10], start=1):
+            tag = urgency_tag.get(item.get("urgency", "medium"), "🟡")
+            subject = (item.get("subject") or "(no subject)")[:55]
+            to_name = item.get("to_name") or item.get("to_email") or "—"
+            days = item.get("days_waiting", 0)
+            lines.append(f"{i}. {tag} \"{subject}\" → {to_name} ({days}d, no reply)")
+        if len(items) > 10:
+            lines.append(f"... and {len(items) - 10} more")
+        return "\n".join(lines)
+
+    if section_id == "commitments_extract":
+        priority_tag = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        dated = [it for it in items if it.get("due_date")]
+        undated = [it for it in items if not it.get("due_date")]
+        dated.sort(key=lambda it: it.get("due_date") or "")
+        undated.sort(key=lambda it: it.get("received") or "", reverse=True)
+
+        def _fmt_item(item: dict, kind: str) -> str:
+            tag = priority_tag.get(item.get("priority", "medium"), "🟡")
+            them = " ↩" if item.get("type") == "their_commitment" else ""
+            desc = (item.get("description") or "")[:120]
+            contact = item.get("contact_name") or item.get("contact_email") or ""
+            contact_str = f" → {contact}" if contact else ""
+            if kind == "dated":
+                due = item.get("due_date") or ""
+                if due == today_str:
+                    meta = "due today"
+                elif due == tomorrow_str:
+                    meta = "due tomorrow"
+                else:
+                    meta = f"due {due[5:]}" if due else ""
+            else:
+                received = (item.get("received") or "")[:16].replace("T", " ")
+                meta = f"from email {received}" if received else "no deadline"
+            return f"{tag}{them} {desc}{contact_str} ({meta})"
+
+        lines = [f"**Commitments** — {len(items)} item(s)"]
+
+        if dated:
+            lines.append("")
+            lines.append(f"**With deadline ({len(dated)})** — earliest first")
+            for i, item in enumerate(dated[:10], start=1):
+                lines.append(f"{i}. {_fmt_item(item, 'dated')}")
+            if len(dated) > 10:
+                lines.append(f"... and {len(dated) - 10} more dated item(s)")
+
+        if undated:
+            lines.append("")
+            lines.append(f"**No deadline ({len(undated)})** — latest email first")
+            for i, item in enumerate(undated[:5], start=1):
+                lines.append(f"{i}. {_fmt_item(item, 'undated')}")
+            if len(undated) > 5:
+                lines.append(f"... and {len(undated) - 5} more undated item(s)")
+
+        return "\n".join(lines)
+
+    if section_id == "upcoming_commitments":
+        window = result.get("window_days", 7)
+        priority_tag = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+        today_d = datetime.now().date()
+        tomorrow_d = today_d + timedelta(days=1)
+
+        # Bucket items
+        overdue, today_b, tomorrow_b, later = [], [], [], []
+        for it in items:
+            due_raw = (it.get("due_date") or "")[:10]
+            try:
+                due_d = datetime.strptime(due_raw, "%Y-%m-%d").date() if due_raw else None
+            except Exception:
+                due_d = None
+            if it.get("overdue") or (due_d and due_d < today_d):
+                overdue.append((due_d, it))
+            elif due_d == today_d:
+                today_b.append((due_d, it))
+            elif due_d == tomorrow_d:
+                tomorrow_b.append((due_d, it))
+            else:
+                later.append((due_d or datetime.max.date(), it))
+
+        # Sort each bucket by due_date ascending
+        for bucket in (overdue, today_b, tomorrow_b, later):
+            bucket.sort(key=lambda p: p[0] or datetime.max.date())
+
+        def _fmt(idx: int, it: dict, with_due: bool = True, days_ago: int = 0) -> str:
+            tag = priority_tag.get(it.get("priority", "medium"), "🟡")
+            them = " ↩" if it.get("type") == "their_commitment" else ""
+            desc = (it.get("description") or "")[:140]
+            contact = it.get("contact_name") or it.get("contact_email") or ""
+            contact_str = f" → {contact}" if contact else ""
+            extra = ""
+            if with_due:
+                due = (it.get("due_date") or "")[:10]
+                if days_ago > 0:
+                    extra = f" · was due {due[5:]} ({days_ago}d ago)"
+                elif due:
+                    extra = f" · due {due[5:]}"
+            return f"{idx}. {tag}{them} {desc}{contact_str}{extra}"
+
+        lines = [f"**Upcoming Commitments** — {len(items)} item(s) · next {window} days"]
+        shown = 0
+        cap = 15  # max items in the Teams message
+
+        def _emit_bucket(label: str, header: str, bucket: list, days_ago_for: bool = False):
+            nonlocal shown
+            if not bucket or shown >= cap:
+                return
+            lines.append("")
+            lines.append(header.format(n=len(bucket)))
+            for due_d, it in bucket:
+                if shown >= cap:
+                    break
+                days_ago = (today_d - due_d).days if (days_ago_for and due_d) else 0
+                lines.append("  " + _fmt(shown + 1, it, with_due=True, days_ago=days_ago))
+                shown += 1
+
+        _emit_bucket("overdue",  "⚠️ **Overdue ({n})**",      overdue,   days_ago_for=True)
+        _emit_bucket("today",    "📌 **Due today ({n})**",    today_b)
+        _emit_bucket("tomorrow", "📅 **Due tomorrow ({n})**", tomorrow_b)
+        _emit_bucket("later",    "📆 **Later this week ({n})**", later)
+
+        if len(items) > shown:
+            lines.append(f"\n+{len(items) - shown} more not shown")
+        return "\n".join(lines)
+
+    if section_id == "meeting_action_items":
+        # Group by meeting, sort meetings by date desc.
+        meetings: dict[str, list[dict]] = {}
+        meeting_meta: dict[str, dict] = {}
+        for it in items:
+            mid = it.get("meeting_id") or "_unknown"
+            meetings.setdefault(mid, []).append(it)
+            if mid not in meeting_meta:
+                meeting_meta[mid] = {
+                    "title": it.get("meeting_title") or "(unknown meeting)",
+                    "date":  it.get("meeting_date") or "",
+                }
+        ordered_mids = sorted(meetings.keys(),
+                              key=lambda m: meeting_meta[m]["date"], reverse=True)
+
+        lines = [f"**Meeting Action Items** — {len(items)} item(s) across {len(meetings)} meeting(s)"]
+        for mid in ordered_mids:
+            meta = meeting_meta[mid]
+            title = meta["title"]
+            date = meta["date"]
+            grp = meetings[mid]
+            lines.append("")
+            header = f"**{title}**"
+            if date:
+                header += f" — {date}"
+            header += f" ({len(grp)} item(s))"
+            lines.append(header)
+            for it in grp[:8]:
+                owner = (it.get("owner") or "—").strip()
+                action = " ".join((it.get("action") or "").split())[:220]
+                due = it.get("due_date")
+                due_str = f" (due {due[5:] if len(due) >= 10 else due})" if due else ""
+                lines.append(f"  • **{owner}**: {action}{due_str}")
+            if len(grp) > 8:
+                lines.append(f"  ... +{len(grp) - 8} more in this meeting")
+        return "\n".join(lines)
+
+    if section_id == "market_intelligence":
+        lines = [f"**Market Intelligence** — {len(items)} signal(s)"]
+        for i, item in enumerate(items[:12], start=1):
+            headline   = (item.get("headline") or "")[:120]
+            summary    = (item.get("summary") or "")[:250]
+            source     = (item.get("source") or "").strip()
+            source_url = (item.get("source_url") or "").strip()
+            date_part  = (item.get("published_date") or "")[5:]
+            signal     = item.get("signal_type", "other")
+            priority   = item.get("priority", "medium")
+
+            source_link = f"[{source}]({source_url})" if (source and source_url) else source
+            meta_parts  = [p for p in [signal, priority if priority != "medium" else "", date_part, source_link] if p]
+            meta        = " · ".join(meta_parts)
+
+            lines.append("")
+            lines.append(f"**{i}. {headline}**")
+            if summary:
+                lines.append(summary)
+            if meta:
+                lines.append(meta)
+        if len(items) > 12:
+            lines.append(f"\n+{len(items) - 12} more signals")
+        return "\n".join(lines)
+
+    if section_id == "company_intelligence":
+        lines = [f"**Company Intelligence** — {len(items)} signal(s)"]
+        # Group by company
+        by_company: dict[str, list[dict]] = {}
+        for item in items[:15]:
+            co = item.get("company") or "Unknown"
+            by_company.setdefault(co, []).append(item)
+        for company, co_items in by_company.items():
+            lines.append("")
+            lines.append(f"**{company}**")
+            for item in co_items:
+                headline   = (item.get("headline") or "")[:120]
+                summary    = (item.get("summary") or "")[:250]
+                person     = item.get("person") or ""
+                source     = (item.get("source") or "").strip()
+                source_url = (item.get("source_url") or "").strip()
+                date_part  = (item.get("published_date") or "")[5:]
+                priority   = item.get("priority", "medium")
+
+                source_link = f"[{source}]({source_url})" if (source and source_url) else source
+                meta_parts  = [p for p in [person, priority if priority != "medium" else "", date_part, source_link] if p]
+                meta        = " · ".join(meta_parts)
+
+                lines.append(f"**{headline}**")
+                if summary:
+                    lines.append(summary)
+                if meta:
+                    lines.append(meta)
+        remaining = len(items) - 15
+        if remaining > 0:
+            lines.append(f"\n+{remaining} more signals")
+        return "\n".join(lines)
+
+    if section_id == "relationship_health":
+        health_tag = {
+            "at_risk": "🔴 At Risk",
+            "stalled": "⏸ Stalled",
+            "cooling": "🟡 Cooling",
+            "new":     "🆕 New",
+        }
+        lines = [f"**Relationship Health** — {len(items)} contact(s) need attention"]
+        for item in items[:12]:
+            name      = item.get("contact_name") or item.get("contact_email") or "—"
+            company   = item.get("company") or ""
+            health    = item.get("health", "")
+            tag       = health_tag.get(health, health.upper())
+            reminder  = (item.get("reminder") or "")[:300]
+            action    = (item.get("suggested_action") or "")[:200]
+            who       = f"**{name}**" + (f" · {company}" if company else "")
+            lines.append("")
+            lines.append(f"{tag} — {who}")
+            if reminder:
+                lines.append(reminder)
+            if action:
+                lines.append(f"→ {action}")
+        if len(items) > 12:
+            lines.append(f"\n+{len(items) - 12} more")
+        return "\n".join(lines)
+
+    if section_id == "expenses":
+        lines = [f"💳 Expense Capture — {len(items)} new receipt(s) captured"]
+        totals: dict[str, float] = {}
+        for item in items:
+            cat = item.get("category", "Other")
+            try:
+                totals[cat] = totals.get(cat, 0) + float(item.get("amount") or 0)
+            except Exception:
+                pass
+        for i, item in enumerate(items[:8], start=1):
+            vendor   = (item.get("vendor") or "?")[:30]
+            amount   = item.get("amount", "")
+            currency = item.get("currency", "")
+            cat      = item.get("category", "")
+            date     = (item.get("date") or "")
+            lines.append(f"{i}. {vendor} — {amount} {currency} ({cat}) on {date}")
+        if totals:
+            lines.append("By category: " + " · ".join(
+                f"{k} ${v:.0f}" for k, v in sorted(totals.items())
+            ))
+        return "\n".join(lines)
+
+    if section_id == "meetings_today":
+        the_date = result.get("date", "")
+        lines = [f"**Today's Meetings** — {len(items)} meeting(s)" + (f" ({the_date})" if the_date else "")]
+        for it in items[:12]:
+            subject = (it.get("subject") or "(no subject)")[:100]
+            start = it.get("start_time") or ""
+            end = it.get("end_time") or ""
+            time_str = (f"{start}–{end}" if start and end else start) if not it.get("is_all_day") else "all day"
+            location = (it.get("location") or "").strip()
+            attendees = it.get("attendees", [])
+            who = f" · {len(attendees)} attendee(s)" if attendees else ""
+            loc_str = f" · {location[:60]}" if location else ""
+            lines.append("")
+            lines.append(f"**{time_str}** — {subject}{who}{loc_str}")
+            if attendees:
+                lines.append(f"  with {', '.join(attendees[:5])}" + ("..." if len(attendees) > 5 else ""))
+        if len(items) > 12:
+            lines.append(f"\n+{len(items) - 12} more")
+        return "\n".join(lines)
+
+    if section_id == "due_today":
+        the_date = result.get("date", "")
+        lines = [f"**Due Today** — {len(items)} commitment(s)" + (f" ({the_date})" if the_date else "")]
+        priority_tag = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+        for i, it in enumerate(items[:15], start=1):
+            tag = priority_tag.get(it.get("priority", "medium"), "🟡")
+            desc = (it.get("description") or "")[:160]
+            contact = it.get("contact_name") or it.get("contact_email") or ""
+            contact_str = f" → {contact}" if contact else ""
+            lines.append(f"{i}. {tag} {desc}{contact_str}")
+        if len(items) > 15:
+            lines.append(f"... +{len(items) - 15} more")
+        return "\n".join(lines)
+
+    if section_id == "yesterday_recap":
+        stats = result.get("stats", {})
+        the_date = result.get("date", "")
+        lines = [f"**Yesterday's Recap** — {the_date}"]
+        lines.append(
+            f"📥 {stats.get('inbound_count', 0)} in  ·  "
+            f"📤 {stats.get('outbound_count', 0)} out  ·  "
+            f"📅 {stats.get('meetings_count', 0)} meeting(s)  ·  "
+            f"✅ {stats.get('commitments_count', 0)} commitment(s)"
+        )
+
+        meetings = [i for i in items if i.get("type") == "meeting"]
+        inbound = [i for i in items if i.get("type") == "inbound_email"]
+        outbound = [i for i in items if i.get("type") == "outbound_email"]
+        commits = [i for i in items if i.get("type") == "commitment"]
+
+        if meetings:
+            lines.append("")
+            lines.append(f"**Meetings ({len(meetings)})**")
+            for m in meetings:
+                rng = f"{m.get('start','')}–{m.get('end','')}" if m.get("start") else ""
+                subj = (m.get("subject") or "")[:100]
+                lines.append(f"  • {rng} {subj}")
+
+        if inbound:
+            lines.append("")
+            lines.append(f"**Top inbound ({len(inbound)})**")
+            for m in inbound:
+                lines.append(f"  • {m.get('time','')} \"{(m.get('subject') or '')[:90]}\" — {m.get('from','')}")
+
+        if outbound:
+            lines.append("")
+            lines.append(f"**Top outbound ({len(outbound)})**")
+            for m in outbound:
+                lines.append(f"  • {m.get('time','')} \"{(m.get('subject') or '')[:90]}\" → {m.get('to','')}")
+
+        if commits:
+            lines.append("")
+            lines.append(f"**New commitments ({len(commits)})**")
+            for c in commits:
+                kind = " ↩" if c.get("commit_kind") == "their_commitment" else ""
+                due = f" (due {c.get('due_date','')[5:]})" if c.get("due_date") else ""
+                lines.append(f"  •{kind} {(c.get('description') or '')[:140]}{due}")
+        return "\n".join(lines)
+
+    if section_id == "projects_needing_attention":
+        total = result.get("total_projects", 0)
+        lines = [f"**Projects Needing Attention** — {len(items)} of {total} project(s)"]
+        status_tag = {"needs_attention": "🔴 Needs Attention", "early_stage": "🆕 Early Stage"}
+        for it in items[:10]:
+            name = it.get("name", "")
+            tag = status_tag.get(it.get("status", ""), it.get("status", "").upper())
+            momentum = it.get("momentum", "")
+            mom_str = f" · {momentum} momentum" if momentum else ""
+            last = it.get("last_activity", "")
+            last_str = f" · last activity {last}" if last else ""
+            summary = (it.get("summary") or "")[:240]
+            next_action = (it.get("next_action") or "")[:200]
+            lines.append("")
+            lines.append(f"{tag} — **{name}**{mom_str}{last_str}")
+            if summary:
+                lines.append(summary)
+            if next_action:
+                lines.append(f"→ {next_action}")
+        if len(items) > 10:
+            lines.append(f"\n+{len(items) - 10} more")
+        return "\n".join(lines)
+
+    if section_id == "project_status":
+        counts = result.get("status_counts", {})
+        lines = [f"**Project Status** — {len(items)} active project(s)"]
+        if counts:
+            parts = []
+            for k in ("ongoing", "needs_attention", "paused", "early_stage"):
+                if counts.get(k):
+                    parts.append(f"{k.replace('_', ' ')} {counts[k]}")
+            if parts:
+                lines.append("  ·  ".join(parts))
+
+        status_tag = {
+            "ongoing":         "🟢",
+            "needs_attention": "🔴",
+            "paused":          "⏸",
+            "early_stage":     "🆕",
+        }
+        # Group by status
+        by_status: dict[str, list[dict]] = {}
+        for it in items:
+            by_status.setdefault(it.get("status", ""), []).append(it)
+        for status in ("needs_attention", "ongoing", "paused", "early_stage"):
+            grp = by_status.get(status, [])
+            if not grp:
+                continue
+            lines.append("")
+            lines.append(f"{status_tag.get(status, '')} **{status.upper()} ({len(grp)})**")
+            for it in grp[:8]:
+                name = it.get("name", "")
+                momentum = it.get("momentum", "")
+                last = it.get("last_activity", "")
+                meta_parts = [p for p in [momentum, f"last {last}" if last else ""] if p]
+                meta = " · ".join(meta_parts)
+                lines.append(f"  • {name}" + (f" — {meta}" if meta else ""))
+            if len(grp) > 8:
+                lines.append(f"  ... +{len(grp) - 8} more")
+        return "\n".join(lines)
+
     title = section_id.replace("_", " ").title()
     lines = [f"**{title}** — {len(items)} item(s)"]
-    for item in items[:5]:
+    for i, item in enumerate(items[:10], start=1):
         label = item.get("subject") or item.get("vendor") or item.get("title") or str(item)
-        lines.append(f"• {str(label)[:80]}")
-    if len(items) > 5:
-        lines.append(f"• ... and {len(items) - 5} more")
+        lines.append(f"{i}. {str(label)[:80]}")
+    if len(items) > 10:
+        lines.append(f"... and {len(items) - 10} more")
     return "\n".join(lines)
+
+
+def _log_outbound_to_history(uid: str, content: str) -> None:
+    """Append an outbound system message (briefing push, prep, expense notify, …)
+    to .data/{uid}/bot_history.db so the web chat panel can see it too."""
+    if not content:
+        return
+    import sqlite3, time
+    db_path = _udir(uid) / "bot_history.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        con = sqlite3.connect(str(db_path))
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS history "
+            "(id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, content TEXT, ts REAL)"
+        )
+        con.execute("INSERT INTO history (role, content, ts) VALUES (?, ?, ?)",
+                    ("model", content, time.time()))
+        con.commit()
+        con.close()
+    except Exception as e:
+        print(f"[Bot] history log failed for {uid}: {e}")
 
 
 def _send_to_bot(uid: str, result: dict) -> None:
@@ -696,6 +1582,7 @@ def _send_to_bot(uid: str, result: dict) -> None:
         bot_token = auth.get_valid_access_token(bot_uid)
         bot_graph = GraphClient(bot_token)
         bot_graph.send_chat_message(chat_id, message)
+        _log_outbound_to_history(uid, message)
     except Exception as e:
         print(f"[Bot] Failed to send {result.get('id')} to {uid}: {e}")
 
@@ -750,6 +1637,26 @@ def run_section(section_id: str, background_tasks: BackgroundTasks,
 
     background_tasks.add_task(_run)
     return {"ok": True}
+
+
+@app.get("/api/sections/due_today")
+def get_due_today(session: dict = Depends(require_session)):
+    """Derived section — real-time filter of commitments_extract for due_date == today."""
+    uid = session["user_id"]
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    path = _udir(uid) / "results" / "commitments_extract.json"
+    if not path.exists():
+        return {"id": "due_today", "status": "not_run", "items": [], "count": 0, "empty": True}
+    data = _read_json(path)
+    items = [
+        item for item in data.get("items", [])
+        if item.get("due_date") == today_str and item.get("type") == "my_commitment"
+    ]
+    return {
+        "id": "due_today", "status": "fresh",
+        "date": today_str, "items": items,
+        "count": len(items), "empty": len(items) == 0,
+    }
 
 
 @app.get("/api/sections/{section_id}")
@@ -840,6 +1747,43 @@ def patch_crm_contact(email: str, body: dict, session: dict = Depends(require_se
     return data["contacts"][addr]
 
 
+@app.post("/api/crm")
+def create_crm_contact(body: dict, session: dict = Depends(require_session)):
+    """Manually add a new contact. Required: email. Optional: name, company,
+    role, phone, linkedin, status, priority, summary, writing_style, notes."""
+    uid  = session["user_id"]
+    from src.modules.crm import load_crm, save_crm
+    email = (body.get("email") or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(400, "Valid email is required")
+    data = load_crm(_udir(uid))
+    contacts = data.setdefault("contacts", {})
+    if email in contacts:
+        raise HTTPException(409, "Contact already exists — use PATCH to update")
+    today = datetime.now().strftime("%Y-%m-%d")
+    contact = {
+        "email":         email,
+        "name":          body.get("name", ""),
+        "company":       body.get("company", ""),
+        "role":          body.get("role", ""),
+        "phone":         body.get("phone", ""),
+        "linkedin":      body.get("linkedin", ""),
+        "status":        body.get("status", "other"),
+        "priority":      body.get("priority", "medium"),
+        "summary":       body.get("summary", ""),
+        "writing_style": body.get("writing_style", ""),
+        "notes":         body.get("notes", ""),
+        "thread_count":  body.get("thread_count", 0),
+        "last_contact":  body.get("last_contact", today),
+        "ignore":        bool(body.get("ignore", False)),
+        "updated_at":    today,
+        "manual":        True,
+    }
+    contacts[email] = contact
+    save_crm(_udir(uid), data)
+    return contact
+
+
 @app.post("/api/crm/scan")
 def trigger_crm_scan(background_tasks: BackgroundTasks,
                      session: dict = Depends(require_session),
@@ -863,11 +1807,754 @@ def trigger_crm_scan(background_tasks: BackgroundTasks,
     return {"ok": True, "message": "CRM scan started"}
 
 
+# ── M03 Meeting scan ──────────────────────────────────────
+
+@app.post("/api/m03/scan")
+def trigger_m03_scan(background_tasks: BackgroundTasks,
+                     session: dict = Depends(require_session),
+                     force: bool = False,
+                     use_mock: bool = False):
+    uid = session["user_id"]
+
+    def _run():
+        try:
+            from src.modules.m03_meeting import run as m03_run
+            from src.ai import AIClient
+            token    = auth.get_valid_access_token(uid)
+            graph    = GraphClient(token)
+            ai       = AIClient()
+            settings = _read_json(_user_settings(uid))
+            result   = m03_run(graph, ai, _udir(uid), settings=settings, force=force, use_mock=use_mock)
+            # Refresh read sections from the newly populated Meeting DB
+            recent_meetings.run(_udir(uid))
+            meeting_action_items.run(_udir(uid))
+            print(f"[M03] Scan complete for {uid}: {result.get('processed', 0)} processed")
+
+            # Send Teams notification for each processed meeting
+            processed_results = [r for r in result.get("results", []) if r.get("status") == "processed"]
+            if processed_results:
+                lines = [f"✅ Meeting scan complete — {len(processed_results)} meeting(s) processed"]
+                for r in processed_results[:5]:
+                    n_actions = len(r.get("action_items", []))
+                    draft_saved = r.get("followup_draft_saved", False)
+                    title = r.get("title", "(untitled)")
+                    date  = (r.get("date") or "")[:10]
+                    lines.append(
+                        f"• **{title}**" + (f" ({date})" if date else "")
+                        + f" — {n_actions} action item(s)"
+                        + (" · follow-up draft saved to Drafts" if draft_saved else "")
+                    )
+                try:
+                    bot_uid, chat_id = _find_bot_for_user(uid)
+                    if bot_uid and chat_id:
+                        bot_token  = auth.get_valid_access_token(bot_uid)
+                        bot_graph  = GraphClient(bot_token)
+                        bot_graph.send_chat_message(chat_id, "\n".join(lines))
+                except Exception as _ne:
+                    print(f"[M03] Teams notification failed: {_ne}")
+
+        except Exception as e:
+            print(f"[M03] Scan failed for {uid}: {e}")
+
+    background_tasks.add_task(_run)
+    return {"ok": True, "message": "Meeting scan started"}
+
+
+# ── Projects: read-only list + manual edit ───────────────
+
+_PROJECT_EDITABLE_FIELDS = {
+    "status", "momentum", "category", "summary", "next_action",
+    "name", "deadline", "ignore",
+}
+_PROJECT_VALID_STATUSES  = {"ongoing", "needs_attention", "paused", "early_stage", "completed"}
+_PROJECT_VALID_MOMENTUMS = {"accelerating", "steady", "slowing", "stalled"}
+
+
+@app.get("/api/projects")
+def get_projects(session: dict = Depends(require_session)):
+    """List all projects from projects.json."""
+    uid       = session["user_id"]
+    proj_path = _udir(uid) / "projects.json"
+    if not proj_path.exists():
+        return {"last_scan": None, "total": 0, "projects": []}
+    try:
+        data     = json.loads(proj_path.read_text())
+        projects = list(data.get("projects", {}).values())
+        projects.sort(key=lambda p: p.get("last_activity", ""), reverse=True)
+        return {
+            "last_scan": data.get("last_scan"),
+            "total":     len(projects),
+            "projects":  projects,
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.patch("/api/projects/{project_id}")
+def patch_project(project_id: str, body: dict, session: dict = Depends(require_session)):
+    """Manually update a project. Allowed fields: status, momentum, category,
+    summary, next_action, name, deadline, ignore."""
+    uid       = session["user_id"]
+    proj_path = _udir(uid) / "projects.json"
+    if not proj_path.exists():
+        raise HTTPException(404, "Projects DB not built yet")
+    data = json.loads(proj_path.read_text())
+    projects = data.get("projects", {})
+    if project_id not in projects:
+        raise HTTPException(404, f"Project '{project_id}' not found")
+    updates = {k: v for k, v in body.items() if k in _PROJECT_EDITABLE_FIELDS}
+    if "status" in updates and updates["status"] not in _PROJECT_VALID_STATUSES:
+        raise HTTPException(400, f"Invalid status. Must be one of {sorted(_PROJECT_VALID_STATUSES)}")
+    if "momentum" in updates and updates["momentum"] not in _PROJECT_VALID_MOMENTUMS:
+        raise HTTPException(400, f"Invalid momentum. Must be one of {sorted(_PROJECT_VALID_MOMENTUMS)}")
+    projects[project_id].update(updates)
+    projects[project_id]["updated_at"] = datetime.now().strftime("%Y-%m-%d")
+    data["projects"] = projects
+    # Atomic write
+    tmp = proj_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    tmp.replace(proj_path)
+    return projects[project_id]
+
+
+# ── Expenses: full history from Excel + manual edit ──────
+
+_EXPENSE_EDITABLE_FIELDS = {"Vendor", "Date", "Amount", "Currency", "Category", "GST_HST", "Net_Amount"}
+
+
+def _expense_row_id(row: dict) -> str:
+    """Stable id computed from Msg_ID + Att_ID (or fallback to row content)."""
+    import hashlib
+    key = (str(row.get("Msg_ID") or "") + "::" + str(row.get("Att_ID") or ""))
+    if not key.strip("::"):
+        # Fallback: hash the whole row
+        key = json.dumps({k: str(v) for k, v in row.items()}, sort_keys=True)
+    return hashlib.sha1(key.encode()).hexdigest()[:16]
+
+
+@app.get("/api/expenses/all")
+def get_all_expenses(session: dict = Depends(require_session)):
+    """Return all rows from expenses_master.xlsx as a JSON list with stable ids."""
+    uid  = session["user_id"]
+    path = _udir(uid) / "expenses" / "expenses_master.xlsx"
+    if not path.exists():
+        return []
+    try:
+        from openpyxl import load_workbook
+        ws      = load_workbook(path).active
+        headers = [c.value for c in ws[1]]
+        rows = [
+            dict(zip(headers, row))
+            for row in ws.iter_rows(min_row=2, values_only=True)
+        ]
+        for r in rows:
+            r["id"] = _expense_row_id(r)
+        return rows
+    except Exception:
+        return []
+
+
+@app.patch("/api/expenses/{row_id}")
+def patch_expense(row_id: str, body: dict, session: dict = Depends(require_session)):
+    """Manually update a row in expenses_master.xlsx. Allowed fields: Vendor,
+    Date, Amount, Currency, Category, GST_HST, Net_Amount."""
+    uid  = session["user_id"]
+    path = _udir(uid) / "expenses" / "expenses_master.xlsx"
+    if not path.exists():
+        raise HTTPException(404, "No expense ledger yet")
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        raise HTTPException(500, "openpyxl not installed")
+
+    wb = load_workbook(path)
+    ws = wb.active
+    headers = [c.value for c in ws[1]]
+    col_index = {h: i + 1 for i, h in enumerate(headers)}  # 1-based
+
+    target_row = None
+    for row_num in range(2, ws.max_row + 1):
+        row_dict = {h: ws.cell(row=row_num, column=col_index[h]).value for h in headers}
+        if _expense_row_id(row_dict) == row_id:
+            target_row = row_num
+            break
+    if target_row is None:
+        raise HTTPException(404, f"Expense row '{row_id}' not found")
+
+    updates = {k: v for k, v in body.items() if k in _EXPENSE_EDITABLE_FIELDS}
+    for field, value in updates.items():
+        if field in col_index:
+            ws.cell(row=target_row, column=col_index[field]).value = value
+
+    wb.save(path)
+
+    updated_row = {h: ws.cell(row=target_row, column=col_index[h]).value for h in headers}
+    updated_row["id"] = _expense_row_id(updated_row)
+    return updated_row
+
+
+@app.post("/api/expenses")
+def create_expense(body: dict, session: dict = Depends(require_session)):
+    """Manually add a new receipt row to expenses_master.xlsx."""
+    uid  = session["user_id"]
+    expenses_dir = _udir(uid) / "expenses"
+    expenses_dir.mkdir(parents=True, exist_ok=True)
+    path = expenses_dir / "expenses_master.xlsx"
+    try:
+        from openpyxl import Workbook, load_workbook
+    except ImportError:
+        raise HTTPException(500, "openpyxl not installed")
+
+    headers = [
+        "Date", "Vendor", "Amount", "Currency", "GST_HST", "Net_Amount",
+        "Category", "Attachment", "Email_Subject", "From", "Msg_ID", "Att_ID", "Processed_Date",
+    ]
+    if path.exists():
+        wb = load_workbook(path)
+        ws = wb.active
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Expenses"
+        ws.append(headers)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    manual_id = f"manual_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+    new_row = [
+        body.get("Date") or today,
+        body.get("Vendor", ""),
+        body.get("Amount", ""),
+        body.get("Currency", "CAD"),
+        body.get("GST_HST", ""),
+        body.get("Net_Amount", ""),
+        body.get("Category", "Other"),
+        body.get("Attachment", ""),
+        body.get("Email_Subject", "(manual entry)"),
+        body.get("From", ""),
+        manual_id,                # Msg_ID
+        manual_id,                # Att_ID — stable id source
+        today,                    # Processed_Date
+    ]
+    ws.append(new_row)
+    wb.save(path)
+
+    row_dict = dict(zip(headers, new_row))
+    row_dict["id"] = _expense_row_id(row_dict)
+    return row_dict
+
+
+@app.get("/api/expenses/{row_id}/photo")
+def get_expense_photo(row_id: str, session: dict = Depends(require_session)):
+    """Stream the receipt photo from OneDrive (CEO Platform/Receipts/{attachment})."""
+    from fastapi.responses import Response
+    uid  = session["user_id"]
+    path = _udir(uid) / "expenses" / "expenses_master.xlsx"
+    if not path.exists():
+        raise HTTPException(404, "No expense ledger yet")
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        raise HTTPException(500, "openpyxl not installed")
+
+    wb = load_workbook(path)
+    ws = wb.active
+    headers = [c.value for c in ws[1]]
+    col_index = {h: i + 1 for i, h in enumerate(headers)}
+
+    attachment_name = None
+    for row_num in range(2, ws.max_row + 1):
+        row_dict = {h: ws.cell(row=row_num, column=col_index[h]).value for h in headers}
+        if _expense_row_id(row_dict) == row_id:
+            attachment_name = row_dict.get("Attachment")
+            break
+    if not attachment_name:
+        raise HTTPException(404, "Receipt row not found or has no attachment")
+
+    try:
+        token = auth.get_valid_access_token(uid)
+        graph = GraphClient(token)
+        from urllib.parse import quote
+        encoded = quote(f"CEO Platform/Receipts/{attachment_name}", safe="/")
+        # Get item metadata + downloadUrl
+        meta = graph.get(f"/me/drive/root:/{encoded}")
+        download_url = meta.get("@microsoft.graph.downloadUrl")
+        mime = (meta.get("file") or {}).get("mimeType", "application/octet-stream")
+        if not download_url:
+            content = graph.download(f"/me/drive/root:/{encoded}:/content")
+        else:
+            import requests as _req
+            r = _req.get(download_url, timeout=20)
+            r.raise_for_status()
+            content = r.content
+        return Response(content=content, media_type=mime)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(404, f"Photo not in OneDrive: {e}")
+
+
+@app.delete("/api/expenses/{row_id}")
+def delete_expense(row_id: str, session: dict = Depends(require_session)):
+    """Delete a row from expenses_master.xlsx."""
+    uid  = session["user_id"]
+    path = _udir(uid) / "expenses" / "expenses_master.xlsx"
+    if not path.exists():
+        raise HTTPException(404, "No expense ledger yet")
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        raise HTTPException(500, "openpyxl not installed")
+
+    wb = load_workbook(path)
+    ws = wb.active
+    headers = [c.value for c in ws[1]]
+    col_index = {h: i + 1 for i, h in enumerate(headers)}
+
+    target_row = None
+    for row_num in range(2, ws.max_row + 1):
+        row_dict = {h: ws.cell(row=row_num, column=col_index[h]).value for h in headers}
+        if _expense_row_id(row_dict) == row_id:
+            target_row = row_num
+            break
+    if target_row is None:
+        raise HTTPException(404, f"Expense row '{row_id}' not found")
+
+    ws.delete_rows(target_row, 1)
+    wb.save(path)
+    return {"ok": True}
+
+
+# ── Company Intelligence Watchlist ────────────────────────
+
+# ── Outreach (batch draft emails from OneDrive folder) ────
+
+@app.post("/api/outreach/run")
+async def trigger_outreach(request: Request, session: dict = Depends(require_session)):
+    """Batch-generate Outlook drafts for contacts found in a OneDrive folder.
+    Body: {"folder": "Conferences/TechConf", "context_note": "met at TechConf 2026"}
+    folder defaults to settings.outreach_folder if omitted.
+    """
+    uid  = session["user_id"]
+    body = await request.json()
+    folder       = (body.get("folder") or "").strip()
+    context_note = (body.get("context_note") or "").strip()
+
+    try:
+        from src.modules.outreach import run as _run_outreach
+        token    = auth.get_valid_access_token(uid)
+        graph    = GraphClient(token)
+        ai       = AIClient()
+        settings = _read_json(_user_settings(uid))
+        result   = _run_outreach(
+            graph=graph, ai=ai, data_dir=_udir(uid),
+            settings=settings, folder=folder, context_note=context_note,
+        )
+        return result
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/outreach/last")
+def get_last_outreach(session: dict = Depends(require_session)):
+    """Return the most recent outreach run results."""
+    uid = session["user_id"]
+    f   = _udir(uid) / "outreach" / "results.json"
+    if not f.exists():
+        return {"status": "not_run"}
+    try:
+        return json.loads(f.read_text())
+    except Exception:
+        return {"status": "not_run"}
+
+
+@app.get("/api/watchlist")
+def get_watchlist(session: dict = Depends(require_session)):
+    uid  = session["user_id"]
+    path = _udir(uid) / "market_watchlist.json"
+    if not path.exists():
+        return {"companies": []}
+    try:
+        return {"companies": json.loads(path.read_text())}
+    except Exception:
+        return {"companies": []}
+
+
+@app.post("/api/watchlist")
+async def save_watchlist(request: Request, session: dict = Depends(require_session)):
+    uid  = session["user_id"]
+    body = await request.json()
+    companies = [str(c).strip() for c in body.get("companies", []) if str(c).strip()]
+    path = _udir(uid) / "market_watchlist.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(companies, indent=2, ensure_ascii=False))
+    return {"ok": True, "count": len(companies)}
+
+
+# ── User Profile (business_profile + market_segments) ────
+
+@app.get("/api/profile")
+def get_profile(session: dict = Depends(require_session)):
+    from src.modules.profile import load_business_profile, load_market_segments
+    uid = session["user_id"]
+    return {
+        "business_profile": load_business_profile(_udir(uid)),
+        "market_segments":  load_market_segments(_udir(uid)),
+    }
+
+
+@app.post("/api/profile/business")
+async def save_business_profile_endpoint(request: Request, session: dict = Depends(require_session)):
+    from src.modules.profile import save_business_profile
+    uid  = session["user_id"]
+    body = await request.json()
+    text = str(body.get("text", ""))
+    save_business_profile(_udir(uid), text)
+    return {"ok": True}
+
+
+@app.post("/api/profile/segments")
+async def save_market_segments_endpoint(request: Request, session: dict = Depends(require_session)):
+    from src.modules.profile import save_market_segments
+    uid  = session["user_id"]
+    body = await request.json()
+    text = str(body.get("text", ""))
+    save_market_segments(_udir(uid), text)
+    return {"ok": True}
+
+
+@app.get("/api/profile/status")
+def get_profile_status(session: dict = Depends(require_session)):
+    from src.modules.profile import load_init_status, init_has_started, save_init_status
+    uid  = session["user_id"]
+    udir = _udir(uid)
+    # Auto-kick: if init has never been triggered for this user (e.g. existing
+    # session predating this feature), start the chain now so the OnboardingPage
+    # actually shows progress instead of frozen "pending" dots.
+    if not init_has_started(udir):
+        save_init_status(udir, "generating")  # creates the status file so we only kick once
+        threading.Thread(target=_run_first_login_init, args=(uid,), daemon=True).start()
+        print(f"[init] Auto-started init chain for {uid} (existing session, no prior init)")
+    return load_init_status(udir)
+
+
+@app.post("/api/profile/confirm")
+def confirm_profile(session: dict = Depends(require_session)):
+    from src.modules.profile import save_init_status
+    save_init_status(_udir(session["user_id"]), "user_confirmed")
+    return {"ok": True}
+
+
+@app.post("/api/profile/regenerate")
+def regenerate_profile(session: dict = Depends(require_session)):
+    from src.modules.profile import save_init_status, load_init_status
+    uid = session["user_id"]
+    # Only set status to "generating" if user hasn't confirmed yet.
+    # Confirmed users see a Settings spinner instead — they shouldn't be re-routed to Onboarding.
+    if load_init_status(_udir(uid)).get("stage") != "user_confirmed":
+        save_init_status(_udir(uid), "generating")
+    threading.Thread(target=_regenerate_profile_for_user, args=(uid,), daemon=True).start()
+    return {"ok": True}
+
+
 # ── Health check ──────────────────────────────────────────
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# ── Per-user briefing schedules (schedules.json + APScheduler) ────────────
+
+def _briefing_job_id(uid: str, briefing_id: str) -> str:
+    return f"user_{uid}_briefing_{briefing_id}"
+
+
+def _run_briefing_for_user(uid: str, briefing_id: str, force: bool = False) -> None:
+    """Run all skills in a briefing sequentially, each pushed to Teams.
+    force=True bypasses the enabled check (used by Test Run).
+    Sends a 'complete' footer to Teams so the user knows the briefing ran even
+    if individual skills had no results."""
+    from src.modules.schedules import load_schedules
+    schedules = load_schedules(_udir(uid))
+    briefing = next((b for b in schedules.get("briefings", []) if b.get("id") == briefing_id), None)
+    if not briefing:
+        return
+    if not force and not briefing.get("enabled"):
+        return
+    skill_ids = briefing.get("skills", [])
+    print(f"[Briefing] Firing '{briefing.get('name')}' for {uid}{' (test run)' if force else ''}: {skill_ids}")
+
+    pushed = []
+    empty = []
+    failed = []
+    for sid in skill_ids:
+        if sid not in _SECTION_RUNNERS:
+            failed.append((sid, "unknown skill"))
+            continue
+        try:
+            # Mirror _run_section_for_user but track pushed vs empty
+            results_dir = _udir(uid) / "results"
+            results_dir.mkdir(parents=True, exist_ok=True)
+            token    = auth.get_valid_access_token(uid)
+            graph    = GraphClient(token)
+            ai       = AIClient()
+            settings = _read_json(_user_settings(uid))
+            result   = _SECTION_RUNNERS[sid](graph, ai, _udir(uid), settings, None)
+            _write_json(results_dir / f"{sid}.json", result)
+            msg = _format_section_for_teams(result)
+            if msg:
+                bot_uid, chat_id = _find_bot_for_user(uid)
+                if bot_uid and chat_id:
+                    bot_token = auth.get_valid_access_token(bot_uid)
+                    bot_graph = GraphClient(bot_token)
+                    bot_graph.send_chat_message(chat_id, msg)
+                    _log_outbound_to_history(uid, msg)
+                pushed.append(sid)
+            else:
+                empty.append(sid)
+        except Exception as e:
+            failed.append((sid, str(e)[:120]))
+            print(f"[Briefing]   Skill {sid} failed: {e}")
+
+    # Brief footer so user knows the whole briefing finished
+    bot_uid, chat_id = _find_bot_for_user(uid)
+    if bot_uid and chat_id:
+        suffix = " (test run)" if force else ""
+        total = len(pushed) + len(empty)
+        if failed:
+            footer = (
+                f"⚠️ **Briefing '{briefing.get('name')}' finished with errors{suffix}** — "
+                f"{total} ok, {len(failed)} failed: {', '.join(s for s, _ in failed)}"
+            )
+        else:
+            footer = f"✅ **Briefing '{briefing.get('name')}' complete{suffix}** — {total} skill(s) reported."
+        try:
+            bot_token = auth.get_valid_access_token(bot_uid)
+            bot_graph = GraphClient(bot_token)
+            bot_graph.send_chat_message(chat_id, footer)
+            _log_outbound_to_history(uid, footer)
+        except Exception as e:
+            print(f"[Briefing] Footer send failed for {uid}: {e}")
+
+
+def _register_briefing(uid: str, briefing: dict) -> None:
+    from src.modules.schedules import cron_to_apscheduler_kwargs, is_valid_cron
+    job_id = _briefing_job_id(uid, briefing["id"])
+    try:
+        _scheduler.remove_job(job_id)
+    except Exception:
+        pass
+    if not briefing.get("enabled"):
+        return
+    cron = briefing.get("cron", "")
+    if not is_valid_cron(cron):
+        print(f"[Scheduler] Skipping {job_id}: invalid cron {cron!r}")
+        return
+    kwargs = cron_to_apscheduler_kwargs(cron)
+    tz = briefing.get("tz") or "UTC"
+    try:
+        _scheduler.add_job(
+            _run_briefing_for_user,
+            trigger="cron",
+            kwargs={"uid": uid, "briefing_id": briefing["id"]},
+            id=job_id,
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            timezone=tz,
+            **kwargs,
+        )
+    except Exception as e:
+        # Likely invalid timezone — fall back to UTC
+        print(f"[Scheduler] tz={tz!r} rejected for {job_id} ({e}); using UTC")
+        _scheduler.add_job(
+            _run_briefing_for_user,
+            trigger="cron",
+            kwargs={"uid": uid, "briefing_id": briefing["id"]},
+            id=job_id,
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            **kwargs,
+        )
+
+
+def _unregister_briefing(uid: str, briefing_id: str) -> None:
+    try:
+        _scheduler.remove_job(_briefing_job_id(uid, briefing_id))
+    except Exception:
+        pass
+
+
+def _load_all_user_schedules_at_startup() -> None:
+    """Scan .data/_sessions/*.json for every uid, load their schedules.json, register briefing jobs."""
+    from src.modules.schedules import load_schedules
+    sessions_dir = auth.DATA_DIR / "_sessions"
+    if not sessions_dir.exists():
+        return
+    n = 0
+    for f in sessions_dir.glob("*.json"):
+        uid = f.stem
+        schedules = load_schedules(_udir(uid))
+        for briefing in schedules.get("briefings", []):
+            try:
+                _register_briefing(uid, briefing)
+                if briefing.get("enabled"):
+                    n += 1
+            except Exception as e:
+                print(f"[Scheduler] Failed to register briefing {uid}/{briefing.get('id')}: {e}")
+    print(f"[Scheduler] Registered {n} briefing job(s) from schedules.json")
+
+
+# ── Schedule API endpoints ────────────────────────────────
+
+@app.get("/api/schedules")
+def get_schedules(session: dict = Depends(require_session)):
+    """Return full schedule config: briefings + email_monitor + meeting."""
+    from src.modules.schedules import load_schedules
+    return load_schedules(_udir(session["user_id"]))
+
+
+@app.post("/api/schedules/briefings")
+def create_briefing(body: dict, session: dict = Depends(require_session)):
+    """Add a new briefing bundle."""
+    from src.modules.schedules import add_briefing, NON_SCHEDULABLE_SECTIONS
+    uid = session["user_id"]
+    skills = body.get("skills", [])
+    bad = [s for s in skills if s in NON_SCHEDULABLE_SECTIONS]
+    if bad:
+        raise HTTPException(400, f"Non-schedulable skills: {bad}")
+    unknown = [s for s in skills if s not in _SECTION_RUNNERS]
+    if unknown:
+        raise HTTPException(400, f"Unknown skills: {unknown}")
+    try:
+        entry = add_briefing(_udir(uid), body)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    _register_briefing(uid, entry)
+    return entry
+
+
+@app.patch("/api/schedules/briefings/{briefing_id}")
+def patch_briefing(briefing_id: str, body: dict, session: dict = Depends(require_session)):
+    from src.modules.schedules import update_briefing, NON_SCHEDULABLE_SECTIONS
+    uid = session["user_id"]
+    if "skills" in body:
+        bad = [s for s in body["skills"] if s in NON_SCHEDULABLE_SECTIONS]
+        if bad:
+            raise HTTPException(400, f"Non-schedulable skills: {bad}")
+        unknown = [s for s in body["skills"] if s not in _SECTION_RUNNERS]
+        if unknown:
+            raise HTTPException(400, f"Unknown skills: {unknown}")
+    try:
+        entry = update_briefing(_udir(uid), briefing_id, body)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    _register_briefing(uid, entry)
+    return entry
+
+
+@app.delete("/api/schedules/briefings/{briefing_id}")
+def remove_briefing(briefing_id: str, session: dict = Depends(require_session)):
+    from src.modules.schedules import delete_briefing
+    uid = session["user_id"]
+    try:
+        delete_briefing(_udir(uid), briefing_id)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    _unregister_briefing(uid, briefing_id)
+    return {"ok": True}
+
+
+@app.post("/api/bot/chat")
+def bot_chat(body: dict, session: dict = Depends(require_session)):
+    """Send a message to the same Audrey bot agent that runs in Teams.
+    Re-uses src.bot.reply — full tool access, shared SQLite history."""
+    uid = session["user_id"]
+    text = (body.get("message") or "").strip()
+    if not text:
+        raise HTTPException(400, "message required")
+    data_dir = _udir(uid)
+    settings = _read_json(_user_settings(uid))
+    bot_state = _read_json(data_dir / "teams_bot.json") or {}
+
+    try:
+        owner_graph = GraphClient(auth.get_valid_access_token(uid))
+    except Exception as e:
+        raise HTTPException(500, f"Auth failed: {e}")
+
+    try:
+        from src import bot as _bot
+        reply_text, new_state = _bot.reply(
+            bot_state, text,
+            graph=owner_graph,        # fallback — web has no separate bot account
+            owner_graph=owner_graph,
+            settings=settings,
+            wiki_dir=data_dir / "wiki",
+            data_dir=data_dir,
+            user_model_path=data_dir / "user_model.json",
+        )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Bot error: {e}")
+
+    try:
+        _write_json(data_dir / "teams_bot.json", new_state)
+    except Exception as e:
+        print(f"[BotChat] State save failed for {uid}: {e}")
+
+    return {"response": reply_text}
+
+
+@app.get("/api/bot/history")
+def bot_history(limit: int = 20, session: dict = Depends(require_session)):
+    """Return the most recent N turns of the bot conversation (shared with Teams)."""
+    import sqlite3
+    uid = session["user_id"]
+    db_path = _udir(uid) / "bot_history.db"
+    if not db_path.exists():
+        return {"turns": []}
+    limit = max(1, min(int(limit or 20), 100))
+    try:
+        con = sqlite3.connect(str(db_path))
+        rows = con.execute(
+            "SELECT role, content, ts FROM history ORDER BY ts DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        con.close()
+        rows.reverse()
+        return {"turns": [{"role": r, "content": c, "ts": t} for r, c, t in rows]}
+    except Exception as e:
+        raise HTTPException(500, f"History read failed: {e}")
+
+
+@app.post("/api/schedules/briefings/{briefing_id}/run")
+def test_run_briefing(briefing_id: str, background_tasks: BackgroundTasks,
+                     session: dict = Depends(require_session)):
+    """Trigger a briefing immediately (Test Run). Runs in background."""
+    from src.modules.schedules import load_schedules
+    uid = session["user_id"]
+    schedules = load_schedules(_udir(uid))
+    briefing = next((b for b in schedules.get("briefings", []) if b.get("id") == briefing_id), None)
+    if not briefing:
+        raise HTTPException(404, f"Briefing '{briefing_id}' not found")
+    background_tasks.add_task(_run_briefing_for_user, uid, briefing_id, True)
+    return {"ok": True, "skills": briefing.get("skills", [])}
+
+
+@app.put("/api/schedules/email_monitor")
+def put_email_monitor(body: dict, session: dict = Depends(require_session)):
+    from src.modules.schedules import update_email_monitor
+    return update_email_monitor(_udir(session["user_id"]), body)
+
+
+@app.put("/api/schedules/meeting")
+def put_meeting_config(body: dict, session: dict = Depends(require_session)):
+    from src.modules.schedules import update_meeting
+    return update_meeting(_udir(session["user_id"]), body)
 
 
 # ── Startup ───────────────────────────────────────────────
@@ -896,4 +2583,40 @@ def startup_event():
         replace_existing=True,
         max_instances=1,
     )
-    print("[Scheduler] Teams bot polling every 10s | CRM refresh daily at 06:00 UTC")
+    _scheduler.add_job(
+        _refresh_projects_all_users,
+        trigger="cron",
+        hour=6, minute=30,
+        id="projects_daily_refresh",
+        replace_existing=True,
+        max_instances=1,
+    )
+    _scheduler.add_job(
+        _poll_email_monitor_all_users,
+        trigger="interval",
+        minutes=1,
+        id="email_monitor_poll",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    _scheduler.add_job(
+        _poll_expense_scan_all_users,
+        trigger="interval",
+        minutes=1,
+        id="expense_scan_poll",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    _scheduler.add_job(
+        _poll_meeting_prep_all_users,
+        trigger="interval",
+        minutes=5,
+        id="meeting_prep_poll",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    _load_all_user_schedules_at_startup()
+    print("[Scheduler] Teams bot 10s | Email monitor 1m | Expense scan 1m | Meeting prep 5m | CRM refresh daily 06:00 UTC | Projects refresh daily 06:30 UTC")

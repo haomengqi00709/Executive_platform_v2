@@ -2,13 +2,30 @@ import { useState, useEffect, useCallback } from 'react';
 import {
   Settings, Save, CheckCircle2, AlertCircle, LogIn, LogOut,
   Bot, Webhook, User, Loader2, Copy, ExternalLink, Moon, Sun,
-  LayoutDashboard, Mail, CalendarDays, BarChart3, Users, CreditCard,
-  Search, RefreshCw, Building2, Phone, Linkedin, ChevronRight,
+  LayoutDashboard, Sparkles, Wrench, UserCircle2, Database,
+  BarChart3, Building2, RefreshCw,
 } from 'lucide-react';
 
-// ── Types ──────────────────────────────────────────────────────────────────
+import DashboardPage from './pages/DashboardPage';
+import SkillsPage from './pages/SkillsPage';
+import RecordsPage from './pages/RecordsPage';
+import ToolsPage from './pages/ToolsPage';
+import ProfilePage from './pages/ProfilePage';
 
-type Page = 'dashboard' | 'email' | 'meetings' | 'intelligence' | 'crm' | 'expenses' | 'settings';
+// ── Types (preserved auth + onboarding + settings) ─────────────────────────
+
+type Page = 'dashboard' | 'skills' | 'records' | 'tools' | 'profile' | 'settings';
+
+type ProfileStage = 'pending' | 'generating' | 'draft_ready' | 'user_confirmed';
+
+type StepStatus = 'pending' | 'in_progress' | 'done' | 'failed';
+interface InitStep { key: string; label: string; status: StepStatus; }
+interface InitStatus {
+  stage: ProfileStage;
+  last_update: string | null;
+  steps: InitStep[];
+  current_message: string;
+}
 
 interface AuthUser { username?: string; user_id?: string; }
 
@@ -21,27 +38,14 @@ interface DeviceCode {
   user_code: string; verification_url: string; bot_uid: string; expires_in?: number;
 }
 
-interface CrmContact {
-  email: string; name?: string; company?: string; role?: string;
-  phone?: string; linkedin?: string; status?: string; summary?: string;
-  writing_style?: string; thread_count?: number; last_contact?: string;
-  priority?: string; updated_at?: string;
-}
-
-interface CrmData {
-  last_scan?: string; months_scanned?: number; total?: number;
-  contacts: CrmContact[];
-}
-
 // ── Nav items ─────────────────────────────────────────────────────────────
 
 const NAV: { id: Page; label: string; icon: React.ReactNode; color: string }[] = [
-  { id: 'dashboard',    label: 'Dashboard',    icon: <LayoutDashboard size={16} />, color: 'text-executive-accent' },
-  { id: 'email',        label: 'Email',        icon: <Mail size={16} />,            color: 'text-sky-400' },
-  { id: 'meetings',     label: 'Meetings',     icon: <CalendarDays size={16} />,    color: 'text-violet-400' },
-  { id: 'intelligence', label: 'Intelligence', icon: <BarChart3 size={16} />,       color: 'text-amber-400' },
-  { id: 'crm',          label: 'CRM',          icon: <Users size={16} />,           color: 'text-rose-400' },
-  { id: 'expenses',     label: 'Expenses',     icon: <CreditCard size={16} />,      color: 'text-teal-400' },
+  { id: 'dashboard', label: 'Dashboard', icon: <LayoutDashboard size={16} />, color: 'text-executive-accent' },
+  { id: 'skills',    label: 'Skills',    icon: <Sparkles size={16} />,        color: 'text-amber-400' },
+  { id: 'records',   label: 'Records',   icon: <Database size={16} />,        color: 'text-emerald-400' },
+  { id: 'tools',     label: 'Tools',     icon: <Wrench size={16} />,          color: 'text-violet-400' },
+  { id: 'profile',   label: 'Profile',   icon: <UserCircle2 size={16} />,     color: 'text-rose-400' },
 ];
 
 // ── App shell ──────────────────────────────────────────────────────────────
@@ -49,8 +53,10 @@ const NAV: { id: Page; label: string; icon: React.ReactNode; color: string }[] =
 export default function App() {
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
   const [page,  setPage]  = useState<Page>('dashboard');
+  const [pendingSkillId, setPendingSkillId] = useState<string | undefined>();
   const [user,  setUser]  = useState<AuthUser | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
+  const [profileConfirmed, setProfileConfirmed] = useState<boolean | null>(null);
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
@@ -59,7 +65,18 @@ export default function App() {
   useEffect(() => {
     fetch('/api/auth/me', { credentials: 'include', headers: { 'X-Timezone': Intl.DateTimeFormat().resolvedOptions().timeZone } })
       .then(r => r.json())
-      .then(d => setUser(d?.user_id ? d : null))
+      .then(async d => {
+        const u = d?.user_id ? d : null;
+        setUser(u);
+        if (u) {
+          try {
+            const s = await fetch('/api/profile/status', { credentials: 'include' }).then(r => r.json());
+            setProfileConfirmed(s?.stage === 'user_confirmed');
+          } catch {
+            setProfileConfirmed(false);
+          }
+        }
+      })
       .catch(() => setUser(null))
       .finally(() => setAuthLoading(false));
   }, []);
@@ -67,6 +84,16 @@ export default function App() {
   if (authLoading) return <Spinner />;
 
   if (!user) return <LoginScreen />;
+
+  if (profileConfirmed === false) {
+    return <OnboardingPage onComplete={() => setProfileConfirmed(true)} />;
+  }
+  if (profileConfirmed === null) return <Spinner />;
+
+  const goToSkill = (sid: string) => {
+    setPendingSkillId(sid);
+    setPage('skills');
+  };
 
   return (
     <div className="flex h-screen w-full bg-executive-bg text-executive-text overflow-hidden executive-grid">
@@ -138,448 +165,34 @@ export default function App() {
 
       {/* Main content */}
       <main className="flex-1 overflow-auto">
-        {page === 'dashboard'    && <DashboardPage />}
-        {page === 'email'        && <PlaceholderPage title="Email Intelligence" icon={<Mail size={24} />} color="text-sky-400" sections={['reply_needed', 'followup_needed', 'upcoming_commitments', 'commitments_extract', 'followup_tracking', 'invoices_contracts']} />}
-        {page === 'meetings'     && <PlaceholderPage title="Meeting Intelligence" icon={<CalendarDays size={24} />} color="text-violet-400" sections={['recent_meetings', 'meeting_action_items']} />}
-        {page === 'intelligence' && <PlaceholderPage title="Business Intelligence" icon={<BarChart3 size={24} />} color="text-amber-400" sections={['relationship_health', 'business_insights', 'market_intelligence']} />}
-        {page === 'crm'          && <CrmPage />}
-        {page === 'expenses'     && <PlaceholderPage title="Expense Capture" icon={<CreditCard size={24} />} color="text-teal-400" sections={['expenses']} />}
-        {page === 'settings'     && <SettingsPage user={user} />}
+        {page === 'dashboard' && <DashboardPage goToSkill={goToSkill} />}
+        {page === 'skills'    && (
+          <SkillsPage
+            initialSectionId={pendingSkillId}
+            onClearInitial={() => setPendingSkillId(undefined)}
+          />
+        )}
+        {page === 'records'   && <RecordsPage />}
+        {page === 'tools'     && <ToolsPage />}
+        {page === 'profile'   && <ProfilePage />}
+        {page === 'settings'  && <SettingsPage user={user} />}
       </main>
     </div>
   );
 }
 
-// ── Dashboard ─────────────────────────────────────────────────────────────
-
-interface SectionResult {
-  id: string;
-  status: 'not_run' | 'running' | 'fresh' | 'stale' | 'error';
-  last_run?: string;
-  started_at?: string;
-  items?: any[];
-  count?: number;
-  empty?: boolean;
-  briefing?: string;
-  error?: string;
-  logs?: string[];
-}
-
-const SECTION_DEFS = [
-  { id: 'ai_summary',            title: 'Morning Briefing',        module: 'M01', color: 'text-executive-accent' },
-  { id: 'market_intelligence',   title: 'Market Intelligence',     module: 'M01', color: 'text-executive-accent' },
-  { id: 'reply_needed',          title: 'Emails Awaiting Reply',   module: 'M02', color: 'text-sky-400' },
-  { id: 'followup_needed',       title: 'Sent — No Response',      module: 'M02', color: 'text-sky-400' },
-  { id: 'upcoming_commitments',  title: 'Upcoming Commitments',    module: 'M02', color: 'text-sky-400' },
-  { id: 'commitments_extract',   title: 'Commitments Extracted',   module: 'M02', color: 'text-sky-400' },
-  { id: 'invoices_contracts',    title: 'Invoices & Contracts',    module: 'M02', color: 'text-sky-400' },
-  { id: 'recent_meetings',       title: 'Recent Meetings',         module: 'M03', color: 'text-violet-400' },
-  { id: 'meeting_action_items',  title: 'Meeting Action Items',    module: 'M03', color: 'text-violet-400' },
-  { id: 'relationship_health',   title: 'Relationship Health',     module: 'M04', color: 'text-amber-400' },
-  { id: 'business_insights',     title: 'Business Insights',       module: 'M04', color: 'text-amber-400' },
-  { id: 'expenses',              title: 'Expense Capture',         module: 'M05', color: 'text-teal-400' },
-];
-
-function useSectionRunner(sectionId: string) {
-  const [result, setResult] = useState<SectionResult | null>(null);
-  const [running, setRunning] = useState(false);
-
-  const load = useCallback(async () => {
-    try {
-      const r = await fetch(`/api/sections/${sectionId}`, { credentials: 'include' });
-      if (r.ok) setResult(await r.json());
-    } catch {}
-  }, [sectionId]);
-
-  useEffect(() => { load(); }, [load]);
-
-  const run = async () => {
-    setRunning(true);
-    try {
-      const r = await fetch(`/api/sections/${sectionId}/run`, { method: 'POST', credentials: 'include' });
-      if (!r.ok) { setRunning(false); return; }
-      const poll = setInterval(async () => {
-        try {
-          const r2 = await fetch(`/api/sections/${sectionId}`, { credentials: 'include' });
-          const d: SectionResult = await r2.json();
-          if (d.status !== 'running') {
-            setResult(d); setRunning(false); clearInterval(poll);
-          }
-        } catch {}
-      }, 3000);
-      setTimeout(() => { clearInterval(poll); setRunning(false); }, 5 * 60 * 1000);
-    } catch { setRunning(false); }
-  };
-
-  return { result, running, run };
-}
-
-function StatusBadge({ status }: { status: SectionResult['status'] }) {
-  const map: Record<string, string> = {
-    not_run: 'bg-executive-border text-executive-muted',
-    running: 'bg-amber-500/20 text-amber-400',
-    fresh:   'bg-emerald-500/20 text-emerald-400',
-    stale:   'bg-sky-500/20 text-sky-400',
-    error:   'bg-rose-500/20 text-rose-400',
-  };
-  return (
-    <span className={`text-xs font-mono px-2 py-0.5 rounded-full ${map[status] ?? map.not_run}`}>
-      {status.replace('_', ' ')}
-    </span>
-  );
-}
-
-function SectionPreview({ def, result }: { def: typeof SECTION_DEFS[0]; result: SectionResult }) {
-  if (def.id === 'ai_summary' && result.briefing) {
-    return (
-      <p className="text-xs text-executive-muted leading-relaxed line-clamp-4">
-        {result.briefing}
-      </p>
-    );
-  }
-  const count = result.count ?? result.items?.length ?? 0;
-  return (
-    <p className="text-xs text-executive-muted font-mono">
-      {count > 0 ? `${count} item${count !== 1 ? 's' : ''}` : 'No items'}
-    </p>
-  );
-}
-
-function SectionCard({ def }: { def: typeof SECTION_DEFS[0] }) {
-  const { result, running, run } = useSectionRunner(def.id);
-  const status = result?.status ?? 'not_run';
-
-  return (
-    <div className="glass rounded-xl p-4 flex flex-col gap-3 min-h-[140px]">
-      <div className="flex items-center justify-between">
-        <span className={`text-xs font-mono uppercase tracking-widest ${def.color}`}>{def.module}</span>
-        <StatusBadge status={status} />
-      </div>
-
-      <p className="text-sm font-semibold">{def.title}</p>
-
-      {status === 'running' && result?.logs && result.logs.length > 0 && (
-        <div className="flex flex-col gap-0.5">
-          {result.logs.slice(-4).map((log, i) => (
-            <p key={i} className="text-xs text-executive-muted font-mono truncate">
-              <span className="text-amber-400 mr-1">›</span>{log}
-            </p>
-          ))}
-        </div>
-      )}
-      {status === 'fresh' && result && (
-        <SectionPreview def={def} result={result} />
-      )}
-      {status === 'error' && (
-        <div className="flex flex-col gap-1">
-          {result?.error && <p className="text-xs text-rose-400 font-mono line-clamp-2">{result.error}</p>}
-          {result?.logs && result.logs.length > 0 && (
-            <p className="text-xs text-executive-muted font-mono truncate">
-              Last: {result.logs[result.logs.length - 1]}
-            </p>
-          )}
-        </div>
-      )}
-
-      <div className="flex items-center justify-between mt-auto pt-2 border-t border-executive-border">
-        <span className="text-xs text-executive-muted font-mono">
-          {result?.last_run ? result.last_run.slice(0, 16).replace('T', ' ') : '—'}
-        </span>
-        <button
-          onClick={run}
-          disabled={running}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-executive-accent/10 text-executive-accent rounded-lg text-xs font-semibold hover:bg-executive-accent/20 disabled:opacity-40 transition-all"
-        >
-          {running ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-          {running ? 'Running…' : 'Run'}
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function DashboardPage() {
-  return (
-    <div className="p-8">
-      <PageHeader label="Overview" title="Dashboard" />
-      <div className="grid grid-cols-3 gap-4 mt-8">
-        {SECTION_DEFS.map(s => <SectionCard key={s.id} def={s} />)}
-      </div>
-    </div>
-  );
-}
-
-// ── CRM Page ──────────────────────────────────────────────────────────────
-
-const STATUS_STYLE: Record<string, string> = {
-  client:   'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
-  prospect: 'bg-sky-500/10 text-sky-600 dark:text-sky-400',
-  partner:  'bg-violet-500/10 text-violet-600 dark:text-violet-400',
-  vendor:   'bg-amber-500/10 text-amber-600 dark:text-amber-400',
-  other:    'bg-executive-border text-executive-muted',
-};
-
-function CrmPage() {
-  const [crm,     setCrm]     = useState<CrmData | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [scanning, setScanning] = useState(false);
-  const [search,  setSearch]  = useState('');
-  const [selected, setSelected] = useState<CrmContact | null>(null);
-
-  const load = useCallback(() => {
-    setLoading(true);
-    fetch('/api/crm', { credentials: 'include' })
-      .then(r => r.ok ? r.json() : null)
-      .then(d => setCrm(d))
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, []);
-
-  useEffect(() => { load(); }, [load]);
-
-  const runScan = async () => {
-    setScanning(true);
-    try {
-      await fetch('/api/crm/scan', { method: 'POST', credentials: 'include' });
-      // poll for completion every 5s
-      const poll = setInterval(async () => {
-        const r = await fetch('/api/crm', { credentials: 'include' });
-        const d = await r.json();
-        if (d.last_scan !== crm?.last_scan) {
-          setCrm(d);
-          setScanning(false);
-          clearInterval(poll);
-        }
-      }, 5000);
-      setTimeout(() => { clearInterval(poll); setScanning(false); }, 3 * 60 * 1000);
-    } catch {
-      setScanning(false);
-    }
-  };
-
-  const contacts = (crm?.contacts || []).filter(c => {
-    if (!search) return true;
-    const q = search.toLowerCase();
-    return (
-      c.name?.toLowerCase().includes(q) ||
-      c.company?.toLowerCase().includes(q) ||
-      c.email?.toLowerCase().includes(q) ||
-      c.role?.toLowerCase().includes(q)
-    );
-  });
-
-  const statusCounts = (crm?.contacts || []).reduce<Record<string, number>>((acc, c) => {
-    const s = c.status || 'other';
-    acc[s] = (acc[s] || 0) + 1;
-    return acc;
-  }, {});
-
-  return (
-    <div className="h-full flex flex-col">
-      {/* Header */}
-      <div className="px-8 pt-8 pb-4 shrink-0">
-        <div className="flex items-end justify-between">
-          <PageHeader label="Context Layer" title="CRM" />
-          <div className="flex items-center gap-3">
-            {crm?.last_scan && (
-              <span className="text-xs text-executive-muted font-mono">
-                Scanned {crm.last_scan.slice(0, 10)}
-              </span>
-            )}
-            <button
-              onClick={runScan}
-              disabled={scanning}
-              className="flex items-center gap-2 px-4 py-2 bg-rose-500 text-white rounded-xl text-sm font-semibold hover:bg-rose-400 disabled:opacity-50 transition-all"
-            >
-              {scanning ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
-              {scanning ? 'Scanning…' : 'Run Scan'}
-            </button>
-          </div>
-        </div>
-
-        {/* Stats */}
-        {crm && (crm.total ?? 0) > 0 && (
-          <div className="flex items-center gap-4 mt-4">
-            <Stat label="Total" value={crm.total ?? 0} />
-            {Object.entries(statusCounts).map(([s, n]) => (
-              <Stat key={s} label={s} value={n} />
-            ))}
-          </div>
-        )}
-      </div>
-
-      {loading ? (
-        <div className="flex-1 flex items-center justify-center">
-          <Loader2 size={24} className="animate-spin text-executive-muted" />
-        </div>
-      ) : !crm || (crm.total ?? 0) === 0 ? (
-        <EmptyState
-          title="No contacts yet"
-          description="Run a CRM scan to build your contact database from email history."
-          action={<button onClick={runScan} disabled={scanning} className="flex items-center gap-2 px-5 py-2.5 bg-rose-500 text-white rounded-xl text-sm font-semibold hover:bg-rose-400 disabled:opacity-50 transition-all">
-            {scanning ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}
-            {scanning ? 'Scanning…' : 'Run Scan'}
-          </button>}
-        />
-      ) : (
-        <div className="flex flex-1 min-h-0">
-          {/* Contact list */}
-          <div className="flex-1 flex flex-col min-w-0">
-            {/* Search */}
-            <div className="px-8 pb-3 shrink-0">
-              <div className="relative">
-                <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-executive-muted" />
-                <input
-                  value={search}
-                  onChange={e => setSearch(e.target.value)}
-                  placeholder="Search contacts…"
-                  className="w-full bg-executive-bg border border-executive-border rounded-xl pl-9 pr-4 py-2 text-sm focus:outline-none focus:border-executive-accent transition-colors placeholder:text-executive-muted/40"
-                />
-              </div>
-            </div>
-
-            {/* Table */}
-            <div className="flex-1 overflow-auto px-8 pb-8">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-executive-border">
-                    {['Name', 'Company', 'Role', 'Status', 'Last Contact', 'Threads'].map(h => (
-                      <th key={h} className="text-left py-2 px-3 text-xs font-mono uppercase tracking-widest text-executive-muted first:pl-0">
-                        {h}
-                      </th>
-                    ))}
-                    <th />
-                  </tr>
-                </thead>
-                <tbody>
-                  {contacts.map(c => (
-                    <tr
-                      key={c.email}
-                      onClick={() => setSelected(selected?.email === c.email ? null : c)}
-                      className={`border-b border-executive-border/50 cursor-pointer transition-colors ${
-                        selected?.email === c.email
-                          ? 'bg-executive-accent/5'
-                          : 'hover:bg-executive-border/20'
-                      }`}
-                    >
-                      <td className="py-3 pl-0 pr-3">
-                        <div className="font-medium">{c.name || c.email.split('@')[0]}</div>
-                        <div className="text-xs text-executive-muted">{c.email}</div>
-                      </td>
-                      <td className="py-3 px-3">{c.company || '—'}</td>
-                      <td className="py-3 px-3 text-executive-muted">{c.role || '—'}</td>
-                      <td className="py-3 px-3">
-                        <span className={`px-2 py-0.5 rounded-full text-xs font-mono ${STATUS_STYLE[c.status || 'other'] || STATUS_STYLE.other}`}>
-                          {c.status || 'other'}
-                        </span>
-                      </td>
-                      <td className="py-3 px-3 text-executive-muted font-mono text-xs">{c.last_contact || '—'}</td>
-                      <td className="py-3 px-3 text-executive-muted">{c.thread_count ?? '—'}</td>
-                      <td className="py-3 pl-3 pr-0">
-                        <ChevronRight size={14} className={`text-executive-muted transition-transform ${selected?.email === c.email ? 'rotate-90' : ''}`} />
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          {/* Detail panel */}
-          {selected && (
-            <div className="w-72 shrink-0 border-l border-executive-border overflow-auto p-6 flex flex-col gap-5">
-              <div>
-                <div className="w-10 h-10 rounded-full bg-rose-500/10 flex items-center justify-center text-rose-500 font-bold text-sm mb-3">
-                  {(selected.name || selected.email)[0].toUpperCase()}
-                </div>
-                <h3 className="font-semibold">{selected.name || selected.email.split('@')[0]}</h3>
-                <p className="text-xs text-executive-muted">{selected.email}</p>
-              </div>
-
-              <span className={`self-start px-2 py-0.5 rounded-full text-xs font-mono ${STATUS_STYLE[selected.status || 'other'] || STATUS_STYLE.other}`}>
-                {selected.status || 'other'}
-              </span>
-
-              {selected.company && (
-                <DetailRow icon={<Building2 size={13} />} label="Company" value={selected.company} />
-              )}
-              {selected.role && (
-                <DetailRow icon={<User size={13} />} label="Role" value={selected.role} />
-              )}
-              {selected.phone && (
-                <DetailRow icon={<Phone size={13} />} label="Phone" value={selected.phone} />
-              )}
-              {selected.linkedin && (
-                <DetailRow icon={<Linkedin size={13} />} label="LinkedIn" value={
-                  <a href={selected.linkedin} target="_blank" rel="noopener noreferrer" className="text-executive-accent hover:underline truncate">
-                    Profile
-                  </a>
-                } />
-              )}
-
-              {selected.summary && (
-                <div>
-                  <p className="text-xs font-mono uppercase text-executive-muted tracking-wider mb-1.5">Summary</p>
-                  <p className="text-xs text-executive-text leading-relaxed">{selected.summary}</p>
-                </div>
-              )}
-
-              {selected.writing_style && (
-                <div>
-                  <p className="text-xs font-mono uppercase text-executive-muted tracking-wider mb-1.5">Writing Style</p>
-                  <p className="text-xs text-executive-muted leading-relaxed">{selected.writing_style}</p>
-                </div>
-              )}
-
-              <div className="pt-2 border-t border-executive-border text-xs text-executive-muted font-mono space-y-1">
-                <p>{selected.thread_count} emails · last {selected.last_contact}</p>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── Placeholder page ──────────────────────────────────────────────────────
-
-function PlaceholderPage({
-  title, icon, color, sections,
-}: { title: string; icon: React.ReactNode; color: string; sections: string[] }) {
-  return (
-    <div className="p-8">
-      <div className="flex items-center gap-3 mb-8">
-        <span className={color}>{icon}</span>
-        <div>
-          <p className="text-xs font-mono uppercase text-executive-muted tracking-widest mb-1">Module</p>
-          <h1 className="text-2xl font-bold">{title}</h1>
-        </div>
-      </div>
-      <div className="grid grid-cols-2 gap-4">
-        {sections.map(s => (
-          <div key={s} className="glass rounded-xl p-5 flex flex-col gap-3">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-mono px-2 py-0.5 rounded-full bg-executive-border text-executive-muted">
-                not run
-              </span>
-            </div>
-            <p className="text-sm font-medium capitalize">{s.replace(/_/g, ' ')}</p>
-            <p className="text-xs text-executive-muted">Module not yet run.</p>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ── Settings Page ──────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// PRESERVED PAGES & COMPONENTS — DO NOT TOUCH (Settings / Auth / Onboarding)
+// ════════════════════════════════════════════════════════════════════════════
 
 function SettingsPage({ user }: { user: AuthUser }) {
   const [settings, setSettings]       = useState<Record<string, string>>({});
   const [settLoading, setSettLoading] = useState(false);
   const [saved, setSaved]             = useState(false);
   const [saveError, setSaveError]     = useState('');
+
+  const [businessProfile, setBusinessProfile] = useState('');
+  const [marketSegments,  setMarketSegments]  = useState('');
 
   const [botStatus, setBotStatus]     = useState<BotStatus | null>(null);
   const [deviceCode, setDeviceCode]   = useState<DeviceCode | null>(null);
@@ -594,24 +207,65 @@ function SettingsPage({ user }: { user: AuthUser }) {
     Promise.all([
       fetch('/api/settings', { credentials: 'include', headers: { 'X-Timezone': Intl.DateTimeFormat().resolvedOptions().timeZone } }).then(r => r.ok ? r.json() : {}),
       fetch('/api/teams/bot',  { credentials: 'include' }).then(r => r.ok ? r.json() : null),
-    ]).then(([s, b]) => {
+      fetch('/api/profile',    { credentials: 'include' }).then(r => r.ok ? r.json() : { business_profile: '', market_segments: '' }),
+    ]).then(([s, b, p]) => {
       setSettings(s || {});
       setBotStatus(b);
+      setBusinessProfile(p.business_profile || '');
+      setMarketSegments(p.market_segments || '');
     }).finally(() => setSettLoading(false));
   }, []);
 
   const save = async () => {
     setSaveError('');
     try {
-      const r = await fetch('/api/settings', {
+      const settingsReq = fetch('/api/settings', {
         method: 'PATCH', credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(settings),
       });
-      if (!r.ok) throw new Error('Save failed');
+      const businessReq = fetch('/api/profile/business', {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: businessProfile }),
+      });
+      const segmentsReq = fetch('/api/profile/segments', {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: marketSegments }),
+      });
+      const [r1, r2, r3] = await Promise.all([settingsReq, businessReq, segmentsReq]);
+      if (!r1.ok || !r2.ok || !r3.ok) throw new Error('Save failed');
       setSaved(true);
       setTimeout(() => setSaved(false), 2500);
     } catch (e: any) { setSaveError(e.message || 'Save failed'); }
+  };
+
+  const [regenerating, setRegenerating] = useState(false);
+  const regenerateProfile = async () => {
+    if (!confirm('Regenerate both profile docs from your emails? This will overwrite the current content.')) return;
+    setRegenerating(true);
+    try {
+      const before = await fetch('/api/profile/status', { credentials: 'include' }).then(r => r.json());
+      const beforeTs = before?.last_update || '';
+      await fetch('/api/profile/regenerate', { method: 'POST', credentials: 'include' });
+      const start = Date.now();
+      const tick = async () => {
+        if (Date.now() - start > 10 * 60 * 1000) { setRegenerating(false); return; }
+        const s = await fetch('/api/profile/status', { credentials: 'include' }).then(r => r.json());
+        if (s?.last_update && s.last_update !== beforeTs) {
+          const p = await fetch('/api/profile', { credentials: 'include' }).then(r => r.json());
+          setBusinessProfile(p.business_profile || '');
+          setMarketSegments(p.market_segments || '');
+          setRegenerating(false);
+        } else {
+          setTimeout(tick, 5000);
+        }
+      };
+      setTimeout(tick, 5000);
+    } catch {
+      setRegenerating(false);
+    }
   };
 
   const startBotAuth = async () => {
@@ -671,6 +325,7 @@ function SettingsPage({ user }: { user: AuthUser }) {
   };
 
   const botConnected = botStatus?.enabled && botStatus?.connected !== false;
+  void botPolling;
 
   return (
     <div className="p-8 max-w-2xl">
@@ -753,58 +408,56 @@ function SettingsPage({ user }: { user: AuthUser }) {
           )}
         </Section>
 
+        <Section icon={<Building2 size={16} />} title="Business Profile" color="text-amber-500">
+          <p className="text-xs text-executive-muted -mt-1">Describe your company — products, scale, customers, strategic focus. The AI reads this every time it searches, summarises, or scores emails.</p>
+          <textarea
+            value={businessProfile}
+            onChange={e => setBusinessProfile(e.target.value)}
+            rows={14}
+            className="w-full p-3 rounded-lg border border-executive-border bg-executive-bg text-sm font-mono text-executive-text focus:border-executive-accent focus:outline-none resize-y"
+            placeholder="# Business Profile&#10;&#10;## What the company does&#10;..."
+          />
+        </Section>
+
+        <Section icon={<BarChart3 size={16} />} title="Market Segments" color="text-sky-500">
+          <p className="text-xs text-executive-muted -mt-1">List the market segments your company operates in. The AI uses this to decide which industry signals and competitor moves are actually relevant to you.</p>
+          <textarea
+            value={marketSegments}
+            onChange={e => setMarketSegments(e.target.value)}
+            rows={10}
+            className="w-full p-3 rounded-lg border border-executive-border bg-executive-bg text-sm font-mono text-executive-text focus:border-executive-accent focus:outline-none resize-y"
+            placeholder="# Market Segments&#10;&#10;## Primary segments&#10;..."
+          />
+          <div className="pt-2 border-t border-executive-border flex items-center justify-between">
+            <p className="text-xs text-executive-muted">Re-run AI generation from current email history. Overwrites both docs above.</p>
+            <button
+              onClick={regenerateProfile}
+              disabled={regenerating}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-executive-border text-xs font-mono text-executive-muted hover:text-executive-text disabled:opacity-50 transition-all"
+            >
+              {regenerating ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+              {regenerating ? 'Regenerating...' : 'Regenerate with AI'}
+            </button>
+          </div>
+        </Section>
+
         <Section icon={<Webhook size={16} />} title="Teams Webhook" color="text-purple-400">
           <p className="text-xs text-executive-muted -mt-1">Optional — used for push notifications via Power Automate.</p>
           <Field label="Webhook URL" value={settings.teams_webhook_url || ''} onChange={v => setSettings(p => ({ ...p, teams_webhook_url: v }))} placeholder="https://..." />
         </Section>
+
       </div>
     </div>
   );
 }
 
-// ── Shared components ─────────────────────────────────────────────────────
+// ── Shared utility components (used by Settings + Onboarding) ─────────────
 
 function PageHeader({ label, title }: { label: string; title: string }) {
   return (
     <div>
       <p className="text-xs font-mono uppercase text-executive-accent tracking-[0.25em] mb-1">{label}</p>
       <h1 className="text-3xl font-bold tracking-tight">{title}</h1>
-    </div>
-  );
-}
-
-function Stat({ label, value }: { label: string; value: number | string }) {
-  return (
-    <div className="glass rounded-xl px-4 py-2 flex items-center gap-3">
-      <span className="text-xl font-bold">{value}</span>
-      <span className="text-xs font-mono text-executive-muted capitalize">{label}</span>
-    </div>
-  );
-}
-
-function DetailRow({ icon, label, value }: { icon: React.ReactNode; label: string; value: React.ReactNode }) {
-  return (
-    <div className="flex items-start gap-2">
-      <span className="text-executive-muted mt-0.5 shrink-0">{icon}</span>
-      <div>
-        <p className="text-xs font-mono text-executive-muted uppercase tracking-wider">{label}</p>
-        <p className="text-sm">{value}</p>
-      </div>
-    </div>
-  );
-}
-
-function EmptyState({ title, description, action }: { title: string; description: string; action?: React.ReactNode }) {
-  return (
-    <div className="flex-1 flex flex-col items-center justify-center gap-4 text-center px-8">
-      <div className="w-12 h-12 rounded-2xl bg-executive-border/50 flex items-center justify-center">
-        <Users size={24} className="text-executive-muted" />
-      </div>
-      <div>
-        <h3 className="font-semibold mb-1">{title}</h3>
-        <p className="text-sm text-executive-muted max-w-xs">{description}</p>
-      </div>
-      {action}
     </div>
   );
 }
@@ -827,6 +480,35 @@ function Field({ label, value, onChange, placeholder, type = 'text' }: { label: 
       <label className="text-xs font-mono uppercase text-executive-muted tracking-wider">{label}</label>
       <input type={type} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder}
         className="bg-executive-bg border border-executive-border rounded-xl px-4 py-2.5 text-sm text-executive-text focus:outline-none focus:border-executive-accent transition-colors placeholder:text-executive-muted/40" />
+    </div>
+  );
+}
+
+function StepIcon({ status }: { status: StepStatus }) {
+  if (status === 'done') {
+    return (
+      <div className="w-6 h-6 rounded-full bg-emerald-500/15 flex items-center justify-center shrink-0">
+        <CheckCircle2 size={14} className="text-emerald-500" />
+      </div>
+    );
+  }
+  if (status === 'in_progress') {
+    return (
+      <div className="w-6 h-6 rounded-full bg-executive-accent/15 flex items-center justify-center shrink-0">
+        <Loader2 size={14} className="text-executive-accent animate-spin" />
+      </div>
+    );
+  }
+  if (status === 'failed') {
+    return (
+      <div className="w-6 h-6 rounded-full bg-rose-500/15 flex items-center justify-center shrink-0">
+        <AlertCircle size={14} className="text-rose-500" />
+      </div>
+    );
+  }
+  return (
+    <div className="w-6 h-6 rounded-full border border-executive-border flex items-center justify-center shrink-0">
+      <div className="w-1.5 h-1.5 rounded-full bg-executive-muted" />
     </div>
   );
 }
@@ -869,6 +551,173 @@ function LoginScreen() {
       <a href="/auth/login" className="flex items-center gap-3 px-8 py-4 bg-executive-accent text-white rounded-2xl font-semibold hover:bg-emerald-400 transition-all shadow-sm">
         <LogIn size={20} /> Sign in with Microsoft
       </a>
+    </div>
+  );
+}
+
+function OnboardingPage({ onComplete }: { onComplete: () => void }) {
+  const [status, setStatus]               = useState<InitStatus | null>(null);
+  const [businessProfile, setBusinessProfile] = useState('');
+  const [marketSegments,  setMarketSegments]  = useState('');
+  const [saving, setSaving]               = useState(false);
+  const [error, setError]                 = useState('');
+
+  const stage = status?.stage || 'pending';
+
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const s: InitStatus = await fetch('/api/profile/status', { credentials: 'include' }).then(r => r.json());
+        if (cancelled) return;
+        setStatus(s);
+        if (s?.stage === 'draft_ready') {
+          const p = await fetch('/api/profile', { credentials: 'include' }).then(r => r.json());
+          if (cancelled) return;
+          setBusinessProfile(p.business_profile || '');
+          setMarketSegments(p.market_segments  || '');
+          return;
+        }
+        if (s?.stage === 'user_confirmed') {
+          onComplete();
+          return;
+        }
+      } catch {}
+      if (!cancelled) setTimeout(poll, 3000);
+    };
+    poll();
+    return () => { cancelled = true; };
+  }, [onComplete]);
+
+  const confirm = async () => {
+    setSaving(true); setError('');
+    try {
+      await Promise.all([
+        fetch('/api/profile/business', {
+          method: 'POST', credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: businessProfile }),
+        }),
+        fetch('/api/profile/segments', {
+          method: 'POST', credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: marketSegments }),
+        }),
+      ]);
+      await fetch('/api/profile/confirm', { method: 'POST', credentials: 'include' });
+      onComplete();
+    } catch (e: any) {
+      setError(e?.message || 'Failed to save profile');
+      setSaving(false);
+    }
+  };
+
+  const regenerate = async () => {
+    setStatus(s => s ? { ...s, stage: 'generating' } : s);
+    await fetch('/api/profile/regenerate', { method: 'POST', credentials: 'include' });
+  };
+
+  // Generating state — show step-by-step checklist
+  if (stage === 'pending' || stage === 'generating') {
+    const steps = status?.steps || [];
+    const currentMessage = status?.current_message || '';
+    return (
+      <div className="min-h-screen w-full flex items-center justify-center bg-executive-bg executive-grid p-6">
+        <div className="w-full max-w-xl bg-executive-card border border-executive-border rounded-2xl p-8 shadow-sm">
+          <div className="flex items-center gap-3 mb-6">
+            <div className="w-10 h-10 rounded-xl bg-executive-accent/10 flex items-center justify-center">
+              <Loader2 size={20} className="text-executive-accent animate-spin" />
+            </div>
+            <div>
+              <p className="text-xs font-mono uppercase text-executive-muted tracking-widest">First-time setup</p>
+              <h1 className="text-lg font-bold">Setting up your AI profile</h1>
+            </div>
+          </div>
+
+          <p className="text-sm text-executive-muted mb-6 leading-relaxed">
+            We're scanning your inbox to build the foundation that every AI feature on the platform will use.
+            This usually takes 2–5 minutes on first sign-in.
+          </p>
+
+          <ol className="flex flex-col gap-3">
+            {steps.map(step => (
+              <li key={step.key} className="flex items-start gap-3">
+                <StepIcon status={step.status} />
+                <div className="flex-1 min-w-0">
+                  <p className={`text-sm font-medium ${
+                    step.status === 'done'        ? 'text-executive-text' :
+                    step.status === 'in_progress' ? 'text-executive-accent' :
+                    step.status === 'failed'      ? 'text-rose-500' :
+                                                    'text-executive-muted'
+                  }`}>{step.label}</p>
+                  {step.status === 'in_progress' && currentMessage && (
+                    <p className="text-xs font-mono text-executive-muted mt-0.5 truncate">{currentMessage}</p>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ol>
+        </div>
+      </div>
+    );
+  }
+
+  // Draft ready — show editable form
+  return (
+    <div className="min-h-screen w-full bg-executive-bg executive-grid overflow-auto">
+      <div className="max-w-3xl mx-auto px-8 py-12">
+        <div className="mb-8">
+          <p className="text-xs font-mono uppercase text-executive-muted tracking-widest mb-2">Welcome — first-time setup</p>
+          <h1 className="text-3xl font-bold mb-3">Your profile draft is ready</h1>
+          <p className="text-executive-muted leading-relaxed">
+            We generated this from your recent emails, CRM contacts, and active projects.
+            This profile is the foundation every AI feature on the platform reads — searches, email triage, briefings.
+            Edit anything that's wrong, then confirm to continue.
+          </p>
+        </div>
+
+        {error && <ErrorBanner message={error} />}
+
+        <div className="flex flex-col gap-6">
+          <Section icon={<Building2 size={16} />} title="Business Profile" color="text-amber-500">
+            <p className="text-xs text-executive-muted -mt-1">What your company does, who you serve, and your strategic focus.</p>
+            <textarea
+              value={businessProfile}
+              onChange={e => setBusinessProfile(e.target.value)}
+              rows={18}
+              className="w-full p-3 rounded-lg border border-executive-border bg-executive-bg text-sm font-mono text-executive-text focus:border-executive-accent focus:outline-none resize-y"
+            />
+          </Section>
+
+          <Section icon={<BarChart3 size={16} />} title="Market Segments" color="text-sky-500">
+            <p className="text-xs text-executive-muted -mt-1">The markets you operate in. The AI uses this to filter which signals are relevant.</p>
+            <textarea
+              value={marketSegments}
+              onChange={e => setMarketSegments(e.target.value)}
+              rows={12}
+              className="w-full p-3 rounded-lg border border-executive-border bg-executive-bg text-sm font-mono text-executive-text focus:border-executive-accent focus:outline-none resize-y"
+            />
+          </Section>
+        </div>
+
+        <div className="flex items-center justify-between mt-8">
+          <button
+            onClick={regenerate}
+            disabled={saving}
+            className="flex items-center gap-2 px-4 py-2 rounded-lg border border-executive-border text-sm text-executive-muted hover:text-executive-text transition-all"
+          >
+            <RefreshCw size={14} /> Regenerate with AI
+          </button>
+          <button
+            onClick={confirm}
+            disabled={saving}
+            className="flex items-center gap-2 px-6 py-3 rounded-xl bg-executive-accent text-white font-semibold hover:bg-emerald-400 disabled:opacity-50 transition-all shadow-sm"
+          >
+            {saving ? <Loader2 size={16} className="animate-spin" /> : <CheckCircle2 size={16} />}
+            {saving ? 'Saving...' : 'Confirm and continue'}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

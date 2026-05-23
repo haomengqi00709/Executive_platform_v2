@@ -173,16 +173,45 @@ def _handle_teams_receipt(msg: dict, chat_id: str, graph, ai,
     if h in hashes:
         seen.add(dedup_key)
         _save_seen(seen, seen_file)
-        return "This receipt has already been captured (exact duplicate).", None
+        meta  = hashes[h]
+        _today = datetime.now().strftime("%Y-%m-%d")
+        if isinstance(meta, dict):
+            new_row = {
+                "Date":           meta.get("date", ""),
+                "Vendor":         meta.get("vendor", ""),
+                "Amount":         meta.get("amount", 0),
+                "Currency":       meta.get("currency", "CAD"),
+                "GST_HST":        "",
+                "Net_Amount":     "",
+                "Category":       meta.get("category", "Other"),
+                "Attachment":     meta.get("filename", filename),
+                "Email_Subject":  "[Teams Chat]",
+                "From":           "teams",
+                "Msg_ID":         msg_id,
+                "Att_ID":         "",
+                "Processed_Date": _today,
+            }
+            pending = {
+                "new_row":      new_row,
+                "existing_row": meta,
+                "hash":         h,
+                "hashes_file":  str(hashes_file) if hashes_file else None,
+                "master_file":  str(master_file),
+                "expenses_dir": str(expenses_dir),
+                "is_hash_dup":  True,
+            }
+            reply = (
+                f"⚠️ This receipt was already captured on {meta.get('processed_date', '?')}.\n\n"
+                f"Vendor: {meta.get('vendor', '?')}\n"
+                f"Amount: {meta.get('amount', '?')} {meta.get('currency', '')}\n"
+                f"Date: {meta.get('date', '?')}\n\n"
+                f"Reply YES to add as a new expense entry anyway, or NO to discard."
+            )
+            return reply, pending
+        return "This receipt has already been captured (exact duplicate). No action taken.", None
 
     print(f"[ExpenseAgent] Processing Teams receipt: {filename}")
     result = _extract_from_attachment(img_bytes, mime, filename, ai)
-
-    if owner_graph:
-        try:
-            owner_graph.upload_to_onedrive(f"CEO Platform/Receipts/{filename}", img_bytes, mime)
-        except Exception as e:
-            print(f"[ExpenseAgent] OneDrive upload failed: {e}")
 
     seen.add(dedup_key)
     _save_seen(seen, seen_file)
@@ -234,11 +263,25 @@ def _handle_teams_receipt(msg: dict, chat_id: str, graph, ai,
         )
         return reply, pending
 
+    if owner_graph:
+        try:
+            owner_graph.upload_to_onedrive(f"CEO Platform/Receipts/{filename}", img_bytes, mime)
+        except Exception as e:
+            print(f"[ExpenseAgent] OneDrive upload failed: {e}")
+
     expenses_dir.mkdir(parents=True, exist_ok=True)
     wb = openpyxl.load_workbook(master_file) if master_file.exists() else _init_workbook()
     _append_row(wb.active, new_row)
     wb.save(master_file)
-    hashes[h] = filename
+    hashes[h] = {
+        "filename":       filename,
+        "vendor":         result.get("vendor", ""),
+        "amount":         amount,
+        "currency":       result.get("currency", "CAD"),
+        "date":           result.get("date", ""),
+        "category":       result.get("category", "Other"),
+        "processed_date": today,
+    }
     _save_hashes(hashes, hashes_file)
 
     conf = {"high": "✅ High", "medium": "⚠️ Medium", "low": "⚠️ Low"}.get(
@@ -350,7 +393,10 @@ def poll_and_reply(bot_state: dict, graph, ai, owner_graph=None,
                 settings, wiki_dir, data_dir,
                 user_model_path=user_model_path,
             )
-            graph.send_chat_message(chat_id, reply_text)
+            if "<a href=" in reply_text:
+                graph.send_html_message(chat_id, reply_text)
+            else:
+                graph.send_chat_message(chat_id, reply_text)
         except Exception as e:
             import traceback
             print(f"[TeamsBot] Bot error: {e}")

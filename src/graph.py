@@ -8,9 +8,18 @@ BASE = "https://graph.microsoft.com/v1.0"
 
 
 def _fmt_inline(text: str) -> str:
-    """HTML-escape text and convert **bold** to <b>bold</b>."""
+    """HTML-escape text, convert **bold** and [label](url) links."""
+    # Extract links before escaping to preserve URLs
+    links: list[tuple[str, str]] = _re.findall(r'\[([^\]]+)\]\((https?://[^\)]+)\)', text)
+    placeholder_map: dict[str, str] = {}
+    for label, url in links:
+        placeholder = f"\x00LINK{len(placeholder_map)}\x00"
+        placeholder_map[placeholder] = f'<a href="{url}">{_html_mod.escape(label)}</a>'
+        text = text.replace(f"[{label}]({url})", placeholder, 1)
     text = _html_mod.escape(text)
     text = _re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    for placeholder, anchor in placeholder_map.items():
+        text = text.replace(_html_mod.escape(placeholder), anchor)
     return text
 
 
@@ -129,14 +138,18 @@ class GraphClient:
     # ── Mail ──────────────────────────────────────────────
 
     def get_messages(self, top: int = 10, filter: str = None, orderby: str = "receivedDateTime desc",
-                     mailbox: str = None) -> list:
-        """Read messages from /me or a delegated mailbox (mailbox = email address)."""
+                     mailbox: str = None, folder: str = None) -> list:
+        """Read messages from /me or a delegated mailbox.
+        folder: 'Inbox', 'Drafts', 'SentItems', etc. — None means all folders."""
         base = f"/users/{mailbox}" if mailbox else "/me"
-        params = {"$top": top, "$orderby": orderby,
-                  "$select": "id,subject,from,ccRecipients,receivedDateTime,isRead,importance,hasAttachments,conversationId,bodyPreview,body"}
+        endpoint = f"{base}/mailFolders/{folder}/messages" if folder else f"{base}/messages"
+        params = {"$top": top,
+                  "$select": "id,subject,from,ccRecipients,receivedDateTime,isRead,importance,hasAttachments,conversationId,bodyPreview,body,webLink"}
+        if orderby:
+            params["$orderby"] = orderby
         if filter:
             params["$filter"] = filter
-        return self.get(f"{base}/messages", params=params).get("value", [])
+        return self.get(endpoint, params=params).get("value", [])
 
     def get_sent_messages_since(self, days: int = 14, max_results: int = 500) -> list:
         """Fetch sent messages from the past N days, handling pagination."""
@@ -232,6 +245,24 @@ class GraphClient:
             results.extend(data.get("value", []))
             endpoint = data.get("@odata.nextLink")
             params = None  # nextLink already contains all params
+        return results[:max_results]
+
+    def get_messages_since_datetime(self, since_iso: str, max_results: int = 100) -> list:
+        """Fetch messages received after a specific ISO timestamp (for incremental cache)."""
+        params = {
+            "$top":     100,
+            "$orderby": "receivedDateTime desc",
+            "$filter":  f"receivedDateTime gt {since_iso}",
+        }
+        results = []
+        endpoint = f"{BASE}/me/messages"
+        while endpoint and len(results) < max_results:
+            r = requests.get(endpoint, headers=self.headers, params=params)
+            r.raise_for_status()
+            data = r.json()
+            results.extend(data.get("value", []))
+            endpoint = data.get("@odata.nextLink")
+            params = None
         return results[:max_results]
 
     def create_draft(self, subject: str, body: str, to: str, mailbox: str = None) -> dict:
@@ -425,6 +456,33 @@ class GraphClient:
         return self.post(f"/me/chats/{chat_id}/messages", {
             "body": {"contentType": "html", "content": _to_teams_html(content)}
         })
+
+    def send_html_message(self, chat_id: str, html: str) -> dict:
+        """Send a raw HTML message to a Teams 1:1 chat. Use when content contains links or pre-built HTML."""
+        return self.post(f"/me/chats/{chat_id}/messages", {
+            "body": {"contentType": "html", "content": html}
+        })
+
+    def create_event(self, subject: str, start: str, end: str,
+                     attendees: list = None, location: str = None,
+                     timezone: str = "UTC", is_online: bool = False) -> dict:
+        """Create a calendar event. start/end are ISO 8601 datetime strings."""
+        body: dict = {
+            "subject": subject,
+            "start": {"dateTime": start, "timeZone": timezone},
+            "end":   {"dateTime": end,   "timeZone": timezone},
+        }
+        if attendees:
+            body["attendees"] = [
+                {"emailAddress": {"address": a.strip()}, "type": "required"}
+                for a in attendees if a.strip()
+            ]
+        if location:
+            body["location"] = {"displayName": location}
+        if is_online:
+            body["isOnlineMeeting"] = True
+            body["onlineMeetingProvider"] = "teamsForBusiness"
+        return self.post("/me/events", body)
 
     def create_todo_task(self, title: str, note: str = "", due_date: str = None) -> dict:
         """Create a task in the default To-Do list. due_date format: YYYY-MM-DD."""

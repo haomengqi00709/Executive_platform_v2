@@ -1,0 +1,31 @@
+Title: Q2 Strategy Review
+Date: 2026-05-22
+Attendees: daniel@company.com, jason@trustai.ca
+
+Daniel: Let's start with the pipeline review. We currently have 3 enterprise deals in late stage.
+
+Jason: The Acme deal should close by end of June. I'll send them the updated proposal by this Friday, May 24.
+
+Daniel: Good. Make sure the proposal includes the new pricing structure we agreed on last week.
+
+Jason: Understood. I'll include that. Should I also loop in Sarah from their legal team?
+
+Daniel: Yes, copy Sarah. On the hiring side — we need to bring on 2 engineers before Q3 starts. Jason, can you post the job descriptions this week?
+
+Jason: Will do. Target is to have the roles posted by May 28. I'll use the same JD template we used for the last hire.
+
+Daniel: Perfect. Now on the product roadmap — we agreed to move the platform launch from June 15 to July 1. This gives us two more weeks of testing time before we go live.
+
+Jason: Agreed. That's a firm decision. I'll update the roadmap document and share it with the full team by EOD Thursday.
+
+Daniel: Also make sure the engineering team knows about the new date so they can plan accordingly.
+
+Jason: I'll send a team update today.
+
+Daniel: One more item — let's set up a monthly business review with Acme starting in June. They want to stay close to the rollout.
+
+Jason: Good idea. I'll reach out to their project lead this week to propose dates. We can do it the first Thursday of each month.
+
+Daniel: That works. Let's wrap up. Summary: proposal to Acme by Friday, roles posted by May 28, roadmap updated by Thursday, Acme monthly review scheduled by end of this week.
+
+Jason: Confirmed. I'll send a follow-up email summarizing all action items.

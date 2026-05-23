@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.graph import GraphClient
-from src import wiki as _wiki
+from src.modules.wiki import load_index, load_meeting, get_meeting_action_items
 
 
 def get_upcoming_meetings(graph: GraphClient, hours_ahead: int = 24) -> list:
@@ -38,52 +38,40 @@ def get_upcoming_meetings(graph: GraphClient, hours_ahead: int = 24) -> list:
     return result
 
 
-def get_contact_history(wiki_dir: Path, email: str) -> dict:
-    """Get email and meeting history with a specific contact."""
+def get_contact_history(data_dir: Path, email: str) -> dict:
+    """Get CRM info and meeting history with a specific contact."""
+    from src.modules.crm import load_crm
     email = email.lower().strip()
-    emails_found  = []
-    meetings_found = []
-    project_names  = []
 
-    for pid, pname in _wiki.list_projects(wiki_dir):
-        project = _wiki.load_project(pid, wiki_dir)
-        if not project:
-            continue
-        for e in project.get("emails", []):
-            from_addr = (e.get("from") or "").lower()
-            to_addr   = (e.get("to")   or "").lower()
-            if email in from_addr or email in to_addr:
-                emails_found.append({
-                    "subject":      e.get("subject", ""),
-                    "date":         e.get("date", ""),
-                    "direction":    e.get("direction", ""),
-                    "body_preview": e.get("body_preview", "")[:150],
-                    "project_name": pname,
-                })
-                if pname not in project_names:
-                    project_names.append(pname)
-        for m in project.get("meetings", []):
+    crm = load_crm(data_dir)
+    contact = crm.get("contacts", {}).get(email, {})
+
+    wiki_dir = Path(data_dir) / "wiki"
+    index = load_index(wiki_dir)
+    meetings_found = []
+    for mid in index.get("meetings", {}):
+        full = load_meeting(wiki_dir, mid)
+        if full and email in [e.lower() for e in full.get("attendee_emails", [])]:
             meetings_found.append({
-                "title":        m.get("title", ""),
-                "date":         m.get("date", ""),
-                "summary":      (m.get("analysis") or {}).get("summary", "")[:200],
-                "action_items": (m.get("analysis") or {}).get("action_items", [])[:3],
-                "project_name": pname,
+                "title":        full.get("title", ""),
+                "date":         full.get("date", ""),
+                "summary":      full.get("summary", "")[:200],
+                "action_items": full.get("action_items", [])[:3],
             })
+    meetings_found.sort(key=lambda x: x.get("date", ""), reverse=True)
 
     return {
         "email":           email,
-        "projects":        project_names,
-        "email_count":     len(emails_found),
-        "recent_emails":   sorted(emails_found,   key=lambda x: x.get("date", ""), reverse=True)[:5],
+        "contact":         contact,
         "meeting_count":   len(meetings_found),
-        "recent_meetings": sorted(meetings_found, key=lambda x: x.get("date", ""), reverse=True)[:3],
+        "recent_meetings": meetings_found[:3],
     }
 
 
-def get_open_action_items(wiki_dir: Path, attendee_email: str = None) -> list:
+def get_open_action_items(data_dir: Path, attendee_email: str = None) -> list:
     """Get unresolved action items from recent meetings, optionally filtered by owner."""
-    items = _wiki.get_meeting_action_items(days=30, wiki_dir=wiki_dir)
+    wiki_dir = Path(data_dir) / "wiki"
+    items = get_meeting_action_items(wiki_dir, days=30)
     if attendee_email:
         hint = attendee_email.lower().split("@")[0]
         items = [
