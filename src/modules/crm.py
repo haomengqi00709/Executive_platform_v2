@@ -283,6 +283,7 @@ def build_crm(
 
     # ── Phase 6: AI enrich ────────────────────────────────
     crm: dict = {}
+    _SAVE_EVERY = 10  # incremental save every N contacts — if process crashes, progress is preserved
     for i, contact in enumerate(candidates):
         addr  = contact["email"]
         label = contact["name"] or addr
@@ -313,6 +314,18 @@ def build_crm(
             enriched["priority"] = old["priority"]
 
         crm[addr] = enriched
+
+        # Incremental save — if the process is killed or hangs later, we don't lose everything
+        if (i + 1) % _SAVE_EVERY == 0 or (i + 1) == len(candidates):
+            try:
+                save_crm(data_dir, {
+                    "last_scan":      datetime.now(timezone.utc).isoformat(),
+                    "months_scanned": months,
+                    "contacts":       crm,
+                    "partial":        (i + 1) < len(candidates),
+                })
+            except Exception as e:
+                log(f"  (partial save failed: {e})")
 
     log(f"CRM build complete — {len(crm)} contacts")
     return {

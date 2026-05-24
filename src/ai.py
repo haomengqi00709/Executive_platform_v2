@@ -1,11 +1,29 @@
 import os
 import time
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
+
+
+# Per-call timeout for Gemini text generation. If the API hangs (rare but happens),
+# we abandon the call and let the retry logic try again instead of blocking forever.
+_GEMINI_TIMEOUT_SECS = 60
+
+
+def _call_with_timeout(fn, timeout_secs: int):
+    """Run fn() in a worker thread, raise TimeoutError if it doesn't finish in time.
+    Note: cannot truly kill the worker thread — it'll keep running in background until
+    the underlying network call finally returns or errors out. But the caller is unblocked."""
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(fn)
+        try:
+            return future.result(timeout=timeout_secs)
+        except _FutureTimeout:
+            raise TimeoutError(f"Gemini call exceeded {timeout_secs}s")
 
 
 class AIClient:
@@ -16,7 +34,10 @@ class AIClient:
     def generate(self, prompt: str) -> str:
         for attempt in range(4):
             try:
-                response = self.client.models.generate_content(model=self.model, contents=prompt)
+                response = _call_with_timeout(
+                    lambda: self.client.models.generate_content(model=self.model, contents=prompt),
+                    _GEMINI_TIMEOUT_SECS,
+                )
                 text = response.text
                 if not text or not text.strip():
                     if attempt < 3:
@@ -25,7 +46,16 @@ class AIClient:
                     raise ValueError("Gemini returned empty response")
                 return text
             except Exception as e:
-                if "429" in str(e) and attempt < 3:
+                err = str(e)
+                # Timeout = hang. Only retry ONCE — don't waste 4 minutes per stuck call.
+                if isinstance(e, TimeoutError):
+                    if attempt < 1:
+                        print(f"  Gemini timeout after {_GEMINI_TIMEOUT_SECS}s, retrying once...")
+                        time.sleep(3)
+                        continue
+                    print(f"  Gemini timeout twice — giving up.")
+                    raise
+                if "429" in err and attempt < 3:
                     wait = 10 * (2 ** attempt)
                     print(f"  Rate limited, retrying in {wait}s...")
                     time.sleep(wait)
