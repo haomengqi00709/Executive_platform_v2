@@ -514,7 +514,7 @@ def reply(
         if section_id not in SECTION_IDS:
             return f"Unknown section '{section_id}'. Available: {', '.join(SECTION_IDS)}"
 
-        owner_uid = bot_state.get("owner_uid", "")
+        owner_uid = state.get("owner_uid", "")
         if not owner_uid:
             return "Cannot run section — owner user ID not found in bot state."
 
