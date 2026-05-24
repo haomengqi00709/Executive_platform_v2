@@ -2273,6 +2273,35 @@ def get_init_status(session: dict = Depends(require_session)):
     return load_init_status(_udir(session["user_id"]))
 
 
+@app.post("/api/init/reset")
+def reset_init(session: dict = Depends(require_session)):
+    """Reset init state and immediately start a fresh init chain.
+    Use this when init is stuck mid-way (e.g. process restart left stage='generating' with no live worker).
+    Deletes init_status.json and partial crm.json/projects.json so the chain starts from scratch."""
+    uid = session["user_id"]
+    udir = _udir(uid)
+    # Clear init artifacts so the chain rebuilds cleanly
+    for fname in ("crm.json", "projects.json"):
+        p = udir / fname
+        if p.exists():
+            try:
+                p.unlink()
+            except Exception:
+                pass
+    status_path = udir / "profile" / "init_status.json"
+    if status_path.exists():
+        try:
+            status_path.unlink()
+        except Exception:
+            pass
+    # Kick a fresh run
+    from src.modules.profile import save_init_status
+    save_init_status(udir, "generating", current_message="Restarting setup...")
+    threading.Thread(target=_run_first_login_init, args=(uid,), daemon=True).start()
+    print(f"[init] Reset and restart triggered for {uid}")
+    return {"ok": True, "stage": "generating", "message": "Init reset and restarted"}
+
+
 @app.post("/api/profile/regenerate")
 def regenerate_profile(session: dict = Depends(require_session)):
     from src.modules.profile import save_init_status, load_init_status
