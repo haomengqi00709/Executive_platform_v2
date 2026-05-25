@@ -298,7 +298,9 @@ def _build_digest_card(emails: list) -> dict:
             "separator": True,
         })
         for e in priority[:5]:
-            name = _from_name(e) or e.get("_crm_name") or "Unknown"
+            # pending_digest items store from_name as a plain string field;
+            # don't call _from_name() which expects raw Graph dict structure.
+            name = e.get("from_name") or e.get("_crm_name") or "Unknown"
             company = e.get("_crm_company", "")
             subject = (e.get("subject") or "(no subject)")[:80]
             received = _relative_time(e.get("receivedDateTime", ""))
@@ -318,7 +320,7 @@ def _build_digest_card(emails: list) -> dict:
             "separator": True,
         })
         for e in review[:5]:
-            name = _from_name(e) or "Unknown"
+            name = e.get("from_name") or "Unknown"
             subject = (e.get("subject") or "(no subject)")[:80]
             body.append({"type": "TextBlock", "text": f'• {name} — "{subject}"', "wrap": True})
         if len(review) > 5:

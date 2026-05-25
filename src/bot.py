@@ -235,9 +235,11 @@ def reply(
         f"  read_settings              → 'what are my settings', 'show my ignore list'\n"
         f"  update_setting             → 'ignore emails from X', 'add rule Y'\n"
         f"  read_skill_instruction     → 'how is X configured', 'show instructions for X'\n"
-        f"  update_skill_instruction   → 'don't show X', 'ignore emails from Y', 'change how Z works'\n"
+        f"  update_skill_instruction   → 'don't show X', 'skip Y in followup', 'stop showing newsletters in reply_needed',\n"
+        f"                               'ignore this email in future briefings', 'change how Z works'.\n"
+        f"                               Always pair with section_id. First read_skill_instruction, then append new rule.\n"
+        f"                               After updating, call run_skill(section_id) so changes take effect immediately.\n"
         f"  run_skill                  → 'run morning briefing now', 'refresh my emails section'\n"
-        f"  dismiss_item               → 'ignore this', 'don't show me this again' (no item numbers)\n"
         f"  dismiss_commitment         → 'skip 2', 'skip 3 4', 'skip 2 3 4' — skip means permanent dismiss\n"
         f"  snooze_commitment          → 'snooze 2', 'remind me in 3 days about 3', 'snooze 2 3 4 for 5 days'\n"
         f"  create_reply_draft         → 'draft a reply to X', 'write an email to Y', 'compose a response'\n"
@@ -532,20 +534,6 @@ def reply(
         return f"✅ {label} is running. Results will appear in your dashboard shortly."
 
     # --- Action tools ---
-
-    def dismiss_item(subject_hint: str) -> str:
-        """Permanently suppress an email or item so it no longer appears in action items or briefings.
-        subject_hint: partial subject line, sender name, or any keyword identifying the item."""
-        nonlocal user_model
-        skipped = list(user_model.get("skipped_items", []))
-        skipped.append({
-            "hint":       subject_hint,
-            "dismissed_at": datetime.now(timezone.utc).isoformat(),
-        })
-        user_model = {**user_model, "skipped_items": skipped}
-        _save_user_model(user_model_path, user_model)
-        print(f"[Bot] dismiss_item({subject_hint!r})")
-        return f"✅ Dismissed — '{subject_hint}' will no longer appear in briefings or action items."
 
     def _resolve_commitment(index_or_hint: str) -> tuple[str | None, str]:
         """Return (commitment_id, description) by 1-based index or keyword match."""
@@ -892,7 +880,6 @@ def reply(
         # Trigger
         run_skill,
         # Action
-        dismiss_item,
         mark_commitment_done,
         snooze_commitment,
         dismiss_commitment,
