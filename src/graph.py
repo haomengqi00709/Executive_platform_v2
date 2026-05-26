@@ -137,10 +137,99 @@ class GraphClient:
 
     # ── Mail ──────────────────────────────────────────────
 
+    def get_inbox_folder_ids(self, max_depth: int = 3) -> list[str]:
+        """Return IDs of Inbox + all its sub-folders (recursive, capped at max_depth).
+
+        Cached on the GraphClient instance for the lifetime of this client — most
+        fetch flows make this call once, then reuse for every per-folder query.
+
+        Why: users with Outlook rules routing mail to sub-folders (e.g. Inbox/Acme,
+        Inbox/Projects) would have those messages missed by /me/mailFolders/Inbox/messages
+        which only returns the top-level Inbox. Caller should enumerate via this helper
+        then fetch from each folder id.
+        """
+        if hasattr(self, "_inbox_folder_ids_cache"):
+            return self._inbox_folder_ids_cache
+
+        folders: list[tuple[str, str]] = []  # (id, display_path)
+        try:
+            inbox = self.get("/me/mailFolders/Inbox",
+                             params={"$select": "id,displayName,childFolderCount"})
+            folders.append((inbox["id"], "Inbox"))
+        except Exception as e:
+            print(f"[Graph] Could not enumerate Inbox folder: {e}")
+            return []
+
+        # BFS through child folders
+        queue = [(inbox["id"], "Inbox", 0)]
+        while queue:
+            parent_id, parent_name, depth = queue.pop(0)
+            if depth >= max_depth:
+                continue
+            try:
+                children = self.get(
+                    f"/me/mailFolders/{parent_id}/childFolders",
+                    params={"$top": 100, "$select": "id,displayName,childFolderCount"},
+                ).get("value", [])
+            except Exception:
+                continue
+            for c in children:
+                cid = c.get("id")
+                cname = f"{parent_name}/{c.get('displayName', '?')}"
+                if not cid:
+                    continue
+                folders.append((cid, cname))
+                if c.get("childFolderCount", 0) > 0:
+                    queue.append((cid, cname, depth + 1))
+
+        self._inbox_folder_ids_cache = [fid for fid, _ in folders]
+        self._inbox_folder_names_cache = {fid: name for fid, name in folders}
+        if len(folders) > 1:
+            print(f"[Graph] Inbox + {len(folders) - 1} sub-folder(s) discovered: "
+                  f"{', '.join(name for _, name in folders[:6])}"
+                  f"{' …' if len(folders) > 6 else ''}")
+        return self._inbox_folder_ids_cache
+
     def get_messages(self, top: int = 10, filter: str = None, orderby: str = "receivedDateTime desc",
-                     mailbox: str = None, folder: str = None) -> list:
+                     mailbox: str = None, folder: str = None,
+                     include_subfolders: bool = True) -> list:
         """Read messages from /me or a delegated mailbox.
-        folder: 'Inbox', 'Drafts', 'SentItems', etc. — None means all folders."""
+        folder: 'Inbox', 'Drafts', 'SentItems', etc. — None means all folders.
+        include_subfolders: when folder='Inbox' and mailbox is None, also scan all
+                            sub-folders under Inbox (default True). No effect for other folders."""
+        # Inbox + sub-folder recursive scan
+        if folder == "Inbox" and include_subfolders and not mailbox:
+            folder_ids = self.get_inbox_folder_ids()
+            if len(folder_ids) > 1:
+                results: list = []
+                seen_ids: set = set()
+                for fid in folder_ids:
+                    if len(results) >= top:
+                        break
+                    remaining = top - len(results)
+                    endpoint = f"/me/mailFolders/{fid}/messages"
+                    params = {"$top": remaining,
+                              "$select": "id,subject,from,ccRecipients,receivedDateTime,isRead,importance,hasAttachments,conversationId,bodyPreview,body,webLink"}
+                    if orderby:
+                        params["$orderby"] = orderby
+                    if filter:
+                        params["$filter"] = filter
+                    try:
+                        batch = self.get(endpoint, params=params).get("value", [])
+                    except Exception:
+                        continue
+                    for m in batch:
+                        mid = m.get("id")
+                        if mid and mid not in seen_ids:
+                            seen_ids.add(mid)
+                            results.append(m)
+                # Sort merged batch by receivedDateTime (orderby was per-folder)
+                if orderby and "receivedDateTime" in orderby:
+                    reverse = "desc" in orderby
+                    results.sort(key=lambda m: m.get("receivedDateTime", ""), reverse=reverse)
+                return results[:top]
+            # else: only Inbox itself exists, fall through to single-folder logic
+
         base = f"/users/{mailbox}" if mailbox else "/me"
         endpoint = f"{base}/mailFolders/{folder}/messages" if folder else f"{base}/messages"
         params = {"$top": top,
@@ -227,15 +316,65 @@ class GraphClient:
             params = None
         return results[:max_results]
 
+    def _fetch_messages_in_folder_since(self, folder_path_or_id: str, since_iso: str,
+                                         max_results: int) -> list:
+        """Paginated fetch for one folder. folder_path_or_id can be a well-known name
+        like 'Inbox' or a folder id from get_inbox_folder_ids()."""
+        params = {
+            "$top":     250,
+            "$orderby": "receivedDateTime desc",
+            "$filter":  f"receivedDateTime ge {since_iso}",
+        }
+        results = []
+        endpoint = f"{BASE}/me/mailFolders/{folder_path_or_id}/messages"
+        while endpoint and len(results) < max_results:
+            r = requests.get(endpoint, headers=self.headers, params=params)
+            r.raise_for_status()
+            data = r.json()
+            results.extend(data.get("value", []))
+            endpoint = data.get("@odata.nextLink")
+            params = None
+        return results[:max_results]
+
     def get_messages_since(self, days: int = 30, max_results: int = 500,
-                           folder: str = "Inbox") -> list:
+                           folder: str = "Inbox",
+                           include_subfolders: bool = True) -> list:
         """Fetch messages from the past N days, handling pagination.
 
         folder: defaults to "Inbox" — restricts to inbox messages only (avoids picking up
                 Drafts/Sent/Junk by accident). Pass None to scan all mailbox messages.
+        include_subfolders: when folder='Inbox', also scan all sub-folders recursively.
+                            Default True so users who route mail via Outlook rules to
+                            sub-folders (e.g. Inbox/Acme) don't have those emails missed.
         """
         from datetime import datetime, timedelta, timezone
         since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Inbox + sub-folders: enumerate folder ids, fetch each, merge + dedup
+        if folder == "Inbox" and include_subfolders:
+            folder_ids = self.get_inbox_folder_ids()
+            if len(folder_ids) > 1:
+                merged: list = []
+                seen_ids: set = set()
+                for fid in folder_ids:
+                    if len(merged) >= max_results:
+                        break
+                    remaining = max_results - len(merged)
+                    try:
+                        batch = self._fetch_messages_in_folder_since(fid, since, remaining)
+                    except Exception as e:
+                        print(f"[Graph] sub-folder fetch failed (id={fid[:20]}...): {e}")
+                        continue
+                    for m in batch:
+                        mid = m.get("id")
+                        if mid and mid not in seen_ids:
+                            seen_ids.add(mid)
+                            merged.append(m)
+                merged.sort(key=lambda m: m.get("receivedDateTime", ""), reverse=True)
+                return merged[:max_results]
+            # else: only Inbox itself, fall through to single-folder fetch
+
+        # Single-folder fetch (Inbox-only, or explicit folder, or include_subfolders=False)
         params = {
             "$top":     250,
             "$orderby": "receivedDateTime desc",
