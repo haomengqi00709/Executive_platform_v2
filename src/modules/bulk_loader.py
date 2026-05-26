@@ -30,7 +30,7 @@ _PROJECT_FIELDS = [
     "key_topics", "next_action", "deadline",
 ]
 
-_CRM_STATUSES   = {"client", "prospect", "partner", "vendor", "other"}
+_CRM_STATUSES   = {"client", "prospect", "partner", "investor", "vendor", "internal", "other"}
 _PROJECT_STATUS = {"ongoing", "needs_attention", "paused", "early_stage", "completed"}
 
 
