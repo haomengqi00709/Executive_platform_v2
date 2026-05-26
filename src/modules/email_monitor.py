@@ -171,7 +171,9 @@ IMPORTANT: When in doubt between priority/review and skip, always choose review.
 Do NOT skip an email just because the sender is unknown or the tone is unusual — err on the side of showing it.
 
 Respond with a JSON array, one object per email in the same order:
-[{{"idx":0,"importance":"priority","reason":"one sentence","action":"suggested action"}}]
+[{{"idx":0,"importance":"priority","reason":"why this is priority/review/skip","summary":"one-sentence summary of what the email is actually about","action":"suggested action"}}]
+
+- summary: a single sentence describing the actual content of the email (what they're asking, telling, or sharing). Concrete, no jargon.
 
 Emails to triage:
 {chr(10).join(lines)}"""
@@ -191,6 +193,7 @@ Emails to triage:
             **m,
             "_importance": triage.get("importance", "review"),
             "_ai_reason": triage.get("reason", ""),
+            "_ai_summary": triage.get("summary", ""),
             "_ai_action": triage.get("action", ""),
         })
     return out
@@ -276,70 +279,52 @@ def _build_email_card(email_item: dict) -> dict:
     return card
 
 
-def _build_digest_card(emails: list) -> dict:
-    """Multi-email digest Adaptive Card with priority and review buckets."""
+def _build_digest_html(emails: list, since_time_str: str = "") -> str:
+    """Build digest as an HTML message — one Teams message containing all emails grouped by importance.
+    Each email is in its own <p> so Teams renders natural paragraph spacing between entries."""
     priority = [e for e in emails if e.get("_importance") == "priority"]
     review   = [e for e in emails if e.get("_importance") == "review"]
 
-    body: list = [
-        {
-            "type": "TextBlock",
-            "text": f"📧 Email Digest — {len(emails)} new email{'s' if len(emails) != 1 else ''}",
-            "weight": "Bolder",
-            "size": "Medium",
-        }
-    ]
+    n = len(emails)
+    suffix = "s" if n != 1 else ""
+    overview = f"<b>📧 Email Digest — {n} email{suffix}"
+    if since_time_str:
+        overview += f" since {since_time_str}"
+    overview += "</b>"
+    if priority:
+        overview += f" · {len(priority)} awaiting reply"
+
+    parts = [f"<p>{overview}</p>"]
+
+    def _email_block(e: dict, with_company: bool = True) -> str:
+        name = e.get("from_name") or e.get("_crm_name") or "Unknown"
+        subject = (e.get("subject") or "(no subject)")[:120]
+        label = f"<b>{name}</b>"
+        company = e.get("_crm_company", "") if with_company else ""
+        if company:
+            label += f" ({company})"
+        received = _relative_time(e.get("receivedDateTime", ""))
+        time_part = f" · {received}" if received else ""
+        head = f'{label} — "{subject}"{time_part}'
+        summary = e.get("_ai_summary") or e.get("_ai_reason", "")
+        if summary:
+            return f"<p>{head}<br><i>{summary}</i></p>"
+        return f"<p>{head}</p>"
 
     if priority:
-        body.append({
-            "type": "TextBlock",
-            "text": f"🔴 Priority ({len(priority)})",
-            "weight": "Bolder",
-            "separator": True,
-        })
-        for e in priority[:5]:
-            # pending_digest items store from_name as a plain string field;
-            # don't call _from_name() which expects raw Graph dict structure.
-            name = e.get("from_name") or e.get("_crm_name") or "Unknown"
-            company = e.get("_crm_company", "")
-            subject = (e.get("subject") or "(no subject)")[:80]
-            received = _relative_time(e.get("receivedDateTime", ""))
-            label = f"**{name}**"
-            if company:
-                label += f" ({company})"
-            label += f' — "{subject}" — {received}'
-            body.append({"type": "TextBlock", "text": f"• {label}", "wrap": True})
-            if e.get("_ai_reason"):
-                body.append({"type": "TextBlock", "text": f"  {e['_ai_reason']}", "wrap": True, "isSubtle": True})
+        parts.append(f"<p><b>🔴 Priority ({len(priority)})</b></p>")
+        for e in priority[:10]:
+            parts.append(_email_block(e, with_company=True))
 
     if review:
-        body.append({
-            "type": "TextBlock",
-            "text": f"📋 Review ({len(review)})",
-            "weight": "Bolder",
-            "separator": True,
-        })
-        for e in review[:5]:
-            name = e.get("from_name") or "Unknown"
-            subject = (e.get("subject") or "(no subject)")[:80]
-            body.append({"type": "TextBlock", "text": f'• {name} — "{subject}"', "wrap": True})
-        if len(review) > 5:
-            body.append({"type": "TextBlock", "text": f"  ...and {len(review) - 5} more", "isSubtle": True})
+        parts.append(f"<p><b>📋 Review ({len(review)})</b></p>")
+        for e in review[:10]:
+            parts.append(_email_block(e, with_company=False))
+        if len(review) > 10:
+            parts.append(f"<p><i>...and {len(review) - 10} more</i></p>")
 
-    body.append({
-        "type": "TextBlock",
-        "text": "Reply here to ask about any email or draft a response.",
-        "wrap": True,
-        "isSubtle": True,
-        "separator": True,
-    })
-
-    return {
-        "type": "AdaptiveCard",
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        "version": "1.2",
-        "body": body,
-    }
+    parts.append("<p><i>Reply here to ask about any email or draft a response.</i></p>")
+    return "".join(parts)
 
 
 # ── Digest timing ─────────────────────────────────────────────────────────
@@ -449,7 +434,7 @@ def _maybe_send_digest(graph, chat_id: str, monitor_state: dict, settings: dict)
     followup_items = [
         {
             "_importance": "priority",
-            "_ai_reason": "⏰ Awaiting your reply",
+            "_ai_summary": f.get("_ai_summary") or f.get("_ai_reason") or "⏰ Awaiting your reply",
             "from_name": f.get("from_name", ""),
             "subject": f.get("subject", ""),
             "receivedDateTime": f.get("pushed_at", ""),
@@ -462,9 +447,19 @@ def _maybe_send_digest(graph, chat_id: str, monitor_state: dict, settings: dict)
     if not all_items:
         return
 
+    # Compute "since" label from last digest timestamp
+    since_str = ""
+    last_ts = monitor_state.get("last_digest_ts") or ""
+    if last_ts:
+        try:
+            last_dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+            since_str = last_dt.strftime("%-I:%M %p")
+        except Exception:
+            pass
+
     try:
-        card = _build_digest_card(all_items)
-        _send_adaptive_card(graph, chat_id, card)
+        html = _build_digest_html(all_items, since_time_str=since_str)
+        graph.send_html_message(chat_id, html)
         print(f"[EmailMonitor] Digest sent: {len(all_items)} items ({len(followup_items)} unreplied, {len(pending)} new)")
         monitor_state["pending_digest"] = []
         monitor_state["last_digest_ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -559,7 +554,8 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
         try:
             crm_data = load_crm(data_dir)
             ignored_emails = {
-                email for email, c in crm_data.get("contacts", {}).items() if c.get("ignore")
+                email for email, c in crm_data.get("contacts", {}).items()
+                if c.get("ignore") or c.get("archived")
             }
         except Exception:
             pass
@@ -660,16 +656,18 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
                         "pushed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                         "_crm_company": email_item.get("_crm_company", ""),
                         "_ai_reason": email_item.get("_ai_reason", ""),
+                        "_ai_summary": email_item.get("_ai_summary", ""),
                     })
                 except Exception as e:
                     print(f"[EmailMonitor] Card send failed: {e}")
             else:
                 monitor_state.setdefault("pending_digest", []).append({
                     **summary,
-                    "received": email_item.get("receivedDateTime", ""),
+                    "receivedDateTime": email_item.get("receivedDateTime", ""),
                     "importance": importance,
                     "_importance": importance,
                     "_ai_reason": email_item.get("_ai_reason", ""),
+                    "_ai_summary": email_item.get("_ai_summary", ""),
                     "_ai_action": email_item.get("_ai_action", ""),
                     "_crm_company": email_item.get("_crm_company", ""),
                     "crm_priority": email_item.get("_crm_priority", ""),
