@@ -8,7 +8,7 @@ import type { CrmContact } from '../../lib/api';
 import MergePicker from './MergePicker';
 import BulkUploadModal from './BulkUploadModal';
 
-const STATUS_OPTIONS = ['client', 'prospect', 'partner', 'vendor', 'other'];
+const STATUS_OPTIONS = ['client', 'prospect', 'partner', 'investor', 'vendor', 'internal', 'other'];
 const PRIORITY_OPTIONS = ['high', 'medium', 'low', 'ignore'];
 
 const STATUS_COLOR: Record<string, string> = {
