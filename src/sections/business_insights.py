@@ -130,7 +130,8 @@ def _count_priority(items: list, priority: str) -> int:
 
 def _crm_stats(crm: dict) -> dict:
     contacts = crm.get("contacts", {})
-    out = {"client": 0, "prospect": 0, "partner": 0, "vendor": 0, "other": 0}
+    out = {"client": 0, "prospect": 0, "partner": 0, "investor": 0,
+           "vendor": 0, "internal": 0, "other": 0}
     for c in contacts.values():
         if c.get("ignore") or c.get("archived"):
             continue
@@ -157,7 +158,7 @@ def _new_crm_this_week(crm: dict, today: date) -> int:
     for c in crm.get("contacts", {}).values():
         if c.get("ignore") or c.get("archived"):
             continue
-        if c.get("status") not in ("client", "prospect", "partner"):
+        if c.get("status") not in ("client", "prospect", "partner", "investor"):
             continue
         if (c.get("updated_at") or "") >= cutoff:
             n += 1

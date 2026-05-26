@@ -71,7 +71,7 @@ def _collect_crm_titles(data_dir: Path) -> list[tuple[str, int]]:
     for c in crm.get("contacts", {}).values():
         if c.get("ignore") or c.get("archived") or c.get("priority") == "ignore":
             continue
-        if c.get("status") not in ("client", "prospect", "partner"):
+        if c.get("status") not in ("client", "prospect", "partner", "investor"):
             continue
         role = (c.get("role") or "").strip()
         if role:

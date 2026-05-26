@@ -36,8 +36,8 @@ Last 30 days.
 - Old news (>30 days)
 """
 
-_AUTO_CRM_STATUSES = {"client", "prospect", "partner"}
-_STATUS_PRIORITY   = {"client": 0, "prospect": 1, "partner": 2}
+_AUTO_CRM_STATUSES = {"client", "prospect", "partner", "investor"}
+_STATUS_PRIORITY   = {"client": 0, "prospect": 1, "partner": 2, "investor": 1}
 _WATCHLIST_PRIORITY = 1  # between prospect and partner — user-defined list is high priority
 _ACTIVE_PROJECT_STATUSES = {"ongoing", "needs_attention", "paused", "early_stage"}
 

@@ -29,7 +29,7 @@ from src.modules.profile import load_profile_context
 _SKILLS_DIR = Path(__file__).parent.parent / "skills" / "relationship_health"
 _RESULT_ID = "relationship_health"
 
-_AUTO_CRM_STATUSES = {"client", "prospect", "partner"}
+_AUTO_CRM_STATUSES = {"client", "prospect", "partner", "investor"}
 _ACTIVE_PROJECT_STATUSES = {"ongoing", "needs_attention", "paused", "early_stage"}
 
 _LOOKBACK_DAYS = 90

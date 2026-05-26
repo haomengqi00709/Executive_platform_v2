@@ -218,7 +218,11 @@ def _save_cache(cache: msal.SerializableTokenCache):
         os.replace(tmp, CACHE_FILE)  # atomic on POSIX — prevents partial-write corruption
 
 def _build_legacy_app(cache) -> msal.PublicClientApplication:
-    return msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY_LEGACY, token_cache=cache)
+    # Use /common authority so multi-tenant users (e.g. Audrey@<their-domain>)
+    # can register as bot accounts via device flow. The Azure app registration
+    # must also be set to multi-tenant in Azure portal; both must agree, else
+    # AADSTS50020 fires.
+    return msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY_COMMON, token_cache=cache)
 
 def get_token() -> str:
     cache = _load_cache()
