@@ -13,6 +13,7 @@ import RecordsPage from './pages/RecordsPage';
 import ToolsPage from './pages/ToolsPage';
 import ProfilePage from './pages/ProfilePage';
 import OnboardingWizard from './components/OnboardingWizard';
+import { ActivityProvider } from './components/ActivityDrawer';
 
 // ── Types (preserved auth + onboarding + settings) ─────────────────────────
 
@@ -103,6 +104,7 @@ export default function App() {
   };
 
   return (
+    <ActivityProvider>
     <div className="flex h-screen w-full bg-executive-bg text-executive-text overflow-hidden executive-grid">
       {/* Sidebar */}
       <aside className="w-56 shrink-0 h-full flex flex-col border-r border-executive-border bg-executive-card z-10">
@@ -192,6 +194,7 @@ export default function App() {
         {page === 'settings'  && <SettingsPage user={user} />}
       </main>
     </div>
+    </ActivityProvider>
   );
 }
 

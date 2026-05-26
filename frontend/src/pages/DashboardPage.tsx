@@ -8,6 +8,7 @@ import { getSection, runSection, relativeTime } from '../lib/api';
 import type {
   SectionResult, RelationshipItem,
 } from '../lib/types';
+import { useActivity } from '../components/ActivityDrawer';
 
 interface DashboardPageProps {
   goToSkill: (sectionId: string) => void;
@@ -35,6 +36,7 @@ export default function DashboardPage({ goToSkill }: DashboardPageProps) {
   const [stats, setStats] = useState<Record<string, SectionResult | null>>({});
   const [loading, setLoading] = useState(true);
   const [rerunning, setRerunning] = useState(false);
+  const activity = useActivity();
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -53,6 +55,7 @@ export default function DashboardPage({ goToSkill }: DashboardPageProps) {
 
   const handleRerunBriefing = async () => {
     setRerunning(true);
+    activity.start('ai_summary');
     try {
       await runSection('ai_summary');
       const start = Date.now();

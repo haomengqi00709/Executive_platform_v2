@@ -662,42 +662,75 @@ def bot_auth_start(session: dict = Depends(require_session)):
 
 @app.post("/api/teams/bot/auth-poll")
 def bot_auth_poll(session: dict = Depends(require_session)):
+    """Single-shot OAuth poll — returns immediately with pending/success/error.
+
+    We can't use MSAL's auth.complete_device_flow() here because it's a
+    blocking call that waits until the user completes auth or the code
+    expires (5–15 min). On Railway/Cloudflare that connection gets
+    idle-killed mid-flight (ERR_HTTP2_PROTOCOL_ERROR), and the frontend
+    polling loop dies. Hitting the raw token endpoint returns in <1s with
+    'authorization_pending' until the user completes, then with the token."""
     global _bot_device_flow
     with _bot_device_flow_lock:
         if not _bot_device_flow:
             return {"status": "no_flow"}
-        try:
-            token = auth.complete_device_flow(_bot_device_flow)
-            _bot_device_flow.clear()
 
-            import requests as _req
+        import requests as _req
+        try:
+            r = _req.post(
+                "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                data={
+                    "client_id":   auth.CLIENT_ID,
+                    "grant_type":  "urn:ietf:params:oauth:grant-type:device_code",
+                    "device_code": _bot_device_flow.get("device_code", ""),
+                },
+                timeout=8,
+            )
+            result = r.json()
+        except Exception as e:
+            return {"status": "error", "message": f"Token poll failed: {e}"}
+
+        if "error" in result:
+            err = result["error"]
+            if err in ("authorization_pending", "slow_down"):
+                return {"status": "pending"}
+            if err == "expired_token":
+                _bot_device_flow.clear()
+                return {"status": "expired", "message": "Device code expired"}
+            return {"status": "error", "message": result.get("error_description", err)}
+
+        token = result.get("access_token")
+        if not token:
+            return {"status": "error", "message": "No access_token in response"}
+
+        _bot_device_flow.clear()
+
+        try:
             me = _req.get(
                 "https://graph.microsoft.com/v1.0/me",
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=10,
             ).json()
-            bot_uid   = me.get("id", "")
-            bot_email = me.get("mail") or me.get("userPrincipalName", "")
-            if bot_uid:
-                expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-                auth.save_user_tokens(bot_uid, {
-                    "access_token":  token,
-                    "refresh_token": "",
-                    "expiry":        expiry,
-                    "username":      bot_email,
-                })
-                bp = _bot_state_path(bot_uid)
-                bs = json.loads(bp.read_text()) if bp.exists() else {}
-                bs["enabled"]           = True
-                bs["is_registered_bot"] = True
-                _write_json(bp, bs)
-
-            return {"status": "success", "bot_email": bot_email, "bot_uid": bot_uid}
         except Exception as e:
-            msg = str(e)
-            if "authorization_pending" in msg or "slow_down" in msg:
-                return {"status": "pending"}
-            return {"status": "error", "message": msg}
+            return {"status": "error", "message": f"Graph /me failed: {e}"}
+
+        bot_uid   = me.get("id", "")
+        bot_email = me.get("mail") or me.get("userPrincipalName", "")
+        if bot_uid:
+            expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+            auth.save_user_tokens(bot_uid, {
+                "access_token":  token,
+                "refresh_token": result.get("refresh_token", ""),
+                "expiry":        expiry,
+                "username":      bot_email,
+            })
+            bp = _bot_state_path(bot_uid)
+            bs = json.loads(bp.read_text()) if bp.exists() else {}
+            bs["enabled"]           = True
+            bs["is_registered_bot"] = True
+            _write_json(bp, bs)
+
+        return {"status": "success", "bot_email": bot_email, "bot_uid": bot_uid}
 
 
 @app.post("/api/teams/bot/activate")
@@ -2585,18 +2618,45 @@ async def scan_expenses_historical(
     days = int((body or {}).get("days") or 90)
     days = max(7, min(days, 365))
 
+    # Stream logs into results/expenses.json (status=running + logs[-20:]) so
+    # the global Activity drawer can poll /api/sections/expenses and show
+    # live progress, same way run_section() does.
+    results_dir = _udir(uid) / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    expense_result_path = results_dir / "expenses.json"
+    _write_json(expense_result_path, {
+        "id": "expenses", "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "scan_days": days,
+        "logs": [f"Starting scan: last {days} days"],
+    })
+
     def _run():
         from src.sections.expenses import run as expenses_run
+        logs: list[str] = [f"Starting scan: last {days} days"]
+        def _progress(msg: str):
+            logs.append(msg)
+            print(f"[ExpenseScan/{uid[:8]}] {msg}")
+            _write_json(expense_result_path, {
+                "id": "expenses", "status": "running",
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "scan_days": days,
+                "logs": logs[-20:],
+            })
         try:
             token = auth.get_valid_access_token(uid)
             graph = GraphClient(token)
             ai    = AIClient()
-            result = expenses_run(
-                graph, ai, _udir(uid), days=days,
-                progress=lambda m: print(f"[ExpenseScan/{uid[:8]}] {m}"),
-            )
+            result = expenses_run(graph, ai, _udir(uid), days=days, progress=_progress)
+            result["logs"] = logs[-20:]
+            _write_json(expense_result_path, result)
             print(f"[ExpenseScan] Done for {uid} — captured {result.get('count', 0)} new items ({days}d)")
         except Exception as e:
+            _write_json(expense_result_path, {
+                "id": "expenses", "status": "error",
+                "error": str(e), "logs": logs[-20:],
+                "last_run": datetime.now(timezone.utc).isoformat(),
+            })
             print(f"[ExpenseScan] Failed for {uid}: {e}")
 
     background_tasks.add_task(_run)

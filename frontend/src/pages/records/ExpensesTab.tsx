@@ -8,6 +8,7 @@ import {
   scanHistoricalExpenses,
 } from '../../lib/api';
 import type { ExpenseRow } from '../../lib/api';
+import { useActivity } from '../../components/ActivityDrawer';
 
 const CATEGORY_OPTIONS = ['Travel', 'Meals', 'Software', 'Services', 'Equipment', 'Utilities', 'Other'];
 
@@ -474,11 +475,13 @@ function HistoricalScanBanner({
   }>(null);
   const [error, setError] = useState<string | null>(null);
   const pollRef = useRef<number | null>(null);
+  const activity = useActivity();
 
   const start = async (days: number) => {
     setError(null);
     try {
       const r = await scanHistoricalExpenses(days);
+      activity.start('expenses');
       setState({
         days:          r.days,
         estMin:        r.estimated_minutes,

@@ -12,6 +12,7 @@ import {
   relativeTime,
 } from '../lib/api';
 import { SECTION_BY_ID } from '../lib/sections';
+import { useActivity } from '../components/ActivityDrawer';
 import type {
   SectionResult, ReplyNeededItem, FollowupItem, CommitmentItem,
   MeetingTodayItem, ProjectItem, RelationshipItem,
@@ -43,6 +44,7 @@ export default function SectionDetailPage({ sectionId, goBack, goToCustomize }: 
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [actioned, setActioned] = useState<Record<string, Set<string>>>({});
+  const activity = useActivity();
 
   const meta = SECTION_BY_ID[activeId];
   const activeResult = results[activeId] ?? null;
@@ -66,6 +68,7 @@ export default function SectionDetailPage({ sectionId, goBack, goToCustomize }: 
 
   const handleRefresh = async () => {
     setRefreshing(true);
+    activity.start(activeId);
     try {
       await runSection(activeId);
       const start = Date.now();
