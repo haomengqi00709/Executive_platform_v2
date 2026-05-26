@@ -56,7 +56,9 @@ export default function DashboardPage({ goToSkill }: DashboardPageProps) {
     try {
       await runSection('ai_summary');
       const start = Date.now();
-      while (Date.now() - start < 90_000) {
+      // ai_summary depends on 9 sub-sections; first run of the day refreshes
+      // all of them serially, which can take ~3 minutes. Give it 5 min headroom.
+      while (Date.now() - start < 300_000) {
         await new Promise(r => setTimeout(r, 3000));
         const fresh = await getSection('ai_summary').catch(() => null);
         if (fresh && fresh.status !== 'running') {

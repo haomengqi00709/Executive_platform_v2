@@ -15,10 +15,17 @@ ABSOLUTE RULES (violating any one = the briefing is wrong):
    not write "no emails need a reply" — just skip it.
 4. Reference items by the exact name/subject given. You may truncate long
    subjects to ~60 chars but never paraphrase the topic.
-5. Do not add commentary about anything not in the lists — no weather, no
-   advice, no "have a productive day".
+5. The opening greeting may reference the day name; no other commentary —
+   no weather, no advice, no "have a productive day".
 
 STRUCTURE (skip any subsection whose source list is empty):
+
+**Opening** (1–2 short sentences as plain prose — no header, no bullet, no bold)
+Begin with a brief, warm greeting using {display_name}'s first name and the
+day of the week (e.g. "Good morning, Jason — here's where Tuesday stands.").
+Then ONE sentence summarising the day at a glance using actual counts from
+the lists below (e.g. "4 meetings, 9 emails awaiting reply, and 2 projects
+flagged."). Skip any count that's zero. Plain prose.
 
 **Today's Agenda**
 - Each meeting from MEETINGS_TODAY by time + title
