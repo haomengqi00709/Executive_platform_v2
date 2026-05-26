@@ -227,8 +227,13 @@ class GraphClient:
             params = None
         return results[:max_results]
 
-    def get_messages_since(self, days: int = 30, max_results: int = 500) -> list:
-        """Fetch all messages from the past N days, handling pagination."""
+    def get_messages_since(self, days: int = 30, max_results: int = 500,
+                           folder: str = "Inbox") -> list:
+        """Fetch messages from the past N days, handling pagination.
+
+        folder: defaults to "Inbox" — restricts to inbox messages only (avoids picking up
+                Drafts/Sent/Junk by accident). Pass None to scan all mailbox messages.
+        """
         from datetime import datetime, timedelta, timezone
         since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
         params = {
@@ -237,7 +242,7 @@ class GraphClient:
             "$filter":  f"receivedDateTime ge {since}",
         }
         results = []
-        endpoint = f"{BASE}/me/messages"
+        endpoint = f"{BASE}/me/mailFolders/{folder}/messages" if folder else f"{BASE}/me/messages"
         while endpoint and len(results) < max_results:
             r = requests.get(endpoint, headers=self.headers, params=params)
             r.raise_for_status()
