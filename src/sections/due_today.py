@@ -7,12 +7,13 @@ Real-time filter of `results/commitments_extract.json` for items where
 No AI. No own data cache (reads upstream + writes own result snapshot).
 """
 import json
-from datetime import datetime, date, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.ai import AIClient
 from src.graph import GraphClient
 from src.modules.validator import validate_output
+from src.modules.tz import now_local, today_local_str
 
 _RESULT_ID = "due_today"
 
@@ -53,7 +54,7 @@ def run(
     results_path = data_dir / "results" / f"{_RESULT_ID}.json"
     results_path.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
-    today_str = date.today().isoformat()
+    today_str = today_local_str(data_dir)
 
     src_path = data_dir / "results" / "commitments_extract.json"
     if not src_path.exists():
@@ -97,7 +98,7 @@ def run(
 
     user_instruction = _load_user_instruction(data_dir)
     display_name = (settings or {}).get("display_name") or "the executive"
-    date_str = datetime.now().strftime("%A, %B %d, %Y")
+    date_str = now_local(data_dir).strftime("%A, %B %d, %Y")
     items = validate_output(
         items, ai,
         section_id=_RESULT_ID,

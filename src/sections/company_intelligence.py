@@ -90,7 +90,7 @@ def _build_company_list(data_dir: Path, crm_data: dict, projects_data: dict) -> 
 
     # CRM contacts — only client / prospect / partner, not low priority
     for contact in crm_data.get("contacts", {}).values():
-        if contact.get("ignore") or contact.get("priority") == "ignore":
+        if contact.get("ignore") or contact.get("archived") or contact.get("priority") == "ignore":
             continue
         if contact.get("priority") == "low":
             continue
@@ -106,7 +106,7 @@ def _build_company_list(data_dir: Path, crm_data: dict, projects_data: dict) -> 
     # Projects — cross-ref participants with CRM (client/prospect/partner, not low priority)
     contacts = crm_data.get("contacts", {})
     for proj in projects_data.get("projects", {}).values():
-        if proj.get("ignore") or proj.get("status") not in _ACTIVE_PROJECT_STATUSES:
+        if proj.get("ignore") or proj.get("archived") or proj.get("status") not in _ACTIVE_PROJECT_STATUSES:
             continue
         for email in proj.get("participants", []):
             contact = contacts.get(email.lower(), {})

@@ -6,12 +6,16 @@ No caching, no AI. Each call returns the current view of the day.
 """
 import hashlib
 import json
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from src.ai import AIClient
 from src.graph import GraphClient
 from src.modules.validator import validate_output
+from src.modules.tz import (
+    get_user_tz, now_local, today_local_str, local_day_window_utc, format_local_time,
+)
 
 _RESULT_ID = "meetings_today"
 
@@ -36,18 +40,7 @@ def _load_user_instruction(data_dir: Path) -> str:
     return path.read_text().strip()
 
 
-def _format_time(iso_str: str) -> str:
-    """Convert ISO datetime to HH:MM in local-ish format (UTC for now)."""
-    if not iso_str:
-        return ""
-    try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        return dt.strftime("%H:%M")
-    except Exception:
-        return iso_str[11:16] if len(iso_str) >= 16 else iso_str
-
-
-def _build_item(event: dict) -> dict:
+def _build_item(event: dict, tz: ZoneInfo) -> dict:
     subject = event.get("subject") or "(no subject)"
     start = (event.get("start") or {}).get("dateTime") or ""
     end = (event.get("end") or {}).get("dateTime") or ""
@@ -67,8 +60,8 @@ def _build_item(event: dict) -> dict:
         "subject":     subject,
         "start":       start,
         "end":         end,
-        "start_time":  _format_time(start),
-        "end_time":    _format_time(end),
+        "start_time":  format_local_time(start, tz),
+        "end_time":    format_local_time(end, tz),
         "is_all_day":  is_all_day,
         "location":    location,
         "attendees":   attendees[:10],
@@ -94,31 +87,26 @@ def run(
     results_path = data_dir / "results" / f"{_RESULT_ID}.json"
     results_path.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
+    tz = get_user_tz(data_dir)
+    today_str = today_local_str(data_dir)
+    start_utc_iso, end_utc_iso = local_day_window_utc(data_dir, 0)
 
-    today = date.today()
-    start_utc = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
-    end_utc = start_utc + timedelta(days=1)
-
-    _p(f"Fetching calendar for {today.isoformat()}")
+    _p(f"Fetching calendar for {today_str} ({tz.key})")
 
     try:
-        events = graph.get_calendar_view(
-            start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            top=50,
-        )
+        events = graph.get_calendar_view(start_utc_iso, end_utc_iso, top=50)
     except Exception as e:
         _p(f"Calendar fetch failed: {e}")
         events = []
 
     events.sort(key=lambda e: (e.get("start") or {}).get("dateTime") or "")
-    items = [_build_item(e) for e in events]
+    items = [_build_item(e, tz) for e in events]
 
     _p(f"{len(items)} meeting(s) before user-preference review")
 
     user_instruction = _load_user_instruction(data_dir)
     display_name = (settings or {}).get("display_name") or "the executive"
-    date_str = datetime.now().strftime("%A, %B %d, %Y")
+    date_str = now_local(data_dir).strftime("%A, %B %d, %Y")
     items = validate_output(
         items, ai,
         section_id=_RESULT_ID,
@@ -131,7 +119,7 @@ def run(
         "id":       _RESULT_ID,
         "status":   "fresh",
         "last_run": now.isoformat(),
-        "date":     today.isoformat(),
+        "date":     today_str,
         "items":    items,
         "count":    len(items),
         "empty":    len(items) == 0,

@@ -14,7 +14,7 @@ import type { SectionDef } from '../../lib/sections';
 // Sections that have no instruction.md / are not customisable
 const NO_CUSTOMIZE = new Set([
   'upcoming_commitments', 'recent_meetings', 'meeting_action_items',
-  'expenses', 'meeting_prep',
+  'expenses',
 ]);
 
 interface Props {

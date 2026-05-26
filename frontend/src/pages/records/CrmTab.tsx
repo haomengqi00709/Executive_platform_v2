@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   Loader2, Search, ChevronDown, ChevronRight, Plus, EyeOff, Save, X, Star,
-  Phone, Linkedin, Mail, Building2, Briefcase,
+  Phone, Linkedin, Mail, Building2, Briefcase, Archive, GitMerge, RefreshCw, Upload,
 } from 'lucide-react';
-import { getCrm, patchCrmContact, createCrmContact, relativeTime } from '../../lib/api';
+import { getCrm, patchCrmContact, createCrmContact, relativeTime, archiveRecord, scanCrm } from '../../lib/api';
 import type { CrmContact } from '../../lib/api';
+import MergePicker from './MergePicker';
+import BulkUploadModal from './BulkUploadModal';
 
 const STATUS_OPTIONS = ['client', 'prospect', 'partner', 'vendor', 'other'];
 const PRIORITY_OPTIONS = ['high', 'medium', 'low', 'ignore'];
@@ -27,6 +29,9 @@ export default function CrmTab() {
   const [expandedEmail, setExpandedEmail] = useState<string | null>(null);
   const [savingEmail, setSavingEmail] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [mergeSource, setMergeSource] = useState<CrmContact | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [bulkOpen, setBulkOpen] = useState(false);
 
   const refresh = () => {
     setLoading(true);
@@ -47,6 +52,45 @@ export default function CrmTab() {
       setContacts(cs => cs.map(c => c.email === email ? { ...c, ...updated } : c));
     } finally {
       setSavingEmail(null);
+    }
+  };
+
+  const archive = async (email: string) => {
+    if (!confirm(`Archive ${email}? This hides them from all sections. (You can still un-archive by editing crm.json directly.)`)) return;
+    try {
+      await archiveRecord('contact', email);
+      setExpandedEmail(null);
+      refresh();
+    } catch (e: any) {
+      alert(`Archive failed: ${e?.message || 'unknown error'}`);
+    }
+  };
+
+  const rescan = async () => {
+    if (!confirm('Re-scan the last 6 months of inbox? This rebuilds the CRM from scratch and may take a few minutes.')) return;
+    setScanning(true);
+    try {
+      const before = lastScan;
+      await scanCrm();
+      // Poll until last_scan timestamp changes
+      const start = Date.now();
+      const tick = async () => {
+        if (Date.now() - start > 20 * 60 * 1000) { setScanning(false); return; }
+        try {
+          const d = await getCrm();
+          if (d.last_scan && d.last_scan !== before) {
+            setContacts(d.contacts || []);
+            setLastScan(d.last_scan);
+            setScanning(false);
+            return;
+          }
+        } catch {}
+        setTimeout(tick, 5000);
+      };
+      setTimeout(tick, 5000);
+    } catch (e: any) {
+      alert(`Scan failed: ${e?.message || 'unknown error'}`);
+      setScanning(false);
     }
   };
 
@@ -102,6 +146,15 @@ export default function CrmTab() {
             />
             Show ignored
           </label>
+          <button
+            onClick={rescan}
+            disabled={scanning}
+            className="flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg border border-executive-border text-executive-muted hover:text-executive-text hover:bg-executive-border/40 disabled:opacity-50"
+            title="Re-scan last 6 months of inbox"
+          >
+            {scanning ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+            {scanning ? 'Scanning…' : 'Re-scan'}
+          </button>
           <button
             onClick={() => setCreating(true)}
             className="flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg bg-executive-accent text-white hover:opacity-90"
@@ -160,6 +213,8 @@ export default function CrmTab() {
                   contact={c}
                   saving={savingEmail === c.email}
                   onSave={patch => update(c.email, patch)}
+                  onArchive={() => archive(c.email)}
+                  onMerge={() => setMergeSource(c)}
                 />
               )}
             </div>
@@ -171,6 +226,27 @@ export default function CrmTab() {
         <NewContactModal
           onClose={() => setCreating(false)}
           onCreated={() => { setCreating(false); refresh(); }}
+          onSwitchToBulk={() => { setCreating(false); setBulkOpen(true); }}
+        />
+      )}
+
+      {mergeSource && (
+        <MergePicker
+          kind="contact"
+          keepRecord={mergeSource}
+          candidates={contacts.filter(c =>
+            c.email !== mergeSource.email && !c.ignore && !(c as any).archived
+          )}
+          onClose={() => setMergeSource(null)}
+          onMerged={() => { setMergeSource(null); setExpandedEmail(null); refresh(); }}
+        />
+      )}
+
+      {bulkOpen && (
+        <BulkUploadModal
+          kind="crm"
+          onClose={() => setBulkOpen(false)}
+          onCommitted={() => refresh()}
         />
       )}
     </div>
@@ -180,11 +256,13 @@ export default function CrmTab() {
 // ───────────────────────────────────────────────────────────
 
 function ContactDetail({
-  contact, saving, onSave,
+  contact, saving, onSave, onArchive, onMerge,
 }: {
   contact: CrmContact;
   saving: boolean;
   onSave: (patch: Partial<CrmContact>) => Promise<void>;
+  onArchive: () => void;
+  onMerge: () => void;
 }) {
   const [draft, setDraft] = useState<CrmContact>(contact);
 
@@ -268,13 +346,31 @@ function ContactDetail({
       </div>
 
       <div className="flex items-center justify-between mt-4 pt-3 border-t border-executive-border/40">
-        <button
-          onClick={() => onSave({ ignore: !contact.ignore })}
-          className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md text-executive-muted hover:bg-executive-border/40 transition-colors"
-        >
-          <EyeOff size={12} />
-          {contact.ignore ? 'Un-ignore' : 'Ignore from all sections'}
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => onSave({ ignore: !contact.ignore })}
+            className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md text-executive-muted hover:bg-executive-border/40 transition-colors"
+          >
+            <EyeOff size={12} />
+            {contact.ignore ? 'Un-ignore' : 'Ignore'}
+          </button>
+          <button
+            onClick={onArchive}
+            className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md text-executive-muted hover:bg-executive-border/40 transition-colors"
+            title="Archive — hide from all sections (treat as completed/inactive)"
+          >
+            <Archive size={12} />
+            Archive
+          </button>
+          <button
+            onClick={onMerge}
+            className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md text-executive-muted hover:bg-executive-border/40 transition-colors"
+            title="Merge with… — combine this contact with another (this one is kept)"
+          >
+            <GitMerge size={12} />
+            Merge with…
+          </button>
+        </div>
         <button
           onClick={handleSave}
           disabled={!dirty || saving}
@@ -289,9 +385,9 @@ function ContactDetail({
 }
 
 function NewContactModal({
-  onClose, onCreated,
+  onClose, onCreated, onSwitchToBulk,
 }: {
-  onClose: () => void; onCreated: () => void;
+  onClose: () => void; onCreated: () => void; onSwitchToBulk: () => void;
 }) {
   const [form, setForm] = useState<Partial<CrmContact>>({
     email: '', name: '', company: '', role: '', status: 'other', priority: 'medium',
@@ -324,6 +420,14 @@ function NewContactModal({
             <X size={18} />
           </button>
         </div>
+
+        <button
+          onClick={onSwitchToBulk}
+          className="w-full mb-4 flex items-center justify-center gap-2 px-3 py-2 text-xs rounded-md border border-dashed border-executive-border text-executive-muted hover:text-executive-accent hover:border-executive-accent/60 transition-colors"
+        >
+          <Upload size={12} />
+          Have a list? Upload CSV / Excel / PDF / Word instead →
+        </button>
 
         <div className="grid grid-cols-2 gap-3">
           <Field label="Email *" value={form.email || ''} onChange={v => setForm(f => ({ ...f, email: v }))} />

@@ -265,12 +265,26 @@ class GraphClient:
             params = None
         return results[:max_results]
 
-    def create_draft(self, subject: str, body: str, to: str, mailbox: str = None) -> dict:
+    def get_message(self, message_id: str) -> dict:
+        """Fetch a single message with full body. Used by the draft composer
+        so AI has the actual email content (reply_needed.json only stores a
+        300-char preview)."""
+        return self.get(
+            f"/me/messages/{message_id}",
+            params={"$select": "subject,from,toRecipients,bodyPreview,body,receivedDateTime"},
+            timeout=15,
+        )
+
+    def create_draft(self, subject: str, body: str, to, mailbox: str = None) -> dict:
+        """to can be a single email string or a list of email strings."""
         base = f"/users/{mailbox}" if mailbox else "/me"
+        if isinstance(to, str):
+            to = [to]
+        recipients = [{"emailAddress": {"address": e}} for e in to if e]
         return self.post(f"{base}/messages", {
             "subject": subject,
             "body": {"contentType": "HTML", "content": body},
-            "toRecipients": [{"emailAddress": {"address": to}}],
+            "toRecipients": recipients,
         })
 
     def send_mail(self, to: str, subject: str, html: str):

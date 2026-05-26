@@ -110,7 +110,7 @@ def run(
     projects = data.get("projects", {})
     candidates = []
     for proj in projects.values():
-        if proj.get("ignore"):
+        if proj.get("ignore") or proj.get("archived"):
             continue
         if proj.get("status") not in _ATTENTION_STATUSES:
             continue

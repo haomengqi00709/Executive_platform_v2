@@ -90,7 +90,7 @@ def _load_user_instruction(data_dir: Path) -> str:
 def _build_candidates(crm_data: dict) -> list[dict]:
     out: list[dict] = []
     for email, contact in crm_data.get("contacts", {}).items():
-        if contact.get("ignore") or contact.get("priority") == "ignore":
+        if contact.get("ignore") or contact.get("archived") or contact.get("priority") == "ignore":
             continue
         if contact.get("priority") == "low":
             continue
@@ -229,7 +229,7 @@ def _classify_health(metrics: dict, has_active_project: bool) -> tuple[str, str]
 def _link_projects(email: str, projects_data: dict) -> list[dict]:
     out = []
     for proj in projects_data.get("projects", {}).values():
-        if proj.get("ignore"):
+        if proj.get("ignore") or proj.get("archived"):
             continue
         if proj.get("status") not in _ACTIVE_PROJECT_STATUSES:
             continue

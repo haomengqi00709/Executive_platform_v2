@@ -68,7 +68,7 @@ def _find_projects_for_email(
     text_lower = (subject + " " + preview).lower()
     matched: dict[str, dict] = {}
     for p in all_projects:
-        if p.get("ignore") or p.get("priority") == "ignore" or p.get("status") == "completed":
+        if p.get("ignore") or p.get("archived") or p.get("priority") == "ignore" or p.get("status") == "completed":
             continue
         pid = p.get("id", "")
         participants = [e.lower() for e in p.get("participants", [])]
@@ -188,7 +188,7 @@ def run(
     crm_contacts = crm_data.get("contacts", {})
     ignored_emails: set = {
         email for email, c in crm_contacts.items()
-        if c.get("ignore") or c.get("priority") == "ignore"
+        if c.get("ignore") or c.get("archived") or c.get("priority") == "ignore"
     }
 
     projects_db = load_projects(data_dir)

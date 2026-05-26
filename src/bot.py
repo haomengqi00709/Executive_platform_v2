@@ -249,8 +249,9 @@ def reply(
         f"  confirm_expense / discard_expense → only when a pending expense is shown above\n"
         f"  update_crm_contact         → 'mark X as high priority', 'add note to Sarah', 'set company for John'\n"
         f"  create_calendar_event      → 'schedule meeting with X', 'block my calendar Friday', 'create Teams call'\n"
-        f"  run_outreach               → 'draft outreach emails for the people I met at X', 'batch email contacts from OneDrive folder'\n"
-        f"                               Always confirm the OneDrive folder and a brief context note with the user first.\n\n"
+        f"  run_outreach               → 'draft outreach for the people I met at X', 'batch email contacts from OneDrive folder', 'draft outreach for everyone tagged Y'\n"
+        f"                               Three modes (pick one): folder= (OneDrive), tag= (CRM by tag), recent_hours= (CRM by recency)\n"
+        f"  tag_recent_contacts        → 'tag everyone I just added as X', 'group these contacts as Calgary Summit 2026'\n\n"
         f"AVAILABLE SECTIONS (use these exact section_id values for run_skill, "
         f"read_skill_instruction, update_skill_instruction):\n"
         + "".join(
@@ -792,19 +793,23 @@ def reply(
         except Exception as e:
             return f"Error creating event: {e}"
 
-    def run_outreach(context_note: str = "", folder: str = "") -> str:
-        """Batch-generate personalized email drafts from contacts in a OneDrive folder.
-        Use after a conference, networking event, or any time the user has a batch of new contacts to reach out to.
+    def run_outreach(context_note: str = "", folder: str = "",
+                     tag: str = "", recent_hours: int = 0) -> str:
+        """Batch-generate personalized email drafts. Three modes — use ONE:
 
-        context_note: short context to inject into each draft
-                      (e.g. 'met at TechConf 2026', 'introduced by John at the Acme dinner').
+        folder       — scan a OneDrive folder for cards/csv/xlsx/pdf and draft per contact found.
+                       e.g. folder='Conferences/TechConf'. Empty uses settings.outreach_folder.
+        tag          — pull contacts from CRM tagged with this label (case-insensitive substring).
+                       e.g. tag='Calgary Energy Summit 2026'.
+        recent_hours — pull contacts from CRM added in the last N hours.
+                       e.g. recent_hours=24 for "contacts I added today".
+
+        context_note: brief context injected into each draft (e.g. 'met at TechConf').
                       Always ask the user for this if not obvious from the conversation.
-        folder: OneDrive folder path (relative to drive root, e.g. 'Conferences/TechConf').
-                Leave empty to use the default from settings (outreach_folder).
 
-        Supported file types: business card photos (jpg/png), PDF rosters, CSV/Excel contact lists.
         Drafts are saved to Outlook Drafts — user manually reviews and sends each one.
-        Already-processed files are skipped on re-runs."""
+        Note: when users send business cards in Teams chat, drafts are AUTO-generated already;
+        this tool is for batch operations on existing CRM contacts or OneDrive uploads."""
         if owner_graph is None:
             return "Owner account not available."
         try:
@@ -818,19 +823,38 @@ def reply(
                 settings=settings,
                 context_note=context_note,
                 folder=folder,
+                tag=tag,
+                recent_hours=recent_hours,
             )
             if result.get("status") == "not_run":
                 return f"❌ {result.get('error', 'Unknown error')}"
             s = result.get("summary", {})
             msg = (f"✅ Outreach run complete:\n"
                    f"  • {s.get('drafts', 0)} drafts saved to Outlook\n"
-                   f"  • {s.get('files', 0)} files processed\n"
                    f"  • {s.get('skipped', 0)} contacts skipped (missing email or generation failed)")
+            if s.get("files"):
+                msg += f"\n  • {s['files']} files processed"
             if s.get("errors", 0):
                 msg += f"\n  • {s['errors']} errors"
             return msg
         except Exception as e:
             return f"Error running outreach: {e}"
+
+    def tag_recent_contacts(tag: str, hours: int = 24) -> str:
+        """Tag all contacts added to CRM in the last N hours with a group label.
+        Use when the user says 'tag everyone I just added as X' or similar.
+        Existing tags are preserved (this adds to the list, not replaces).
+        Returns the count of contacts tagged."""
+        if not data_dir:
+            return "No data directory available."
+        try:
+            from src.modules.crm import tag_contacts_added_since
+            n = tag_contacts_added_since(data_dir, tag, hours)
+            if n == 0:
+                return f"No contacts found added in the last {hours}h."
+            return f"✅ Tagged {n} contact{'s' if n != 1 else ''} with '{tag}'."
+        except Exception as e:
+            return f"Error tagging contacts: {e}"
 
     def dismiss_email_followup(from_name_or_subject: str) -> str:
         """Remove a specific email from the unreplied follow-up reminder list.
@@ -893,6 +917,7 @@ def reply(
         update_crm_contact,
         create_calendar_event,
         run_outreach,
+        tag_recent_contacts,
     ]
 
     # ── Gemini function calling loop ───────────────────────

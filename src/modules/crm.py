@@ -183,6 +183,125 @@ def update_contact(data_dir: Path, email: str, field: str, value) -> dict:
     return contact
 
 
+def add_contacts_bulk(data_dir: Path, raw_contacts: list, source: str,
+                      tags: list | None = None) -> dict:
+    """Add a batch of contacts to CRM.
+    Returns {"added": N, "updated": M, "skipped_no_email": K, "by_email": {email: "added"|"updated"|...}}.
+
+    - Skips entries without a valid email.
+    - For existing contacts: merges notes (appended with date stamp), unions tags,
+      preserves manually-set fields (priority/ignore/writing_style).
+    - For new contacts: writes name/email/company/role/phone/linkedin/notes/source/tags/added_at.
+    """
+    crm = load_crm(data_dir)
+    contacts = crm.setdefault("contacts", {})
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    today = datetime.now().strftime("%Y-%m-%d")
+    tags = tags or []
+
+    result = {"added": 0, "updated": 0, "skipped_no_email": 0, "by_email": {}}
+
+    for raw in raw_contacts:
+        email = (raw.get("email") or "").strip().lower()
+        if not email or "@" not in email:
+            result["skipped_no_email"] += 1
+            continue
+
+        existing = contacts.get(email)
+        if existing:
+            # Merge: union tags, append notes, fill in any missing fields
+            old_tags = list(existing.get("tags") or [])
+            new_tags = list(set(old_tags + tags))
+            existing["tags"] = new_tags
+            new_note = (raw.get("notes") or "").strip()
+            if new_note:
+                prior = existing.get("notes", "")
+                existing["notes"] = f"{prior}\n[{today}] {new_note}".strip() if prior else f"[{today}] {new_note}"
+            for f in ("name", "company", "role", "phone", "linkedin"):
+                if raw.get(f) and not existing.get(f):
+                    existing[f] = raw[f]
+            existing.setdefault("source", existing.get("source") or source)
+            existing["updated_at"] = today
+            result["updated"] += 1
+            result["by_email"][email] = "updated"
+        else:
+            note = (raw.get("notes") or "").strip()
+            contacts[email] = {
+                "email":       email,
+                "name":        (raw.get("name") or "").strip(),
+                "company":     (raw.get("company") or "").strip(),
+                "role":        (raw.get("role") or "").strip(),
+                "phone":       (raw.get("phone") or "").strip(),
+                "linkedin":    (raw.get("linkedin") or "").strip(),
+                "notes":       f"[{today}] {note}" if note else "",
+                "source":      source,
+                "tags":        list(tags),
+                "added_at":    now_iso,
+                "updated_at":  today,
+                "status":      "other",
+                "thread_count": 0,
+            }
+            result["added"] += 1
+            result["by_email"][email] = "added"
+
+    save_crm(data_dir, crm)
+    return result
+
+
+def tag_contacts_added_since(data_dir: Path, tag: str, hours: int) -> int:
+    """Add `tag` to every contact whose added_at is within the last `hours` hours.
+    Returns the number of contacts tagged."""
+    crm = load_crm(data_dir)
+    contacts = crm.get("contacts", {})
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    n = 0
+    for c in contacts.values():
+        added_at = c.get("added_at", "")
+        if not added_at:
+            continue
+        try:
+            dt = datetime.fromisoformat(added_at.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if dt < cutoff:
+            continue
+        tags = list(c.get("tags") or [])
+        if tag not in tags:
+            tags.append(tag)
+            c["tags"] = tags
+            n += 1
+    save_crm(data_dir, crm)
+    return n
+
+
+def find_contacts_by_tag(data_dir: Path, tag: str) -> list:
+    """Return list of contact dicts matching the given tag (case-insensitive substring match)."""
+    crm = load_crm(data_dir)
+    tag_lower = tag.lower()
+    return [
+        c for c in crm.get("contacts", {}).values()
+        if any(tag_lower in t.lower() for t in (c.get("tags") or []))
+    ]
+
+
+def find_contacts_added_since(data_dir: Path, hours: int) -> list:
+    """Return list of contact dicts added in the last `hours` hours."""
+    crm = load_crm(data_dir)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    out = []
+    for c in crm.get("contacts", {}).values():
+        added_at = c.get("added_at", "")
+        if not added_at:
+            continue
+        try:
+            dt = datetime.fromisoformat(added_at.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if dt >= cutoff:
+            out.append(c)
+    return out
+
+
 def build_crm(
     graph: GraphClient,
     ai: AIClient,

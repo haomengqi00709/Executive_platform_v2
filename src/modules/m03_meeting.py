@@ -82,7 +82,30 @@ def _parse_attendees_from_header(text: str) -> list[str]:
 
 def _parse_date_from_header(text: str) -> str:
     m = re.search(r"Date:\s*(\d{4}-\d{2}-\d{2})", text[:400])
-    return m.group(1) if m else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return m.group(1) if m else ""
+
+
+def _parse_date_from_filename(name: str) -> str:
+    """Teams recording filenames look like:
+       'Team catch up-20260509_103255-Meeting Recording.mp4'
+    Pull the YYYYMMDD timestamp out."""
+    m = re.search(r"(\d{4})(\d{2})(\d{2})_\d{6}", name or "")
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return ""
+
+
+def _meeting_date_for_recording(rec: dict, transcript_text: str) -> str:
+    """Resolve the actual meeting date for an OneDrive recording.
+    Tries (in order): transcript header → filename timestamp → file
+    lastModifiedDateTime → createdDateTime → today."""
+    return (
+        _parse_date_from_header(transcript_text)
+        or _parse_date_from_filename(rec.get("name", ""))
+        or (rec.get("lastModifiedDateTime") or "")[:10]
+        or (rec.get("createdDateTime") or "")[:10]
+        or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    )
 
 
 def _parse_title_from_header(text: str, filename: str) -> str:
@@ -256,36 +279,145 @@ def _attendees_from_calendar(rec: dict, graph: GraphClient) -> list[dict]:
 
 # ── Project detection ─────────────────────────────────────
 
-def _detect_project(attendee_emails: list[str], data_dir: Path) -> str | None:
+_ACTIVE_PROJECT_STATUSES = {"ongoing", "needs_attention", "paused", "early_stage"}
+
+
+def _detect_project(
+    attendee_emails: list[str],
+    data_dir: Path,
+    title: str = "",
+    summary: str = "",
+    ai: AIClient | None = None,
+) -> str | None:
     """
-    Match attendee emails against projects.json participants.
-    Returns project_id if found, None otherwise. No auto-registration.
+    Match this meeting to an existing project (or None if no match).
+    Two-pass detection:
+      1. Email exact match against projects.json participants → return immediately
+      2. AI judgment over filtered candidates (active projects whose participants
+         share a domain with any attendee). No auto-creation of new projects.
     """
     try:
         projects = load_projects(data_dir).get("projects", {})
     except Exception:
         return None
+
+    if not attendee_emails:
+        return None
+
+    attendee_lower = [e.lower() for e in attendee_emails if e]
+
+    # Pass 1 — fast email exact match
     for pid, proj in projects.items():
-        if proj.get("ignore"):
+        if proj.get("ignore") or proj.get("archived"):
             continue
         proj_participants = [p.lower() for p in proj.get("participants", [])]
-        for email in attendee_emails:
-            if email.lower() in proj_participants:
-                return pid
+        if any(e in proj_participants for e in attendee_lower):
+            return pid
+
+    # Pass 2 — AI judgment over ALL active projects
+    # No domain pre-filter: that was too strict (excluded projects whose
+    # participants list happens not to include the meeting attendees' domain,
+    # which is common — e.g. a TechCorp project that only lists internal staff
+    # as participants will still be the right match for a meeting with
+    # @techcorp.com attendees). Let AI look at the full set.
+    if ai is None:
+        return None
+
+    candidates: list[dict] = [
+        {"id": pid, "proj": proj}
+        for pid, proj in projects.items()
+        if not (proj.get("ignore") or proj.get("archived"))
+        and proj.get("status") in _ACTIVE_PROJECT_STATUSES
+    ]
+
+    if not candidates:
+        return None
+
+    # Cap to top-15 by recency to keep prompt bounded (was 10)
+    candidates.sort(key=lambda c: c["proj"].get("last_activity") or "", reverse=True)
+    candidates = candidates[:15]
+
+    # Build attendee CRM context
+    try:
+        crm = load_crm(data_dir).get("contacts", {})
+    except Exception:
+        crm = {}
+    attendee_lines: list[str] = []
+    for e in attendee_lower:
+        c = crm.get(e) or {}
+        bits = [c.get("name") or "", f"<{e}>"]
+        meta = []
+        if c.get("company"): meta.append(c["company"])
+        if c.get("role"):    meta.append(c["role"])
+        if c.get("status"):  meta.append(c["status"])
+        meta_str = f" — {' · '.join(meta)}" if meta else ""
+        attendee_lines.append(f"  - {' '.join(b for b in bits if b)}{meta_str}")
+
+    cand_lines: list[str] = []
+    for c in candidates:
+        p = c["proj"]
+        topics = ", ".join((p.get("key_topics") or [])[:5])
+        cand_lines.append(
+            f"  - id: {c['id']}\n"
+            f"    name: {p.get('name', '')}\n"
+            f"    status: {p.get('status', '')}\n"
+            f"    participants: {', '.join((p.get('participants') or [])[:6])}\n"
+            f"    topics: {topics}\n"
+            f"    summary: {(p.get('summary') or '')[:200]}"
+        )
+
+    prompt = (
+        "Match this meeting to ONE of the candidate projects below, or reply null if none fit.\n\n"
+        f"Meeting:\n  Title: {title or '(none)'}\n"
+        f"  Attendees:\n" + "\n".join(attendee_lines) + "\n"
+        f"  Summary: {(summary or '')[:600]}\n\n"
+        f"Candidate active projects (15 most recent):\n"
+        + "\n".join(cand_lines) + "\n\n"
+        "Return JSON: {\"project_id\": \"<id>\" or null, \"reason\": \"one short sentence\"}.\n"
+        "Pick at most one. Match by:\n"
+        " - Attendees: are any of them at a client company that matches the project?\n"
+        " - Meeting title or summary topic: does it clearly refer to one project?\n"
+        "If the meeting is a generic internal sync, ad-hoc catch-up, or doesn't relate "
+        "to any listed project, reply null. Do not force a match."
+    )
+
+    try:
+        raw = ai.extract_json(prompt)
+        result = json.loads(raw)
+        pid = result.get("project_id")
+        if pid and pid in {c["id"] for c in candidates}:
+            return pid
+    except Exception as e:
+        print(f"    [M03] AI project detection failed (non-critical): {e}")
+
     return None
 
 
 # ── CRM + Projects alignment ──────────────────────────────
 
-def _align_crm(attendee_emails: list[str], meeting_date: str, data_dir: Path) -> None:
-    """Update last_contact for attendees already in CRM."""
+def _align_crm(
+    attendee_emails: list[str],
+    meeting_date: str,
+    meeting_id: str,
+    data_dir: Path,
+) -> None:
+    """For each attendee already in CRM:
+      - bump last_contact if this meeting is more recent
+      - append meeting_id to their meeting_ids list (dedup)
+    Attendees not in CRM are skipped (we don't auto-create contacts here)."""
     try:
         crm = load_crm(data_dir)
         changed = False
         for email in attendee_emails:
             contact = crm.get("contacts", {}).get(email.lower())
-            if contact and meeting_date > contact.get("last_contact", ""):
+            if not contact:
+                continue
+            if meeting_date > contact.get("last_contact", ""):
                 contact["last_contact"] = meeting_date
+                changed = True
+            meeting_ids = contact.setdefault("meeting_ids", [])
+            if meeting_id and meeting_id not in meeting_ids:
+                meeting_ids.append(meeting_id)
                 changed = True
         if changed:
             save_crm(data_dir, crm)
@@ -661,7 +793,9 @@ def _process_transcript(
     today_str: str = "",
 ) -> dict:
     attendee_emails = _parse_attendees_from_header(transcript_text)
-    date_str = _parse_date_from_header(transcript_text)
+    date_str = _parse_date_from_header(transcript_text) or (
+        today_str or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    )
     analysis = _analyse(
         transcript_text, ai,
         skill_text=skill_text,
@@ -696,11 +830,19 @@ def run(
     force: bool = False,
     use_mock: bool = False,
     progress=None,
+    months: int = 0,
+    max_to_process: int | None = None,
 ) -> dict:
     """
     Process all unprocessed meeting recordings.
     Writes to Meeting DB (wiki/), aligns CRM + Projects.
     Returns section-compatible result dict.
+
+    Knobs:
+      months         — if > 0, skip OneDrive recordings older than this many months
+                       (used by first-login backfill = 6, manual scan = 0 = no limit)
+      max_to_process — if set, stop after processing this many NEW recordings
+                       (used by 20-min poller = 3 to spread load)
     """
     def _p(msg: str):
         print(msg)
@@ -749,7 +891,12 @@ def run(
             external = [{"name": "", "email": e} for e in attendee_emails if e.lower() != own_email.lower()]
             external = _filter_draft_recipients(external, user_instruction, own_email, ai)
 
-            project_id = _detect_project(attendee_emails, data_dir)
+            project_id = _detect_project(
+                attendee_emails, data_dir,
+                title=record.get("title", ""),
+                summary=record.get("summary", ""),
+                ai=ai,
+            )
             record["project_id"]       = project_id
             record["attendee_emails"]  = attendee_emails
 
@@ -757,23 +904,22 @@ def run(
             added = add_meeting(wiki_dir, record)
             _p(f"    → project: {project_id or 'unmatched'} | wiki: {'added' if added else 'duplicate'}")
 
-            _align_crm(attendee_emails, record["date"], data_dir)
+            _align_crm(attendee_emails, record["date"], meeting_id, data_dir)
             _align_projects(project_id, record["date"], meeting_id, data_dir)
 
             draft_body = _generate_followup_draft(record)
             record["followup_draft"] = draft_body
             saved, draft_link = 0, None
             if draft_body and external:
-                subj = f"Follow-up: {record.get('title', 'our meeting')}"
-                html = draft_body.replace("\n", "<br>")
-                for att in external:
-                    try:
-                        resp = graph.create_draft(subj, html, att["email"])
-                        saved += 1
-                        if not draft_link:
-                            draft_link = resp.get("webLink")
-                    except Exception as _e:
-                        _p(f"    → Draft failed for {att['email']}: {_e}")
+                subj  = f"Follow-up: {record.get('title', 'our meeting')}"
+                html  = draft_body.replace("\n", "<br>")
+                to_list = [a["email"] for a in external if a.get("email")]
+                try:
+                    resp = graph.create_draft(subj, html, to_list)
+                    saved = len(to_list)
+                    draft_link = resp.get("webLink")
+                except Exception as _e:
+                    _p(f"    → Draft failed for {to_list}: {_e}")
             record["followup_draft_saved"] = saved > 0
             record["followup_draft_link"]  = draft_link
             record["todos_pushed"] = _push_action_items_to_todo(record, graph, own_hints)
@@ -789,18 +935,36 @@ def run(
                 f for f in graph.list_drive_folder("Recordings")
                 if f.get("name", "").endswith(".mp4")
             ]
-            mp4_files = own_mp4
             _p(f"Found {len(own_mp4)} recording(s) in Recordings/")
+            if months > 0:
+                cutoff = (datetime.now(timezone.utc) - timedelta(days=months * 30)).isoformat()
+                before = len(own_mp4)
+                own_mp4 = [
+                    f for f in own_mp4
+                    if (f.get("lastModifiedDateTime") or f.get("createdDateTime") or "") >= cutoff
+                ]
+                skipped = before - len(own_mp4)
+                if skipped:
+                    _p(f"Skipped {skipped} recording(s) older than {months} months")
+            # Polling mode: process most-recent first (so newest mp4s are catch-up first)
+            own_mp4.sort(key=lambda f: f.get("lastModifiedDateTime") or "", reverse=True)
+            mp4_files = own_mp4
         except Exception as e:
             _p(f"[OneDrive] Could not fetch recordings: {e}")
             mp4_files = []
 
         app_token = _get_app_token(graph)
+        _new_processed_in_run = 0
 
         for rec in mp4_files:
             item_id    = rec["id"]
             name       = rec["name"]
             meeting_id = f"ondrive_{item_id[:16]}"
+
+            # Polling cap: only counts NEW recordings actually processed in this run
+            if max_to_process is not None and _new_processed_in_run >= max_to_process:
+                _p(f"Reached max_to_process cap ({max_to_process}); stopping")
+                break
 
             if is_processed(wiki_dir, meeting_id) and not force:
                 results.append({"meeting_id": meeting_id, "title": name, "status": "already_processed", "source": "ondrive"})
@@ -854,23 +1018,30 @@ def run(
                 skill_text=skill_text, user_instruction=user_instruction,
                 display_name=display_name, today_str=today_str,
             )
-            raw_emails     = record.pop("_attendee_emails", [])
-            attendees_info = [{"name": "", "email": e} for e in raw_emails]
-
-            if not attendees_info:
-                attendees_info = _attendees_from_call_records(rec, app_token)
-                if attendees_info:
-                    _p(f"  [CallRecords] {len(attendees_info)} attendee(s)")
-            if not attendees_info:
-                attendees_info = _attendees_from_calendar(rec, graph)
-                if attendees_info:
-                    _p(f"  [Calendar] {len(attendees_info)} attendee(s)")
+            # Resolve the real meeting date from the OneDrive file (filename
+            # contains YYYYMMDD; fall back to lastModifiedDateTime).
+            record["date"] = _meeting_date_for_recording(rec, transcript_text)
+            _p(f"    Meeting date: {record['date']}")
+            # Discard whatever the AI guessed from the audio transcript —
+            # Gemini just labels speakers as "Speaker 1/2/3" so the addresses
+            # are usually wrong. Calendar invite is the only reliable source.
+            record.pop("_attendee_emails", None)
+            attendees_info = _attendees_from_calendar(rec, graph)
+            if attendees_info:
+                _p(f"  [Calendar] {len(attendees_info)} attendee(s)")
+            else:
+                _p(f"  No calendar invite found — draft will be saved without recipients")
 
             external_attendees = [a for a in attendees_info if a["email"].lower() != own_email.lower()]
             external_attendees = _filter_draft_recipients(external_attendees, user_instruction, own_email, ai)
             attendee_emails    = [a["email"] for a in external_attendees]
 
-            project_id = _detect_project(attendee_emails, data_dir)
+            project_id = _detect_project(
+                attendee_emails, data_dir,
+                title=record.get("title", ""),
+                summary=record.get("summary", ""),
+                ai=ai,
+            )
             record["project_id"]      = project_id
             record["attendee_emails"] = attendee_emails
 
@@ -878,29 +1049,32 @@ def run(
             add_meeting(wiki_dir, record)
             _p(f"    → project: {project_id or 'unmatched'}")
 
-            _align_crm(attendee_emails, record["date"], data_dir)
+            _align_crm(attendee_emails, record["date"], meeting_id, data_dir)
             _align_projects(project_id, record["date"], meeting_id, data_dir)
 
             draft_body = _generate_followup_draft(record)
             record["followup_draft"] = draft_body
             saved, draft_link = 0, None
-            if draft_body and external_attendees:
-                subj = f"Follow-up: {record.get('title', 'our meeting')}"
-                html = draft_body.replace("\n", "<br>")
-                for att in external_attendees:
-                    try:
-                        resp = graph.create_draft(subj, html, att["email"])
-                        saved += 1
-                        if not draft_link:
-                            draft_link = resp.get("webLink")
-                    except Exception as _e:
-                        _p(f"    → Draft failed for {att['email']}: {_e}")
-            record["followup_draft_saved"] = saved > 0
+            if draft_body:
+                subj  = f"Follow-up: {record.get('title', 'our meeting')}"
+                html  = draft_body.replace("\n", "<br>")
+                to_list = [a["email"] for a in external_attendees if a.get("email")]
+                try:
+                    resp = graph.create_draft(subj, html, to_list)
+                    saved = len(to_list) or -1  # -1 = draft saved but no recipients
+                    draft_link = resp.get("webLink")
+                    if not to_list:
+                        _p(f"    → Draft saved with NO recipients (calendar empty) — user must fill in 'To:'")
+                except Exception as _e:
+                    _p(f"    → Draft failed: {_e}")
+            record["followup_draft_saved"] = bool(draft_link)
             record["followup_draft_link"]  = draft_link
+            record["followup_draft_recipients"] = max(0, saved)
             record["todos_pushed"] = _push_action_items_to_todo(record, graph, own_hints)
 
             _backup_to_onedrive(record, transcript_text, attendee_emails, graph, progress=_p)
             results.append({**record, "status": "processed"})
+            _new_processed_in_run += 1
 
     processed_count = sum(1 for r in results if r.get("status") == "processed")
     skipped_count   = sum(1 for r in results if r.get("status") == "already_processed")

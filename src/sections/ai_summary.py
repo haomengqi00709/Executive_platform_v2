@@ -1,80 +1,162 @@
 """
-ai_summary section — morning briefing.
+ai_summary section — morning briefing synthesis layer.
 
-Four-layer input:
-  1. src/skills/ai_summary.md          — system skill description (stable)
-  2. data_dir/instructions/ai_summary.md — user temp instructions (optional)
-  3. Live fetch: calendar + screened inbox
-  4. Other section results: commitments_extract, meeting_action_items, relationship_health
+Reads other sections' result.json files (refreshing them if stale) and
+generates a narrative briefing. Does NOT fetch raw calendar / inbox /
+screener data — that's the job of the dedicated sections.
+
+Each dependency is refreshed if its last_run is older than FRESH_WINDOW_SECS,
+otherwise reused. A matching freshness check in server._run_briefing_for_user
+ensures a refreshed dep is not run twice in the same briefing.
 """
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from src.graph import GraphClient
 from src.ai import AIClient
-from src.modules.screener import screen_emails
-from src.modules.crm import load_crm
-from src.modules.projects import load_projects
-from src.modules.profile import load_profile_context
+from src.modules.tz import now_local
 
 _SKILL_FILE = Path(__file__).parent.parent / "skills" / "ai_summary" / "skill.md"
 
-_WIN_TZ = {
-    "Eastern Standard Time":        "America/New_York",
-    "Eastern Daylight Time":        "America/New_York",
-    "Central Standard Time":        "America/Chicago",
-    "Mountain Standard Time":       "America/Denver",
-    "Pacific Standard Time":        "America/Los_Angeles",
-    "Pacific Daylight Time":        "America/Los_Angeles",
-    "Atlantic Standard Time":       "America/Halifax",
-    "Newfoundland Standard Time":   "America/St_Johns",
-    "Saskatchewan":                 "America/Regina",
-    "Canada Central Standard Time": "America/Regina",
-    "GMT Standard Time":            "Europe/London",
-    "China Standard Time":          "Asia/Shanghai",
-    "Tokyo Standard Time":          "Asia/Tokyo",
-    "AUS Eastern Standard Time":    "Australia/Sydney",
-}
+DEPENDENCIES = [
+    "meetings_today",
+    "reply_needed",
+    "followup_needed",
+    "due_today",
+    "upcoming_commitments",
+    "yesterday_recap",
+    "meeting_action_items",
+    "relationship_health",
+    "projects_needing_attention",
+]
+
+FRESH_WINDOW_SECS = 30 * 60
+_MAX_ITEMS_PER_DEP = 10
+_PRIORITY_RANK = {"high": 0, "medium": 1, "low": 2}
 
 
-def _resolve_tz(raw: str) -> ZoneInfo:
-    iana = _WIN_TZ.get(raw, raw if "/" in raw else "UTC")
+def _load_result(data_dir: Path, sid: str) -> dict:
+    f = data_dir / "results" / f"{sid}.json"
+    if not f.exists():
+        return {}
     try:
-        return ZoneInfo(iana)
+        return json.loads(f.read_text())
     except Exception:
-        return ZoneInfo("UTC")
+        return {}
 
 
-def _fmt_time(utc_str: str, tz: ZoneInfo) -> str:
-    try:
-        s = utc_str.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(tz).strftime("%H:%M")
-    except Exception:
-        return utc_str[11:16] if len(utc_str) > 15 else utc_str
-
-
-def _load_result(data_dir: Path, section_id: str) -> dict:
-    f = data_dir / "results" / f"{section_id}.json"
-    if f.exists():
-        try:
-            return json.loads(f.read_text())
-        except Exception:
-            pass
-    return {}
-
-
-def _save_result(data_dir: Path, result: dict) -> None:
+def _save_result(data_dir: Path, sid: str, result: dict) -> None:
     results_dir = data_dir / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
-    f = results_dir / "ai_summary.json"
+    f = results_dir / f"{sid}.json"
     tmp = f.with_suffix(".tmp")
     tmp.write_text(json.dumps(result, indent=2, ensure_ascii=False))
     tmp.replace(f)
+
+
+def _is_fresh(result: dict, window_secs: int) -> bool:
+    ts = result.get("last_run")
+    if not ts:
+        return False
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds() <= window_secs
+    except Exception:
+        return False
+
+
+def _sort_and_cap(sid: str, items: list) -> list:
+    """Per-dep ranking so top-10 are the most relevant when we truncate."""
+    if not items:
+        return []
+    if sid == "reply_needed":
+        items = sorted(items, key=lambda x: (_PRIORITY_RANK.get(x.get("priority", "medium"), 1), -_recency(x.get("received"))))
+    elif sid == "followup_needed":
+        items = sorted(items, key=lambda x: (_PRIORITY_RANK.get(x.get("urgency", "medium"), 1), -int(x.get("days_waiting", 0) or 0)))
+    elif sid in ("due_today", "upcoming_commitments"):
+        items = sorted(items, key=lambda x: (x.get("due_date") or "9999", _PRIORITY_RANK.get(x.get("priority", "medium"), 1)))
+    elif sid == "meeting_action_items":
+        items = [a for a in items if not a.get("completed")]
+        items = sorted(items, key=lambda x: (x.get("due_date") or "9999"))
+    elif sid == "relationship_health":
+        items = [h for h in items if h.get("status") in ("at_risk", "cooling", "overdue")]
+        items = sorted(items, key=lambda x: _PRIORITY_RANK.get(x.get("priority", "medium"), 1))
+    elif sid == "projects_needing_attention":
+        items = sorted(items, key=lambda x: (_PRIORITY_RANK.get(x.get("priority", "medium"), 1), x.get("last_activity") or ""))
+    elif sid == "meetings_today":
+        items = sorted(items, key=lambda x: x.get("start") or x.get("time") or "")
+    elif sid == "yesterday_recap":
+        items = sorted(items, key=lambda x: _PRIORITY_RANK.get(x.get("priority", "medium"), 1))
+    return items[:_MAX_ITEMS_PER_DEP]
+
+
+def _recency(iso: str | None) -> float:
+    if not iso:
+        return 0.0
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _format_atom(sid: str, idx: int, item: dict) -> str:
+    if sid == "meetings_today":
+        time = item.get("time") or item.get("start") or ""
+        return f"  [{idx}] {time} — {item.get('subject') or item.get('title') or '(no title)'}"
+    if sid == "reply_needed":
+        pri = item.get("priority", "medium")
+        sender = item.get("from_name") or item.get("from_email") or "Unknown"
+        subj = (item.get("subject") or "(no subject)")[:80]
+        reason = (item.get("reason") or item.get("preview") or "").strip()[:120]
+        return f"  [{idx}] {pri.upper()} — From: {sender} | Subject: \"{subj}\" | Reason: {reason}"
+    if sid == "followup_needed":
+        urg = item.get("urgency", "medium")
+        to = item.get("to_name") or item.get("to_email") or "Unknown"
+        subj = (item.get("subject") or "(no subject)")[:80]
+        days = item.get("days_waiting", 0)
+        return f"  [{idx}] {urg.upper()} — To: {to} | Subject: \"{subj}\" | {days}d waiting"
+    if sid in ("due_today", "upcoming_commitments"):
+        due = (item.get("due_date") or "")[:10]
+        desc = (item.get("description") or "")[:120]
+        person = item.get("contact_name") or item.get("contact_email") or ""
+        person_str = f" — {person}" if person else ""
+        return f"  [{idx}] [{due or 'no date'}] {desc}{person_str}"
+    if sid == "meeting_action_items":
+        due = (item.get("due_date") or "")[:10]
+        action = (item.get("action") or "")[:120]
+        meeting = item.get("meeting_title") or ""
+        meeting_str = f" (from: {meeting})" if meeting else ""
+        return f"  [{idx}] [{due or 'no date'}] {action}{meeting_str}"
+    if sid == "relationship_health":
+        name = item.get("contact_name") or item.get("contact_email") or "Unknown"
+        status = item.get("status", "")
+        suggested = (item.get("suggested_action") or "")[:80]
+        return f"  [{idx}] {name} — {status}" + (f" | {suggested}" if suggested else "")
+    if sid == "projects_needing_attention":
+        name = item.get("name") or ""
+        status = item.get("status", "")
+        summary = (item.get("summary") or "")[:100]
+        return f"  [{idx}] {name} — {status} — {summary}"
+    if sid == "yesterday_recap":
+        kind = item.get("type", "")
+        subj = (item.get("subject") or "")[:80]
+        who = item.get("from") or ""
+        return f"  [{idx}] {kind}: \"{subj}\"" + (f" — {who}" if who else "")
+    return f"  [{idx}] {json.dumps(item, ensure_ascii=False)[:200]}"
+
+
+def _format_dep_block(sid: str, dep: dict) -> str:
+    if dep.get("error"):
+        return f"{sid.upper()}: skipped (refresh error: {dep['error'][:80]})"
+    items = _sort_and_cap(sid, dep.get("items") or [])
+    if not items:
+        return f"{sid.upper()}: empty"
+    header = f"{sid.upper()} (count={len(items)}):"
+    body = "\n".join(_format_atom(sid, i + 1, it) for i, it in enumerate(items))
+    return f"{header}\n{body}"
 
 
 def run(
@@ -83,11 +165,13 @@ def run(
     data_dir: Path,
     settings: dict = None,
     progress=None,
+    runner_lookup=None,
 ) -> dict:
-    """
-    Generate morning briefing for the executive.
+    """Synthesise morning briefing from other sections' results.
 
-    Returns standard section result dict with briefing text + structured data.
+    runner_lookup(sid) -> callable(graph, ai, data_dir, settings, progress) -> dict
+    Injected from server._SECTION_RUNNERS to avoid circular import; used to
+    refresh a stale dep on demand.
     """
     def log(msg: str):
         if progress:
@@ -96,170 +180,53 @@ def run(
     data_dir = Path(data_dir)
     settings = settings or {}
 
-    # ── 1. Skill description ──────────────────────────────
     skill_text = _SKILL_FILE.read_text() if _SKILL_FILE.exists() else ""
-
-    # ── 2. User instruction ───────────────────────────────
-    instruction_path = data_dir / "instructions" / "ai_summary.md"
-    user_instruction = instruction_path.read_text().strip() if instruction_path.exists() else ""
-
-    # ── 3. Timezone + today's window ─────────────────────
-    tz_raw = settings.get("timezone") or ""
-    if not tz_raw:
-        try:
-            tz_raw = graph.get_mailbox_timezone()
-        except Exception:
-            tz_raw = "UTC"
-
-    tz = _resolve_tz(tz_raw)
-    now_local = datetime.now(tz)
-    today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    tomorrow_start = today_start + timedelta(days=1)
-
-    today_utc = today_start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    tomorrow_utc = tomorrow_start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    date_str = now_local.strftime("%A, %B %d, %Y")
+    instr_path = data_dir / "instructions" / "ai_summary.md"
+    user_instruction = instr_path.read_text().strip() if instr_path.exists() else ""
 
     display_name = settings.get("display_name", "the executive")
-    business_context = load_profile_context(data_dir)
+    date_str = now_local(data_dir).strftime("%A, %B %d, %Y")
 
-    # ── 4. Calendar ───────────────────────────────────────
-    log("Fetching today's calendar...")
-    try:
-        events = graph.get_calendar_view(today_utc, tomorrow_utc, top=20)
-    except Exception as e:
-        log(f"Calendar fetch failed: {e}")
-        events = []
+    deps: dict[str, dict] = {}
+    source_runs: dict[str, str] = {}
 
-    # ── 5. Screened inbox (last 2 days) ───────────────────
-    log("Fetching recent emails...")
-    try:
-        raw_messages = graph.get_messages_since(days=2, max_results=200)
-    except Exception as e:
-        log(f"Inbox fetch failed: {e}")
-        raw_messages = []
+    for sid in DEPENDENCIES:
+        existing = _load_result(data_dir, sid)
+        if existing and _is_fresh(existing, FRESH_WINDOW_SECS):
+            deps[sid] = existing
+            source_runs[sid] = existing.get("last_run", "")
+            continue
 
-    ignored_emails: set = set()
-    try:
-        crm_data = load_crm(data_dir)
-        ignored_emails = {
-            email for email, c in crm_data.get("contacts", {}).items()
-            if c.get("ignore") or c.get("priority") == "ignore"
-        }
-    except Exception:
-        pass
+        runner = runner_lookup(sid) if runner_lookup else None
+        if not runner:
+            deps[sid] = existing or {"items": []}
+            source_runs[sid] = (existing or {}).get("last_run", "")
+            continue
 
-    if raw_messages:
-        log(f"Screening {len(raw_messages)} emails...")
-        screened = screen_emails(
-            messages=raw_messages,
-            ai=ai,
-            ignored_emails=ignored_emails,
-            business_context=business_context,
-            display_name=display_name,
-            progress=progress,
-        )
-        visible = [m for m in screened if not m.get("screened_out")]
-    else:
-        visible = []
+        log(f"ai_summary: refreshing {sid}...")
+        try:
+            result = runner(graph, ai, data_dir, settings, progress)
+            _save_result(data_dir, sid, result)
+            deps[sid] = result
+            source_runs[sid] = result.get("last_run", "")
+        except Exception as e:
+            log(f"ai_summary: {sid} refresh failed: {e}")
+            deps[sid] = {"items": [], "error": str(e)}
 
-    top_emails = visible[:15]
-
-    # ── 6. Other section results (optional context) ───────
-    commitments_data = _load_result(data_dir, "commitments_extract")
-    action_items_data = _load_result(data_dir, "meeting_action_items")
-    health_data = _load_result(data_dir, "relationship_health")
-
-    today_str = now_local.strftime("%Y-%m-%d")
-    next_week_str = (now_local + timedelta(days=7)).strftime("%Y-%m-%d")
-
-    # Filter commitments to today + next 7 days
-    all_commitments = commitments_data.get("items", [])
-    due_soon = [
-        c for c in all_commitments
-        if today_str <= (c.get("due_date") or "9999")[:10] <= next_week_str
-    ]
-
-    # Open meeting action items
-    all_actions = action_items_data.get("items", [])
-    open_actions = [a for a in all_actions if not a.get("completed")][:10]
-
-    # At-risk relationships
-    all_health = health_data.get("items", [])
-    at_risk = [h for h in all_health if h.get("status") in ("at_risk", "overdue")][:5]
-
-    # Stalled / at-risk projects from projects.json
-    projects_db = load_projects(data_dir)
-    all_projects = list(projects_db.get("projects", {}).values())
-    cutoff_str = (now_local - timedelta(days=30)).strftime("%Y-%m-%d")
-    attention_projects = [
-        p for p in all_projects
-        if p.get("status") in ("stalled", "at_risk")
-        and not p.get("ignore") and p.get("priority") != "ignore"
-        and (p.get("last_activity") or "9999") >= cutoff_str
-    ][:5]
-
-    # ── 7. Build prompt ───────────────────────────────────
     skill_block = skill_text.replace("{display_name}", display_name).replace("{date}", date_str)
-
-    if events:
-        event_lines = "\n".join(
-            f"- {'All day' if e.get('isAllDay') else _fmt_time(e.get('start', {}).get('dateTime', ''), tz)} — {e.get('subject', '(no subject)')}"
-            for e in events
-        )
-    else:
-        event_lines = ""
-
-    if top_emails:
-        email_lines = "\n".join(
-            f"- From: {((m.get('from') or {}).get('emailAddress') or {}).get('name') or ((m.get('from') or {}).get('emailAddress') or {}).get('address', '')} | "
-            f"Subject: {(m.get('subject') or '(no subject)')[:80]} | "
-            f"Preview: {(m.get('bodyPreview') or '')[:120]}"
-            for m in top_emails
-        )
-    else:
-        email_lines = ""
-
-    commitment_lines = "\n".join(
-        f"- [{c.get('due_date', '')[:10]}] {c.get('subject', '')} — {c.get('person', '')}"
-        for c in due_soon
-    ) if due_soon else ""
-
-    action_lines = "\n".join(
-        f"- {a.get('action', '')} (from: {a.get('meeting_title', '')})"
-        for a in open_actions
-    ) if open_actions else ""
-
-    health_lines = "\n".join(
-        f"- {h.get('name', '')} <{h.get('email', '')}> — last contact: {h.get('last_contact', 'unknown')}"
-        for h in at_risk
-    ) if at_risk else ""
-
-    project_lines = "\n".join(
-        f"- {p.get('name', '')} ({p.get('category', '')}) — {p.get('status', '')} — \"{p.get('summary', '')}\""
-        for p in attention_projects
-    ) if attention_projects else ""
-
-    prompt_parts = [skill_block, f"\nTODAY'S DATE: {date_str} ({tz_raw or 'UTC'})"]
-
-    if event_lines:
-        prompt_parts.append(f"\nTODAY'S MEETINGS:\n{event_lines}")
-    if email_lines:
-        prompt_parts.append(f"\nRECENT EMAILS (screened, last 2 days — top {len(top_emails)}):\n{email_lines}")
-    if commitment_lines:
-        prompt_parts.append(f"\nCOMMITMENTS DUE THIS WEEK:\n{commitment_lines}")
-    if action_lines:
-        prompt_parts.append(f"\nOPEN MEETING ACTION ITEMS:\n{action_lines}")
-    if health_lines:
-        prompt_parts.append(f"\nAT-RISK RELATIONSHIPS:\n{health_lines}")
-    if project_lines:
-        prompt_parts.append(f"\nPROJECTS NEEDING ATTENTION:\n{project_lines}")
+    dep_blocks = "\n\n".join(_format_dep_block(sid, deps[sid]) for sid in DEPENDENCIES)
+    prompt_parts = [
+        skill_block,
+        f"\nTODAY'S DATE: {date_str}",
+        "",
+        "=== PRE-COMPUTED LISTS ===",
+        "",
+        dep_blocks,
+    ]
     if user_instruction:
-        prompt_parts.append(f"\nUSER INSTRUCTIONS (override anything above if contradicted):\n{user_instruction}")
-
+        prompt_parts += ["", "USER INSTRUCTIONS (override anything above if contradicted):", user_instruction]
     prompt = "\n".join(prompt_parts)
 
-    # ── 8. Generate briefing ──────────────────────────────
     log("Generating morning briefing...")
     try:
         briefing = ai.generate(prompt)
@@ -267,29 +234,17 @@ def run(
         log(f"Briefing generation failed: {e}")
         briefing = ""
 
-    # ── 9. Write result ───────────────────────────────────
     result = {
         "id":          "ai_summary",
         "status":      "fresh",
         "last_run":    datetime.now(timezone.utc).isoformat(),
-        "briefing":    briefing,
-        "events":      events,
-        "top_emails":  [
-            {
-                "subject": m.get("subject", ""),
-                "from":    ((m.get("from") or {}).get("emailAddress") or {}).get("address", ""),
-                "from_name": ((m.get("from") or {}).get("emailAddress") or {}).get("name", ""),
-                "preview": m.get("bodyPreview", ""),
-                "received": m.get("receivedDateTime", ""),
-            }
-            for m in top_emails
-        ],
-        "action_items": open_actions,
+        "briefing":    briefing or "",
+        "source_runs": source_runs,
         "items":       [],
         "count":       0,
         "empty":       not briefing,
     }
-
-    _save_result(data_dir, result)
-    log(f"Morning briefing done ({len(events)} meetings, {len(top_emails)} emails)")
+    _save_result(data_dir, "ai_summary", result)
+    deps_with_data = sum(1 for d in deps.values() if d.get("items"))
+    log(f"Morning briefing done ({deps_with_data}/{len(DEPENDENCIES)} deps with data)")
     return result

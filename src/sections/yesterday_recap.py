@@ -11,12 +11,16 @@ Lightweight snapshot of yesterday's activity:
 No AI. Just aggregation + counts + a few top items per category.
 """
 import json
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from src.ai import AIClient
 from src.graph import GraphClient
 from src.modules.validator import validate_output
+from src.modules.tz import (
+    get_user_tz, now_local, local_day_window_utc, format_local_time,
+)
 
 _RESULT_ID = "yesterday_recap"
 
@@ -49,16 +53,6 @@ def _read_json(path: Path) -> dict:
         return {}
 
 
-def _format_time(iso_str: str) -> str:
-    if not iso_str:
-        return ""
-    try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        return dt.strftime("%H:%M")
-    except Exception:
-        return iso_str[11:16] if len(iso_str) >= 16 else iso_str
-
-
 def run(
     graph: GraphClient,
     ai: AIClient,
@@ -76,11 +70,15 @@ def run(
     results_path = data_dir / "results" / f"{_RESULT_ID}.json"
     results_path.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
-    yesterday = date.today() - timedelta(days=1)
-    y_str = yesterday.isoformat()
+    tz = get_user_tz(data_dir)
+    # Local-yesterday window expressed in UTC ISO strings — used both for
+    # the Graph calendar query and for filtering already-fetched inbox/sent
+    # metadata by their UTC receivedDateTime.
+    start_utc_iso, end_utc_iso = local_day_window_utc(data_dir, -1)
+    y_str = (now_local(data_dir).date() - timedelta(days=1)).isoformat()
 
-    start_utc = datetime(yesterday.year, yesterday.month, yesterday.day, tzinfo=timezone.utc)
-    end_utc = start_utc + timedelta(days=1)
+    def _in_yesterday_window(iso: str) -> bool:
+        return bool(iso) and start_utc_iso <= iso < end_utc_iso
 
     # ── Inbound emails ──────────────────────────────────────
     _p("Fetching yesterday's inbox metadata...")
@@ -89,10 +87,7 @@ def run(
     except Exception as e:
         _p(f"Inbox fetch failed: {e}")
         inbox = []
-    inbound_yesterday = [
-        m for m in inbox
-        if (m.get("receivedDateTime") or "")[:10] == y_str
-    ]
+    inbound_yesterday = [m for m in inbox if _in_yesterday_window(m.get("receivedDateTime") or "")]
 
     # ── Outbound emails ─────────────────────────────────────
     _p("Fetching yesterday's sent items...")
@@ -101,19 +96,12 @@ def run(
     except Exception as e:
         _p(f"Sent fetch failed: {e}")
         sent = []
-    outbound_yesterday = [
-        m for m in sent
-        if (m.get("sentDateTime") or "")[:10] == y_str
-    ]
+    outbound_yesterday = [m for m in sent if _in_yesterday_window(m.get("sentDateTime") or "")]
 
     # ── Meetings ────────────────────────────────────────────
     _p("Fetching yesterday's calendar...")
     try:
-        events = graph.get_calendar_view(
-            start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            top=50,
-        )
+        events = graph.get_calendar_view(start_utc_iso, end_utc_iso, top=50)
     except Exception as e:
         _p(f"Calendar fetch failed: {e}")
         events = []
@@ -121,10 +109,7 @@ def run(
     # ── Commitments extracted from yesterday's emails ───────
     com_path = data_dir / "results" / "commitments_extract.json"
     com_items = _read_json(com_path).get("items", [])
-    commitments_yesterday = [
-        c for c in com_items
-        if (c.get("received") or "")[:10] == y_str
-    ]
+    commitments_yesterday = [c for c in com_items if _in_yesterday_window(c.get("received") or "")]
 
     # ── Build items list ────────────────────────────────────
     items: list[dict] = []
@@ -137,7 +122,7 @@ def run(
             "type":    "inbound_email",
             "subject": (m.get("subject") or "(no subject)")[:120],
             "from":    ea.get("name") or ea.get("address") or "—",
-            "time":    _format_time(m.get("receivedDateTime") or ""),
+            "time":    format_local_time(m.get("receivedDateTime") or "", tz),
         })
 
     for m in sorted(outbound_yesterday,
@@ -149,7 +134,7 @@ def run(
             "type":    "outbound_email",
             "subject": (m.get("subject") or "(no subject)")[:120],
             "to":      to_addr.get("name") or to_addr.get("address") or "—",
-            "time":    _format_time(m.get("sentDateTime") or ""),
+            "time":    format_local_time(m.get("sentDateTime") or "", tz),
         })
 
     for ev in sorted(events,
@@ -157,8 +142,8 @@ def run(
         items.append({
             "type":      "meeting",
             "subject":   ev.get("subject") or "(no subject)",
-            "start":     _format_time((ev.get("start") or {}).get("dateTime") or ""),
-            "end":       _format_time((ev.get("end") or {}).get("dateTime") or ""),
+            "start":     format_local_time((ev.get("start") or {}).get("dateTime") or "", tz),
+            "end":       format_local_time((ev.get("end") or {}).get("dateTime") or "", tz),
             "attendees": [
                 ((a.get("emailAddress") or {}).get("name") or
                  (a.get("emailAddress") or {}).get("address") or "")
@@ -186,7 +171,7 @@ def run(
 
     user_instruction = _load_user_instruction(data_dir)
     display_name = (settings or {}).get("display_name") or "the executive"
-    date_str = datetime.now().strftime("%A, %B %d, %Y")
+    date_str = now_local(data_dir).strftime("%A, %B %d, %Y")
     items = validate_output(
         items, ai,
         section_id=_RESULT_ID,

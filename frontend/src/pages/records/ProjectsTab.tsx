@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   Loader2, Search, EyeOff, ChevronDown, ChevronRight, Save,
-  Users, MessageSquare, CalendarClock, Tag, Activity,
+  Users, MessageSquare, CalendarClock, Tag, Activity, Archive, GitMerge, RefreshCw, Upload,
 } from 'lucide-react';
-import { getProjects, patchProject, relativeTime } from '../../lib/api';
+import { getProjects, patchProject, relativeTime, archiveRecord, scanProjects } from '../../lib/api';
 import type { ProjectRecord } from '../../lib/api';
+import MergePicker from './MergePicker';
+import BulkUploadModal from './BulkUploadModal';
 
 const STATUS_OPTIONS = ['ongoing', 'needs_attention', 'paused', 'early_stage', 'completed'];
 const MOMENTUM_OPTIONS = ['accelerating', 'steady', 'slowing', 'stalled'];
@@ -34,8 +36,11 @@ export default function ProjectsTab() {
   const [showIgnored, setShowIgnored] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [savingId, setSavingId] = useState<string | null>(null);
+  const [mergeSource, setMergeSource] = useState<ProjectRecord | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [bulkOpen, setBulkOpen] = useState(false);
 
-  useEffect(() => {
+  const refresh = () => {
     setLoading(true);
     getProjects()
       .then(d => {
@@ -43,7 +48,9 @@ export default function ProjectsTab() {
         setLastScan(d.last_scan);
       })
       .finally(() => setLoading(false));
-  }, []);
+  };
+
+  useEffect(refresh, []);
 
   const update = async (id: string, patch: Partial<ProjectRecord>) => {
     setSavingId(id);
@@ -52,6 +59,44 @@ export default function ProjectsTab() {
       setProjects(ps => ps.map(p => p.id === id ? { ...p, ...updated } : p));
     } finally {
       setSavingId(null);
+    }
+  };
+
+  const archive = async (id: string, name: string) => {
+    if (!confirm(`Archive "${name}"? This hides it from all sections.`)) return;
+    try {
+      await archiveRecord('project', id);
+      setExpandedId(null);
+      refresh();
+    } catch (e: any) {
+      alert(`Archive failed: ${e?.message || 'unknown error'}`);
+    }
+  };
+
+  const rescan = async () => {
+    if (!confirm('Re-scan inbox history and rebuild the Projects DB? This may take a few minutes.')) return;
+    setScanning(true);
+    try {
+      const before = lastScan;
+      await scanProjects();
+      const start = Date.now();
+      const tick = async () => {
+        if (Date.now() - start > 20 * 60 * 1000) { setScanning(false); return; }
+        try {
+          const d = await getProjects();
+          if (d.last_scan && d.last_scan !== before) {
+            setProjects(d.projects || []);
+            setLastScan(d.last_scan);
+            setScanning(false);
+            return;
+          }
+        } catch {}
+        setTimeout(tick, 5000);
+      };
+      setTimeout(tick, 5000);
+    } catch (e: any) {
+      alert(`Scan failed: ${e?.message || 'unknown error'}`);
+      setScanning(false);
     }
   };
 
@@ -107,6 +152,22 @@ export default function ProjectsTab() {
             />
             Show ignored
           </label>
+          <button
+            onClick={rescan}
+            disabled={scanning}
+            className="flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg border border-executive-border text-executive-muted hover:text-executive-text hover:bg-executive-border/40 disabled:opacity-50"
+            title="Re-scan inbox history and rebuild projects DB"
+          >
+            {scanning ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+            {scanning ? 'Scanning…' : 'Re-scan'}
+          </button>
+          <button
+            onClick={() => setBulkOpen(true)}
+            className="flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg border border-executive-border text-executive-muted hover:text-executive-text hover:bg-executive-border/40"
+            title="Upload CSV / Excel / PDF / Word to import projects in bulk"
+          >
+            <Upload size={12} /> Bulk Upload
+          </button>
         </div>
       </header>
 
@@ -157,11 +218,33 @@ export default function ProjectsTab() {
                   project={p}
                   saving={savingId === p.id}
                   onSave={patch => update(p.id, patch)}
+                  onArchive={() => archive(p.id, p.name || p.id)}
+                  onMerge={() => setMergeSource(p)}
                 />
               )}
             </div>
           ))}
         </div>
+      )}
+
+      {mergeSource && (
+        <MergePicker
+          kind="project"
+          keepRecord={mergeSource}
+          candidates={projects.filter(p =>
+            p.id !== mergeSource.id && !p.ignore && !(p as any).archived
+          )}
+          onClose={() => setMergeSource(null)}
+          onMerged={() => { setMergeSource(null); setExpandedId(null); refresh(); }}
+        />
+      )}
+
+      {bulkOpen && (
+        <BulkUploadModal
+          kind="project"
+          onClose={() => setBulkOpen(false)}
+          onCommitted={() => refresh()}
+        />
       )}
     </div>
   );
@@ -170,11 +253,13 @@ export default function ProjectsTab() {
 // ───────────────────────────────────────────────────────────
 
 function ProjectDetail({
-  project, saving, onSave,
+  project, saving, onSave, onArchive, onMerge,
 }: {
   project: ProjectRecord;
   saving: boolean;
   onSave: (patch: Partial<ProjectRecord>) => Promise<void>;
+  onArchive: () => void;
+  onMerge: () => void;
 }) {
   const [draft, setDraft] = useState<ProjectRecord>(project);
 
@@ -339,13 +424,31 @@ function ProjectDetail({
 
       {/* Footer actions */}
       <div className="flex items-center justify-between pt-3 border-t border-executive-border/40">
-        <button
-          onClick={() => onSave({ ignore: !project.ignore })}
-          className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md text-executive-muted hover:bg-executive-border/40 transition-colors"
-        >
-          <EyeOff size={12} />
-          {project.ignore ? 'Un-ignore' : 'Hide from all sections'}
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => onSave({ ignore: !project.ignore })}
+            className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md text-executive-muted hover:bg-executive-border/40 transition-colors"
+          >
+            <EyeOff size={12} />
+            {project.ignore ? 'Un-ignore' : 'Hide'}
+          </button>
+          <button
+            onClick={onArchive}
+            className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md text-executive-muted hover:bg-executive-border/40 transition-colors"
+            title="Archive — mark as completed/inactive, hide from all sections"
+          >
+            <Archive size={12} />
+            Archive
+          </button>
+          <button
+            onClick={onMerge}
+            className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md text-executive-muted hover:bg-executive-border/40 transition-colors"
+            title="Merge with… — combine this project with another (this one is kept)"
+          >
+            <GitMerge size={12} />
+            Merge with…
+          </button>
+        </div>
         <button
           onClick={handleSave}
           disabled={!dirty || saving}

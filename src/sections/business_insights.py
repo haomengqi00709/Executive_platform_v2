@@ -132,7 +132,7 @@ def _crm_stats(crm: dict) -> dict:
     contacts = crm.get("contacts", {})
     out = {"client": 0, "prospect": 0, "partner": 0, "vendor": 0, "other": 0}
     for c in contacts.values():
-        if c.get("ignore"):
+        if c.get("ignore") or c.get("archived"):
             continue
         s = c.get("status", "other")
         out[s] = out.get(s, 0) + 1
@@ -142,7 +142,7 @@ def _crm_stats(crm: dict) -> dict:
 def _projects_stats(projects_data: dict) -> dict:
     out = {"ongoing": 0, "needs_attention": 0, "paused": 0, "early_stage": 0, "completed": 0}
     for p in projects_data.get("projects", {}).values():
-        if p.get("ignore"):
+        if p.get("ignore") or p.get("archived"):
             continue
         s = p.get("status", "")
         if s in out:
@@ -155,7 +155,7 @@ def _new_crm_this_week(crm: dict, today: date) -> int:
     cutoff = (today - timedelta(days=7)).isoformat()
     n = 0
     for c in crm.get("contacts", {}).values():
-        if c.get("ignore"):
+        if c.get("ignore") or c.get("archived"):
             continue
         if c.get("status") not in ("client", "prospect", "partner"):
             continue

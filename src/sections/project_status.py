@@ -105,7 +105,7 @@ def run(
     projects = data.get("projects", {})
     candidates = [
         p for p in projects.values()
-        if not p.get("ignore") and p.get("status") in _INCLUDED_STATUSES
+        if not p.get("ignore") and not p.get("archived") and p.get("status") in _INCLUDED_STATUSES
     ]
     candidates.sort(key=lambda p: (
         _STATUS_RANK.get(p.get("status", ""), 9),

@@ -69,7 +69,7 @@ def _collect_crm_titles(data_dir: Path) -> list[tuple[str, int]]:
 
     titles = Counter()
     for c in crm.get("contacts", {}).values():
-        if c.get("ignore") or c.get("priority") == "ignore":
+        if c.get("ignore") or c.get("archived") or c.get("priority") == "ignore":
             continue
         if c.get("status") not in ("client", "prospect", "partner"):
             continue
@@ -90,7 +90,7 @@ def _collect_project_topics(data_dir: Path) -> list[tuple[str, int]]:
 
     topics = Counter()
     for p in projs.get("projects", {}).values():
-        if p.get("ignore"):
+        if p.get("ignore") or p.get("archived"):
             continue
         for t in p.get("key_topics", []) or []:
             t = (t or "").strip()

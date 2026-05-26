@@ -3,20 +3,22 @@ import {
   Settings, Save, CheckCircle2, AlertCircle, LogIn, LogOut,
   Bot, Webhook, User, Loader2, Copy, ExternalLink, Moon, Sun,
   LayoutDashboard, Sparkles, Wrench, UserCircle2, Database,
-  BarChart3, Building2, RefreshCw,
+  BarChart3, Building2, RefreshCw, AlertTriangle, RotateCcw,
 } from 'lucide-react';
 
 import DashboardPage from './pages/DashboardPage';
 import SkillsPage from './pages/SkillsPage';
+import SectionDetailPage from './pages/SectionDetailPage';
 import RecordsPage from './pages/RecordsPage';
 import ToolsPage from './pages/ToolsPage';
 import ProfilePage from './pages/ProfilePage';
+import OnboardingWizard from './components/OnboardingWizard';
 
 // ── Types (preserved auth + onboarding + settings) ─────────────────────────
 
-type Page = 'dashboard' | 'skills' | 'records' | 'tools' | 'profile' | 'settings';
+type Page = 'dashboard' | 'skills' | 'section' | 'records' | 'tools' | 'profile' | 'settings';
 
-type ProfileStage = 'pending' | 'generating' | 'draft_ready' | 'user_confirmed';
+type ProfileStage = 'pending' | 'awaiting_confirmation' | 'generating' | 'draft_ready' | 'user_confirmed';
 
 type StepStatus = 'pending' | 'in_progress' | 'done' | 'failed';
 interface InitStep { key: string; label: string; status: StepStatus; }
@@ -54,6 +56,7 @@ export default function App() {
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
   const [page,  setPage]  = useState<Page>('dashboard');
   const [pendingSkillId, setPendingSkillId] = useState<string | undefined>();
+  const [sectionDetailId, setSectionDetailId] = useState<string | undefined>();
   const [user,  setUser]  = useState<AuthUser | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [profileConfirmed, setProfileConfirmed] = useState<boolean | null>(null);
@@ -91,6 +94,10 @@ export default function App() {
   if (profileConfirmed === null) return <Spinner />;
 
   const goToSkill = (sid: string) => {
+    setSectionDetailId(sid);
+    setPage('section');
+  };
+  const goToCustomize = (sid: string) => {
     setPendingSkillId(sid);
     setPage('skills');
   };
@@ -166,6 +173,13 @@ export default function App() {
       {/* Main content */}
       <main className="flex-1 overflow-auto">
         {page === 'dashboard' && <DashboardPage goToSkill={goToSkill} />}
+        {page === 'section'   && sectionDetailId && (
+          <SectionDetailPage
+            sectionId={sectionDetailId}
+            goBack={() => setPage('dashboard')}
+            goToCustomize={goToCustomize}
+          />
+        )}
         {page === 'skills'    && (
           <SkillsPage
             initialSectionId={pendingSkillId}
@@ -327,6 +341,29 @@ function SettingsPage({ user }: { user: AuthUser }) {
   const botConnected = botStatus?.enabled && botStatus?.connected !== false;
   void botPolling;
 
+  const [restarting, setRestarting] = useState(false);
+  const restartOnboarding = async () => {
+    const ok = confirm(
+      'Restart onboarding?\n\n' +
+      'This will:\n' +
+      '  • Delete your current CRM and project database\n' +
+      '  • Wipe your scheduled briefings + email monitor config\n' +
+      '  • Send you back through the 4-step setup wizard\n\n' +
+      'Your personal profile, business profile, and Outlook drafts will NOT be touched.\n\n' +
+      'Continue?'
+    );
+    if (!ok) return;
+    setRestarting(true);
+    try {
+      const r = await fetch('/api/onboarding/restart', { method: 'POST', credentials: 'include' });
+      if (!r.ok) throw new Error(`Server returned ${r.status}`);
+      window.location.reload();
+    } catch (e: any) {
+      setRestarting(false);
+      alert(`Restart failed: ${e?.message || e}`);
+    }
+  };
+
   return (
     <div className="p-8 max-w-2xl">
       <div className="flex items-end justify-between mb-8">
@@ -446,8 +483,75 @@ function SettingsPage({ user }: { user: AuthUser }) {
           <Field label="Webhook URL" value={settings.teams_webhook_url || ''} onChange={v => setSettings(p => ({ ...p, teams_webhook_url: v }))} placeholder="https://..." />
         </Section>
 
+        <Section icon={<Database size={16} />} title="DB Cleanup Preferences" color="text-emerald-500">
+          <p className="text-xs text-executive-muted -mt-1">Controls how the weekly scan (Monday 07:00 UTC) handles duplicates and stale records found by AI.</p>
+          <Toggle
+            label="Auto-merge high-confidence duplicates"
+            description="AI-confirmed exact duplicates merge without asking. Medium and low candidates still require review."
+            checked={settings.auto_merge_high_confidence === 'true'}
+            onChange={v => setSettings(p => ({ ...p, auto_merge_high_confidence: v ? 'true' : 'false' }))}
+          />
+          <Toggle
+            label="Auto-archive stale records"
+            description="Completed projects >6 months old and dormant contacts >12 months old are archived automatically."
+            checked={settings.auto_archive_stale === 'true'}
+            onChange={v => setSettings(p => ({ ...p, auto_archive_stale: v ? 'true' : 'false' }))}
+          />
+          <Toggle
+            label="Send weekly cleanup digest to Teams"
+            description="Pushes the scan summary to your Teams chat every Monday."
+            checked={settings.cleanup_digest_enabled !== 'false'}
+            onChange={v => setSettings(p => ({ ...p, cleanup_digest_enabled: v ? 'true' : 'false' }))}
+          />
+        </Section>
+
+        {/* Danger zone — destructive actions live at the bottom, isolated visually */}
+        <div className="rounded-2xl border border-rose-500/30 bg-rose-500/[0.03] p-6 space-y-3">
+          <div className="flex items-center gap-2">
+            <AlertTriangle size={16} className="text-rose-400" />
+            <h3 className="text-sm font-semibold text-rose-300 uppercase tracking-wider">Danger zone</h3>
+          </div>
+          <div className="flex items-start justify-between gap-4">
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-executive-text">Restart onboarding</p>
+              <p className="text-xs text-executive-muted mt-1 leading-relaxed">
+                Wipes your CRM, project database, scheduled briefings, and email-monitor config,
+                then returns you to the 4-step setup wizard. Use this to re-pick history depth
+                or re-tune briefing schedules from scratch. Personal & business profile are kept.
+              </p>
+            </div>
+            <button
+              onClick={restartOnboarding}
+              disabled={restarting}
+              className="shrink-0 flex items-center gap-2 px-4 py-2 rounded-lg bg-rose-500 hover:bg-rose-600 text-white text-sm font-semibold transition-colors disabled:opacity-50"
+            >
+              {restarting ? <Loader2 size={14} className="animate-spin" /> : <RotateCcw size={14} />}
+              {restarting ? 'Restarting…' : 'Restart onboarding'}
+            </button>
+          </div>
+        </div>
+
       </div>
     </div>
+  );
+}
+
+function Toggle({ label, description, checked, onChange }: {
+  label: string; description?: string; checked: boolean; onChange: (v: boolean) => void;
+}) {
+  return (
+    <label className="flex items-start gap-3 cursor-pointer py-1">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={e => onChange(e.target.checked)}
+        className="mt-0.5 w-4 h-4 rounded border-executive-border text-executive-accent focus:ring-executive-accent"
+      />
+      <div className="flex-1 min-w-0">
+        <div className="text-sm font-medium">{label}</div>
+        {description && <p className="text-xs text-executive-muted leading-snug mt-0.5">{description}</p>}
+      </div>
+    </label>
   );
 }
 
@@ -561,6 +665,7 @@ function OnboardingPage({ onComplete }: { onComplete: () => void }) {
   const [marketSegments,  setMarketSegments]  = useState('');
   const [saving, setSaving]               = useState(false);
   const [error, setError]                 = useState('');
+  const [pollNonce, setPollNonce]         = useState(0);  // force re-fetch after wizard submit
 
   const stage = status?.stage || 'pending';
 
@@ -587,7 +692,7 @@ function OnboardingPage({ onComplete }: { onComplete: () => void }) {
     };
     poll();
     return () => { cancelled = true; };
-  }, [onComplete]);
+  }, [onComplete, pollNonce]);
 
   const confirm = async () => {
     setSaving(true); setError('');
@@ -617,8 +722,23 @@ function OnboardingPage({ onComplete }: { onComplete: () => void }) {
     await fetch('/api/profile/regenerate', { method: 'POST', credentials: 'include' });
   };
 
+  // Awaiting wizard — show 4-step configuration before kicking off init
+  if (stage === 'pending' || stage === 'awaiting_confirmation') {
+    return (
+      <OnboardingWizard
+        onSubmitted={() => {
+          // Wizard returned 200 — backend just set stage='generating'.
+          // Bump the poll nonce so the effect immediately refetches status
+          // and falls through to the checklist UI below.
+          setStatus(s => s ? { ...s, stage: 'generating' } : { stage: 'generating', last_update: null, steps: [], current_message: '' });
+          setPollNonce(n => n + 1);
+        }}
+      />
+    );
+  }
+
   // Generating state — show step-by-step checklist
-  if (stage === 'pending' || stage === 'generating') {
+  if (stage === 'generating') {
     const steps = status?.steps || [];
     const currentMessage = status?.current_message || '';
     return (

@@ -50,14 +50,28 @@ _ALLOWED_EXT = {".pdf", ".jpg", ".jpeg", ".png", ".gif", ".tiff", ".tif", ".webp
 _EXTRACT_PROMPT = """Analyze this document and classify it. Return JSON with these fields:
 
 "document_type": one of:
-  - "receipt"   — a PAID expense (already paid; small purchase, meal, travel, transportation, retail receipt)
-  - "invoice"   — a BILL TO PAY (vendor invoice the user owes, with due date; SaaS billing, services)
-  - "contract"  — a legal AGREEMENT (MSA, NDA, SOW, employment, partnership, lease)
-  - "other"     — not a business document, skip
+  - "receipt"       — a PAID expense (already paid; small purchase, meal, travel, transportation, retail receipt)
+  - "invoice"       — a BILL TO PAY (vendor invoice the user owes, with due date; SaaS billing, services)
+  - "contract"      — a legal AGREEMENT (MSA, NDA, SOW, employment, partnership, lease)
+  - "business_card" — one or more people's contact info (name + email/phone + company on a card or
+                      a contact-list document like a conference roster)
+  - "other"         — not a business document, skip
 
-If document_type is "other", return only: {"document_type": "other"}
+If "other", return only: {"document_type": "other"}
 
-Otherwise also include:
+If "business_card", look carefully — a single image may contain MULTIPLE cards laid out together
+or a roster page may list many people. Return an array of contacts, one per visible card/row:
+{
+  "document_type": "business_card",
+  "contacts": [
+    {"name": "...", "email": "...", "phone": "...", "company": "...",
+     "role": "...", "linkedin": "...", "notes": "<any extra info visible>"},
+    ...
+  ]
+}
+If a card has NO email visible, do NOT include it (we need email for follow-up).
+
+If "receipt" / "invoice" / "contract", also include:
 - "vendor": string (company or store name; for contracts use empty string)
 - "counterparty": string (for contracts only — the other party in the agreement; for receipts/invoices use empty string)
 - "date": string (YYYY-MM-DD; document date, invoice issue date, or contract effective date)

@@ -1,13 +1,15 @@
 import { useEffect, useState } from 'react';
-import { Save, RefreshCw, Loader2, AlertCircle, CheckCircle2, FileText, Building2 } from 'lucide-react';
-import { getProfile, saveBusinessProfile, saveMarketSegments, regenerateProfile } from '../lib/api';
+import { Save, RefreshCw, Loader2, AlertCircle, CheckCircle2, FileText, Building2, User } from 'lucide-react';
+import { getProfile, saveBusinessProfile, saveMarketSegments, savePersonalProfile, regenerateProfile } from '../lib/api';
 
-type Tab = 'business' | 'segments';
+type Tab = 'personal' | 'business' | 'segments';
 
 export default function ProfilePage() {
   const [tab, setTab] = useState<Tab>('business');
+  const [personal, setPersonal] = useState('');
   const [business, setBusiness] = useState('');
   const [segments, setSegments] = useState('');
+  const [origPersonal, setOrigPersonal] = useState('');
   const [origBusiness, setOrigBusiness] = useState('');
   const [origSegments, setOrigSegments] = useState('');
   const [loading, setLoading] = useState(true);
@@ -20,8 +22,10 @@ export default function ProfilePage() {
     setLoading(true);
     getProfile()
       .then(p => {
+        setPersonal(p.personal_profile ?? '');
         setBusiness(p.business_profile ?? '');
         setSegments(p.market_segments ?? '');
+        setOrigPersonal(p.personal_profile ?? '');
         setOrigBusiness(p.business_profile ?? '');
         setOrigSegments(p.market_segments ?? '');
       })
@@ -34,7 +38,11 @@ export default function ProfilePage() {
     setSuccess(null);
     setSaving(true);
     try {
-      if (tab === 'business') {
+      if (tab === 'personal') {
+        await savePersonalProfile(personal);
+        setOrigPersonal(personal);
+        setSuccess('Personal profile saved.');
+      } else if (tab === 'business') {
         await saveBusinessProfile(business);
         setOrigBusiness(business);
         setSuccess('Business profile saved.');
@@ -66,7 +74,24 @@ export default function ProfilePage() {
   };
 
   const dirty =
-    tab === 'business' ? business !== origBusiness : segments !== origSegments;
+    tab === 'personal' ? personal !== origPersonal
+    : tab === 'business' ? business !== origBusiness
+    : segments !== origSegments;
+
+  const currentText = tab === 'personal' ? personal : tab === 'business' ? business : segments;
+  const setCurrentText = (v: string) => {
+    if (tab === 'personal') setPersonal(v);
+    else if (tab === 'business') setBusiness(v);
+    else setSegments(v);
+  };
+  const fileName =
+    tab === 'personal' ? 'personal_profile.md'
+    : tab === 'business' ? 'business_profile.md'
+    : 'market_segments.md';
+  const titleLabel =
+    tab === 'personal' ? 'Personal Profile'
+    : tab === 'business' ? 'Business Profile'
+    : 'Market Segments';
 
   return (
     <div className="p-8 max-w-4xl mx-auto space-y-6">
@@ -80,6 +105,9 @@ export default function ProfilePage() {
 
       {/* Tabs */}
       <div className="flex gap-1 bg-executive-card border border-executive-border rounded-lg p-1 w-fit">
+        <TabBtn active={tab === 'personal'} onClick={() => setTab('personal')} icon={<User size={14} />}>
+          Personal Profile
+        </TabBtn>
         <TabBtn active={tab === 'business'} onClick={() => setTab('business')} icon={<Building2 size={14} />}>
           Business Profile
         </TabBtn>
@@ -92,9 +120,7 @@ export default function ProfilePage() {
       <div className="bg-executive-card border border-executive-border rounded-xl overflow-hidden">
         <div className="px-4 py-3 border-b border-executive-border flex items-center justify-between">
           <div>
-            <h2 className="text-sm font-semibold text-executive-text">
-              {tab === 'business' ? 'business_profile.md' : 'market_segments.md'}
-            </h2>
+            <h2 className="text-sm font-semibold text-executive-text">{fileName}</h2>
             <p className="text-xs text-executive-muted mt-0.5">
               Markdown — preview rendering happens when sent to AI.
             </p>
@@ -110,11 +136,11 @@ export default function ProfilePage() {
           </div>
         ) : (
           <textarea
-            value={tab === 'business' ? business : segments}
-            onChange={e => tab === 'business' ? setBusiness(e.target.value) : setSegments(e.target.value)}
+            value={currentText}
+            onChange={e => setCurrentText(e.target.value)}
             spellCheck={false}
             className="w-full px-4 py-3 bg-executive-bg text-sm font-mono text-executive-text resize-y min-h-[24rem] focus:outline-none"
-            placeholder={`# ${tab === 'business' ? 'Business Profile' : 'Market Segments'}\n\n…`}
+            placeholder={`# ${titleLabel}\n\n…`}
           />
         )}
       </div>

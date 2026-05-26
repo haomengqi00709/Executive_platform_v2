@@ -14,7 +14,14 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
     },
   });
   if (!r.ok) {
-    throw new Error(`${r.status} ${r.statusText} — ${url}`);
+    // Try to surface the FastAPI HTTPException detail so callers can show
+    // a useful message instead of just "400 Bad Request".
+    let detail = '';
+    try {
+      const body = await r.json();
+      detail = (body && typeof body.detail === 'string') ? body.detail : '';
+    } catch { /* response wasn't JSON */ }
+    throw new Error(detail || `${r.status} ${r.statusText} — ${url}`);
   }
   return r.json() as Promise<T>;
 }
@@ -40,9 +47,83 @@ export function updateSectionInstructions(sectionId: string, content: string): P
   });
 }
 
+// ── Email drafts ──────────────────────────────────────────
+
+export interface DraftPayload { subject: string; to: string; body: string; }
+
+export type DraftMode = 'reply' | 'followup';
+
+export interface DraftHints {
+  reason?: string;
+  suggested_opening?: string;
+  reply_tone?: string;
+  urgency?: string;
+  days_waiting?: number;
+}
+
+export function generateDraft(
+  emailId: string,
+  mode: DraftMode = 'reply',
+  hints?: DraftHints,
+): Promise<DraftPayload> {
+  return fetchJson<DraftPayload>(`/api/drafts/generate`, {
+    method: 'POST',
+    body: JSON.stringify({ email_id: emailId, mode, ...(hints || {}) }),
+  });
+}
+
+export function refineDraft(
+  emailId: string, currentBody: string, userRequest: string,
+): Promise<{ body: string }> {
+  return fetchJson<{ body: string }>(`/api/drafts/refine`, {
+    method: 'POST',
+    body: JSON.stringify({ email_id: emailId, current_body: currentBody, user_request: userRequest }),
+  });
+}
+
+export function saveDraft(
+  to: string, subject: string, body: string,
+): Promise<{ ok: boolean; draft_id: string; web_link: string }> {
+  return fetchJson(`/api/drafts/save`, {
+    method: 'POST',
+    body: JSON.stringify({ to, subject, body }),
+  });
+}
+
+// ── Item actions ──────────────────────────────────────────
+
+export function markCommitmentDone(commitmentId: string): Promise<{ ok: boolean }> {
+  return fetchJson<{ ok: boolean }>(`/api/commitments/${commitmentId}/done`, { method: 'POST' });
+}
+
+export function snoozeCommitment(commitmentId: string, days = 3): Promise<{ ok: boolean }> {
+  return fetchJson<{ ok: boolean }>(`/api/commitments/${commitmentId}/snooze`, {
+    method: 'POST',
+    body: JSON.stringify({ days }),
+  });
+}
+
+export function updateProject(projectId: string, patch: Record<string, unknown>): Promise<unknown> {
+  return fetchJson(`/api/projects/${projectId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+}
+
+export function updateCrmContact(email: string, patch: Record<string, unknown>): Promise<unknown> {
+  return fetchJson(`/api/crm/${encodeURIComponent(email)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+}
+
 // ── Profile ───────────────────────────────────────────────
 
-export function getProfile(): Promise<{ business_profile: string; market_segments: string }> {
+export function getProfile(): Promise<{
+  business_profile: string;
+  market_segments:  string;
+  personal_profile: string;
+}> {
   return fetchJson(`/api/profile`);
 }
 
@@ -58,6 +139,38 @@ export function saveMarketSegments(content: string): Promise<{ ok: boolean }> {
     method: 'POST',
     body: JSON.stringify({ content }),
   });
+}
+
+export function savePersonalProfile(content: string): Promise<{ ok: boolean }> {
+  return fetchJson(`/api/profile/personal`, {
+    method: 'POST',
+    body: JSON.stringify({ content }),
+  });
+}
+
+// ── Onboarding wizard ─────────────────────────────────────
+
+export type BriefingsPreset = 'recommended' | 'minimal' | 'none' | 'custom';
+export type MonitorPreset   = 'recommended' | 'quiet' | 'off' | 'custom';
+
+export interface OnboardingPreferences {
+  history_months:   number;            // 3..24
+  briefings_preset: BriefingsPreset;
+  monitor_preset:   MonitorPreset;
+  personal_profile?: string;
+}
+
+export function submitOnboardingPreferences(
+  prefs: OnboardingPreferences,
+): Promise<{ ok: boolean; stage: string; history_months: number }> {
+  return fetchJson(`/api/onboarding/preferences`, {
+    method: 'POST',
+    body: JSON.stringify(prefs),
+  });
+}
+
+export function restartOnboarding(): Promise<{ ok: boolean; stage: string }> {
+  return fetchJson(`/api/onboarding/restart`, { method: 'POST' });
 }
 
 export function getProfileStatus(): Promise<ProfileStatus> {
@@ -169,6 +282,37 @@ export function patchProject(id: string, updates: Partial<ProjectRecord>): Promi
   });
 }
 
+export function scanCrm(): Promise<{ ok: boolean }> {
+  return fetchJson(`/api/crm/scan`, { method: 'POST' });
+}
+
+export function scanProjects(): Promise<{ ok: boolean }> {
+  return fetchJson(`/api/projects/scan`, { method: 'POST' });
+}
+
+// ── DB Cleanup (manual direct actions) ────────────────────
+
+export function mergeProjectsDirect(keep_id: string, merge_id: string): Promise<{ ok: boolean }> {
+  return fetchJson(`/api/db-cleanup/merge-projects-direct`, {
+    method: 'POST',
+    body: JSON.stringify({ keep_id, merge_id }),
+  });
+}
+
+export function mergeContactsDirect(keep_email: string, merge_email: string): Promise<{ ok: boolean }> {
+  return fetchJson(`/api/db-cleanup/merge-contacts-direct`, {
+    method: 'POST',
+    body: JSON.stringify({ keep_email, merge_email }),
+  });
+}
+
+export function archiveRecord(kind: 'project' | 'contact', id: string): Promise<{ ok: boolean }> {
+  return fetchJson(`/api/db-cleanup/archive`, {
+    method: 'POST',
+    body: JSON.stringify({ kind, id }),
+  });
+}
+
 // ── Expenses (full master ledger) ─────────────────────────
 
 export interface ExpenseRow {
@@ -191,6 +335,15 @@ export interface ExpenseRow {
 
 export function getAllExpenses(): Promise<ExpenseRow[]> {
   return fetchJson<ExpenseRow[]>(`/api/expenses/all`);
+}
+
+export function scanHistoricalExpenses(
+  days: number,
+): Promise<{ ok: boolean; days: number; estimated_minutes: number }> {
+  return fetchJson(`/api/expenses/scan`, {
+    method: 'POST',
+    body: JSON.stringify({ days }),
+  });
 }
 
 export function patchExpense(id: string, updates: Partial<ExpenseRow>): Promise<ExpenseRow> {

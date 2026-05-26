@@ -60,6 +60,35 @@ _DEFAULT_MARKET_SEGMENTS = """\
 - (Anything tangentially related that the AI should NOT prioritise)
 """
 
+_DEFAULT_PERSONAL_PROFILE = """\
+# Personal Profile
+
+> Basic facts about you as a person. The AI uses this to sign emails
+> correctly, address you naturally, and pick the right tone. Keep it short —
+> only what's useful in a business context.
+
+## Name and title
+(e.g. Daniel Zhang, CEO)
+
+## Company
+(e.g. i3D Model Inc.)
+
+## Contact
+- Email: (your work email)
+- Phone: (optional, only if you're OK with AI putting it in email signatures)
+- Location: (city / country — helps AI suggest meeting times in your zone)
+
+## Languages
+(e.g. English (primary), Mandarin — for replies in either)
+
+## Working hours preference
+(e.g. 9–6 ET, no meetings before 10 AM)
+
+## Other preferences AI should know
+(e.g. "I prefer short emails", "always close with 'Bests, Daniel'",
+"don't volunteer my phone number unless asked")
+"""
+
 
 def _profile_dir(data_dir: Path) -> Path:
     return Path(data_dir) / _PROFILE_SUBDIR
@@ -71,6 +100,10 @@ def _business_path(data_dir: Path) -> Path:
 
 def _segments_path(data_dir: Path) -> Path:
     return _profile_dir(data_dir) / "market_segments.md"
+
+
+def _personal_path(data_dir: Path) -> Path:
+    return _profile_dir(data_dir) / "personal_profile.md"
 
 
 def _read_or_default(path: Path, default: str) -> str:
@@ -87,6 +120,16 @@ def load_business_profile(data_dir: Path) -> str:
 
 def load_market_segments(data_dir: Path) -> str:
     return _read_or_default(_segments_path(data_dir), _DEFAULT_MARKET_SEGMENTS)
+
+
+def load_personal_profile(data_dir: Path) -> str:
+    return _read_or_default(_personal_path(data_dir), _DEFAULT_PERSONAL_PROFILE)
+
+
+def save_personal_profile(data_dir: Path, text: str) -> None:
+    path = _personal_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text.strip() + "\n")
 
 
 def save_business_profile(data_dir: Path, text: str) -> None:
@@ -204,16 +247,24 @@ def init_has_started(data_dir: Path) -> bool:
 
 
 def load_profile_context(data_dir: Path) -> str:
-    """Combined text injected into AI prompts. Empty if both files are still default templates."""
+    """Combined text injected into AI prompts. Empty if all three files are still default templates."""
     business = load_business_profile(data_dir)
     segments = load_market_segments(data_dir)
+    personal = load_personal_profile(data_dir)
 
-    if business == _DEFAULT_BUSINESS_PROFILE.strip() and segments == _DEFAULT_MARKET_SEGMENTS.strip():
+    biz_filled = business and business != _DEFAULT_BUSINESS_PROFILE.strip()
+    seg_filled = segments and segments != _DEFAULT_MARKET_SEGMENTS.strip()
+    per_filled = personal and personal != _DEFAULT_PERSONAL_PROFILE.strip()
+
+    if not (biz_filled or seg_filled or per_filled):
         return ""
 
     parts = []
-    if business and business != _DEFAULT_BUSINESS_PROFILE.strip():
+    if per_filled:
+        # Personal first — sets the "I am ..." identity the AI should write from.
+        parts.append(f"## Personal Profile\n{personal}")
+    if biz_filled:
         parts.append(f"## Business Profile\n{business}")
-    if segments and segments != _DEFAULT_MARKET_SEGMENTS.strip():
+    if seg_filled:
         parts.append(f"## Market Segments\n{segments}")
     return "\n\n".join(parts)

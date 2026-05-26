@@ -3,12 +3,13 @@ CEO AI Platform v2 — FastAPI server
 Auth + Settings + Teams bot registration
 """
 import json
+import re
 import secrets
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, HTTPException, Request, Response
+from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,6 +21,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from src import auth
 from src.graph import GraphClient
 from src.ai import AIClient
+from src.modules.tz import get_user_tz, now_local, today_local_str
 from src.sections import ai_summary, expenses, reply_needed, followup_needed, commitments_extract, upcoming_commitments
 from src.sections import recent_meetings, meeting_action_items
 from src.sections import market_intelligence, company_intelligence
@@ -64,6 +66,17 @@ def _read_json(path: Path) -> dict:
 def _write_json(path: Path, data: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+
+def _within(iso_ts: str | None, secs: int) -> bool:
+    if not iso_ts:
+        return False
+    try:
+        ts = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - ts).total_seconds() <= secs
+    except Exception:
+        return False
 
 def _udir(user_id: str) -> Path:
     return auth.DATA_DIR / user_id
@@ -517,7 +530,7 @@ def _poll_expense_scan_all_users():
                 if bot_uid and chat_id:
                     bot_token = auth.get_valid_access_token(bot_uid)
                     bot_graph = GraphClient(bot_token)
-                    bot_graph.send_chat_message(chat_id, _format_section_for_teams("expenses", result))
+                    bot_graph.send_chat_message(chat_id, _format_section_for_teams(result, get_user_tz(_udir(uid))))
             except Exception as ne:
                 print(f"[ExpensePoll] Teams notify failed for {uid}: {ne}")
         except Exception as e:
@@ -565,6 +578,36 @@ def _poll_meeting_prep_all_users():
             msg = str(e)
             if not any(c in msg for c in ("502", "503", "504", "ConnectionError", "Timeout")):
                 print(f"[MeetingPrep] Error for {uid}: {e}")
+
+
+def _poll_meeting_recordings_all_users():
+    """Every 20 min, scan each user's OneDrive Recordings/ for newly added mp4s.
+    Processes at most 3 new recordings per user per cycle (Gemini transcription is slow + expensive).
+    Already-processed mp4s are skipped via wiki/_index.json."""
+    from src.modules.m03_meeting import run as m03_run
+    sessions_dir = auth.DATA_DIR / "_sessions"
+    if not sessions_dir.exists():
+        return
+    for token_file in sessions_dir.glob("*.json"):
+        uid = token_file.stem
+        bot_path = _bot_state_path(uid)
+        # Skip bot accounts (they don't have their own OneDrive recordings to process)
+        if bot_path.exists() and _read_json(bot_path).get("is_registered_bot"):
+            continue
+        try:
+            token    = auth.get_valid_access_token(uid)
+            graph    = GraphClient(token)
+            ai       = AIClient()
+            settings = _read_json(_user_settings(uid))
+            result   = m03_run(graph, ai, _udir(uid), settings=settings,
+                               months=6, max_to_process=3)
+            n = result.get("processed", 0)
+            if n:
+                print(f"[m03 poll] Processed {n} new recording(s) for {uid}")
+        except Exception as e:
+            msg = str(e)
+            if not any(c in msg for c in ("502", "503", "504", "ConnectionError", "Timeout")):
+                print(f"[m03 poll] Error for {uid}: {e}")
 
 
 # ── Teams bot API ─────────────────────────────────────────
@@ -813,23 +856,24 @@ def _regenerate_profile_for_user(uid: str) -> None:
         save_init_status(_udir(uid), "user_confirmed" if was_confirmed else "draft_ready")
 
 
-def _build_crm_with_progress(uid: str, progress_cb) -> None:
+def _build_crm_with_progress(uid: str, progress_cb, months: int = 6) -> None:
     from src.modules.crm import build_crm, save_crm
     try:
         token  = auth.get_valid_access_token(uid)
         graph  = GraphClient(token)
         ai     = AIClient()
         result = build_crm(graph, ai, _udir(uid),
+                           months=months,
                            market_segments_content=_get_market_segments(uid),
                            progress_cb=progress_cb)
         save_crm(_udir(uid), result)
-        print(f"[CRM] Initial build done for {uid} — {len(result.get('contacts', {}))} contacts")
+        print(f"[CRM] Initial build done for {uid} — {len(result.get('contacts', {}))} contacts ({months}mo scan)")
     except Exception as e:
         print(f"[CRM] Initial build failed for {uid}: {e}")
         raise
 
 
-def _build_projects_with_progress(uid: str, progress_cb) -> None:
+def _build_projects_with_progress(uid: str, progress_cb, months: int = 6) -> None:
     from src.modules.projects import build_projects, save_projects
     try:
         token    = auth.get_valid_access_token(uid)
@@ -837,19 +881,20 @@ def _build_projects_with_progress(uid: str, progress_cb) -> None:
         ai       = AIClient()
         settings = _read_json(_user_settings(uid))
         result   = build_projects(graph, ai, _udir(uid), settings=settings,
+                                  months=months,
                                   progress_cb=progress_cb)
         save_projects(_udir(uid), result)
-        print(f"[Projects] Initial build done for {uid} — {len(result.get('projects', {}))} projects")
+        print(f"[Projects] Initial build done for {uid} — {len(result.get('projects', {}))} projects ({months}mo scan)")
     except Exception as e:
         print(f"[Projects] Initial build failed for {uid}: {e}")
         raise
 
 
-def _run_first_login_init(uid: str) -> None:
+def _run_first_login_init(uid: str, history_months: int | None = None) -> None:
     """
     Serial init chain on first OAuth login.
-      1. CRM build (scans 6 months of inbox)
-      2. Projects build (extracts ongoing work)
+      1. CRM build (scans `history_months` of inbox; default reads settings)
+      2. Projects build (same window)
       3. Profile init (drafts business_profile + market_segments)
 
     Each stage updates init_status.json so the OnboardingPage can show
@@ -859,6 +904,11 @@ def _run_first_login_init(uid: str) -> None:
     from src.modules.profile import (
         save_init_status, reset_init_steps, update_init_step,
     )
+    if history_months is None:
+        settings = _read_json(_user_settings(uid))
+        history_months = int(settings.get("onboarding_history_months") or 12)
+    history_months = max(1, min(int(history_months), 24))
+
     progress_cb = _make_progress_cb(uid)
     try:
         save_init_status(_udir(uid), "generating")
@@ -868,9 +918,9 @@ def _run_first_login_init(uid: str) -> None:
         if (_udir(uid) / "crm.json").exists():
             update_init_step(_udir(uid), "crm", "done", "CRM already built")
         else:
-            update_init_step(_udir(uid), "crm", "in_progress", "Scanning inbox...")
+            update_init_step(_udir(uid), "crm", "in_progress", f"Scanning inbox ({history_months}mo)...")
             try:
-                _build_crm_with_progress(uid, progress_cb)
+                _build_crm_with_progress(uid, progress_cb, months=history_months)
                 update_init_step(_udir(uid), "crm", "done", f"Contacts captured")
             except Exception as e:
                 update_init_step(_udir(uid), "crm", "failed", f"CRM scan failed: {e}")
@@ -879,9 +929,9 @@ def _run_first_login_init(uid: str) -> None:
         if (_udir(uid) / "projects.json").exists():
             update_init_step(_udir(uid), "projects", "done", "Projects already built")
         else:
-            update_init_step(_udir(uid), "projects", "in_progress", "Identifying active projects...")
+            update_init_step(_udir(uid), "projects", "in_progress", f"Identifying active projects ({history_months}mo)...")
             try:
-                _build_projects_with_progress(uid, progress_cb)
+                _build_projects_with_progress(uid, progress_cb, months=history_months)
                 update_init_step(_udir(uid), "projects", "done", "Projects identified")
             except Exception as e:
                 update_init_step(_udir(uid), "projects", "failed", f"Project scan failed: {e}")
@@ -894,8 +944,35 @@ def _run_first_login_init(uid: str) -> None:
         except Exception as e:
             print(f"[profile_init] Generate failed for {uid}: {e}")
             update_init_step(_udir(uid), "profile", "failed", f"Draft generation failed: {e}")
+
+        # Step 4 (background) — Meeting recordings backfill
+        # Runs in a separate thread so onboarding draft_ready isn't blocked
+        # by potentially-long Gemini transcriptions.
+        threading.Thread(
+            target=_run_meeting_backfill_for_user,
+            args=(uid,),
+            daemon=True,
+        ).start()
+        print(f"[init] Meeting backfill thread started for {uid} (runs in parallel; not in onboarding gate)")
     finally:
         save_init_status(_udir(uid), "draft_ready")
+
+
+def _run_meeting_backfill_for_user(uid: str) -> None:
+    """One-time scan of the user's OneDrive Recordings/ for mp4s from the last 6 months.
+    Runs in a background thread on first login. Idempotent — already-processed
+    recordings are skipped via wiki/_index.json."""
+    from src.modules.m03_meeting import run as m03_run
+    try:
+        token    = auth.get_valid_access_token(uid)
+        graph    = GraphClient(token)
+        ai       = AIClient()
+        settings = _read_json(_user_settings(uid))
+        result = m03_run(graph, ai, _udir(uid), settings=settings, months=6)
+        print(f"[m03 backfill] {uid} done — {result.get('processed', 0)} processed, "
+              f"{result.get('skipped', 0)} already in index")
+    except Exception as e:
+        print(f"[m03 backfill] {uid} failed: {e}")
 
 
 # ── CRM lifecycle helpers ─────────────────────────────────
@@ -986,7 +1063,8 @@ def _refresh_projects_all_users() -> None:
 
 _SECTION_RUNNERS: dict[str, object] = {
     "ai_summary": lambda graph, ai, data_dir, settings, progress:
-        ai_summary.run(graph, ai, data_dir, settings, progress),
+        ai_summary.run(graph, ai, data_dir, settings, progress,
+                       runner_lookup=lambda sid: _SECTION_RUNNERS.get(sid)),
     "reply_needed": lambda graph, ai, data_dir, settings, progress:
         reply_needed.run(graph, ai, data_dir, settings, progress),
     "followup_needed": lambda graph, ai, data_dir, settings, progress:
@@ -1047,8 +1125,14 @@ _EMPTY_SECTION_MESSAGES: dict[str, str] = {
 }
 
 
-def _format_section_for_teams(result: dict) -> str:
+def _format_section_for_teams(result: dict, tz: "ZoneInfo | None" = None) -> str:
     section_id = result.get("id", "")
+    # Section formatters that need to compute "today"/"tomorrow" labels use
+    # the user's tz when provided; UTC fallback keeps callers that haven't
+    # been migrated working without crashing.
+    from zoneinfo import ZoneInfo as _ZI
+    tz = tz or _ZI("UTC")
+    _now_local = datetime.now(tz)
     if section_id == "ai_summary":
         briefing = result.get("briefing", "")
         if briefing:
@@ -1145,8 +1229,8 @@ def _format_section_for_teams(result: dict) -> str:
 
     if section_id == "commitments_extract":
         priority_tag = {"high": "🔴", "medium": "🟡", "low": "🟢"}
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        today_str = _now_local.strftime("%Y-%m-%d")
+        tomorrow_str = (_now_local + timedelta(days=1)).strftime("%Y-%m-%d")
 
         dated = [it for it in items if it.get("due_date")]
         undated = [it for it in items if not it.get("due_date")]
@@ -1195,7 +1279,7 @@ def _format_section_for_teams(result: dict) -> str:
     if section_id == "upcoming_commitments":
         window = result.get("window_days", 7)
         priority_tag = {"high": "🔴", "medium": "🟡", "low": "🟢"}
-        today_d = datetime.now().date()
+        today_d = _now_local.date()
         tomorrow_d = today_d + timedelta(days=1)
 
         # Bucket items
@@ -1579,7 +1663,7 @@ def _send_to_bot(uid: str, result: dict) -> None:
     bot_uid, chat_id = _find_bot_for_user(uid)
     if not bot_uid or not chat_id:
         return
-    message = _format_section_for_teams(result)
+    message = _format_section_for_teams(result, get_user_tz(_udir(uid)))
     if not message:
         return
     try:
@@ -1647,7 +1731,7 @@ def run_section(section_id: str, background_tasks: BackgroundTasks,
 def get_due_today(session: dict = Depends(require_session)):
     """Derived section — real-time filter of commitments_extract for due_date == today."""
     uid = session["user_id"]
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = today_local_str(_udir(uid))
     path = _udir(uid) / "results" / "commitments_extract.json"
     if not path.exists():
         return {"id": "due_today", "status": "not_run", "items": [], "count": 0, "empty": True}
@@ -1764,7 +1848,7 @@ def create_crm_contact(body: dict, session: dict = Depends(require_session)):
     contacts = data.setdefault("contacts", {})
     if email in contacts:
         raise HTTPException(409, "Contact already exists — use PATCH to update")
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = today_local_str(_udir(uid))
     contact = {
         "email":         email,
         "name":          body.get("name", ""),
@@ -1809,6 +1893,260 @@ def trigger_crm_scan(background_tasks: BackgroundTasks,
 
     background_tasks.add_task(_run)
     return {"ok": True, "message": "CRM scan started"}
+
+
+@app.post("/api/projects/scan")
+def trigger_projects_scan(background_tasks: BackgroundTasks,
+                          session: dict = Depends(require_session)):
+    """Force a full Projects DB rebuild from inbox history."""
+    uid = session["user_id"]
+
+    def _run():
+        try:
+            from src.modules.projects import build_projects, save_projects
+            from src.ai import AIClient
+            token    = auth.get_valid_access_token(uid)
+            graph    = GraphClient(token)
+            ai       = AIClient()
+            settings = _read_json(_user_settings(uid))
+            result   = build_projects(graph, ai, _udir(uid), settings=settings)
+            save_projects(_udir(uid), result)
+            print(f"[Projects] Scan complete for {uid}: {len(result.get('projects', {}))} projects")
+        except Exception as e:
+            print(f"[Projects] Scan failed for {uid}: {e}")
+
+    background_tasks.add_task(_run)
+    return {"ok": True, "message": "Projects scan started"}
+
+
+# ── Bulk upload (CRM + Projects) ──────────────────────────
+
+_BULK_ALLOWED_EXTS = {".csv", ".xlsx", ".xls", ".docx", ".pdf", ".txt", ".md"}
+_BULK_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per file
+
+
+async def _read_uploads(files: list[UploadFile]) -> list[tuple[bytes, str]]:
+    out: list[tuple[bytes, str]] = []
+    for f in files:
+        ext = Path(f.filename or "").suffix.lower()
+        if ext not in _BULK_ALLOWED_EXTS:
+            raise HTTPException(400, f"Unsupported file type: {ext or f.filename}")
+        data = await f.read()
+        if len(data) > _BULK_MAX_BYTES:
+            raise HTTPException(400, f"{f.filename} is larger than 10MB")
+        if not data:
+            continue
+        out.append((data, f.filename or f"upload{ext}"))
+    return out
+
+
+@app.post("/api/crm/bulk-upload")
+async def crm_bulk_upload(files: list[UploadFile] = File(...),
+                          session: dict = Depends(require_session)):
+    """Parse uploaded files into a preview list of CRM contacts (NOT yet saved)."""
+    from src.modules.bulk_loader import parse_crm_file
+    uploads = await _read_uploads(files)
+    if not uploads:
+        return {"contacts": [], "files": []}
+
+    ai = AIClient()
+    all_contacts: list[dict] = []
+    file_summaries: list[dict] = []
+    for data, name in uploads:
+        try:
+            parsed = parse_crm_file(data, name, ai)
+        except Exception as e:
+            file_summaries.append({"name": name, "count": 0, "error": str(e)[:200]})
+            continue
+        file_summaries.append({"name": name, "count": len(parsed), "error": None})
+        all_contacts.extend(parsed)
+
+    # Deduplicate by email across files
+    seen: set = set()
+    dedup: list[dict] = []
+    for c in all_contacts:
+        e = c.get("email", "").lower()
+        if not e or e in seen:
+            continue
+        seen.add(e)
+        dedup.append(c)
+
+    # Mark which ones already exist in CRM
+    uid = session["user_id"]
+    existing: set = set()
+    crm_path = _udir(uid) / "crm.json"
+    if crm_path.exists():
+        try:
+            existing = {e.lower() for e in json.loads(crm_path.read_text()).get("contacts", {}).keys()}
+        except Exception:
+            pass
+    for c in dedup:
+        c["_already_exists"] = c["email"] in existing
+
+    return {"contacts": dedup, "files": file_summaries}
+
+
+@app.post("/api/crm/bulk-commit")
+async def crm_bulk_commit(request: Request, session: dict = Depends(require_session)):
+    """Persist the user-approved contacts. Exact email matches are skipped."""
+    from src.modules.crm import load_crm, save_crm
+    uid = session["user_id"]
+    body = await request.json()
+    contacts = body.get("contacts") or []
+    if not isinstance(contacts, list):
+        raise HTTPException(400, "contacts must be a list")
+
+    db = load_crm(_udir(uid))
+    existing = db.get("contacts") or {}
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    added = 0
+    skipped_existing = 0
+    skipped_invalid = 0
+    for c in contacts:
+        email = (c.get("email") or "").strip().lower()
+        if not email or "@" not in email:
+            skipped_invalid += 1
+            continue
+        if email in existing:
+            skipped_existing += 1
+            continue
+        existing[email] = {
+            "email":         email,
+            "name":          c.get("name") or "",
+            "company":       c.get("company") or "",
+            "role":          c.get("role") or "",
+            "phone":         c.get("phone") or "",
+            "linkedin":      c.get("linkedin") or "",
+            "status":        c.get("status") or "other",
+            "priority":      c.get("priority") or "medium",
+            "summary":       c.get("summary") or "",
+            "notes":         c.get("notes") or "",
+            "thread_count":  0,
+            "last_contact":  "",
+            "updated_at":    today,
+            "manual":        True,
+            "source":        "bulk_upload",
+            "ignore":        False,
+        }
+        added += 1
+
+    db["contacts"] = existing
+    save_crm(_udir(uid), db)
+    return {"added": added, "skipped_existing": skipped_existing, "skipped_invalid": skipped_invalid}
+
+
+@app.post("/api/projects/bulk-upload")
+async def projects_bulk_upload(files: list[UploadFile] = File(...),
+                               session: dict = Depends(require_session)):
+    """Parse uploaded files into a preview list of Projects (NOT yet saved)."""
+    from src.modules.bulk_loader import parse_project_file
+    uploads = await _read_uploads(files)
+    if not uploads:
+        return {"projects": [], "files": []}
+
+    ai = AIClient()
+    all_projects: list[dict] = []
+    file_summaries: list[dict] = []
+    for data, name in uploads:
+        try:
+            parsed = parse_project_file(data, name, ai)
+        except Exception as e:
+            file_summaries.append({"name": name, "count": 0, "error": str(e)[:200]})
+            continue
+        file_summaries.append({"name": name, "count": len(parsed), "error": None})
+        all_projects.extend(parsed)
+
+    # Dedup by lowercase name across files
+    seen: set = set()
+    dedup: list[dict] = []
+    for p in all_projects:
+        n = (p.get("name") or "").lower().strip()
+        if not n or n in seen:
+            continue
+        seen.add(n)
+        dedup.append(p)
+
+    # Mark which ones already exist (by name match against existing projects)
+    uid = session["user_id"]
+    existing_names: set = set()
+    proj_path = _udir(uid) / "projects.json"
+    if proj_path.exists():
+        try:
+            existing_names = {
+                (p.get("name") or "").lower().strip()
+                for p in json.loads(proj_path.read_text()).get("projects", {}).values()
+            }
+        except Exception:
+            pass
+    for p in dedup:
+        p["_already_exists"] = (p["name"] or "").lower().strip() in existing_names
+
+    return {"projects": dedup, "files": file_summaries}
+
+
+@app.post("/api/projects/bulk-commit")
+async def projects_bulk_commit(request: Request, session: dict = Depends(require_session)):
+    """Persist user-approved projects. Existing name matches are skipped."""
+    from src.modules.projects import load_projects, save_projects
+    uid = session["user_id"]
+    body = await request.json()
+    projects = body.get("projects") or []
+    if not isinstance(projects, list):
+        raise HTTPException(400, "projects must be a list")
+
+    db = load_projects(_udir(uid))
+    existing = db.get("projects") or {}
+    existing_names_lower = {(p.get("name") or "").lower() for p in existing.values()}
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _make_id(name: str) -> str:
+        slug = re.sub(r"[^\w\s-]", "", (name or "")).strip().lower()
+        slug = re.sub(r"[\s-]+", "-", slug)[:60]
+        base = slug or "project"
+        candidate = base
+        i = 1
+        while candidate in existing:
+            i += 1
+            candidate = f"{base}-{i}"
+        return candidate
+
+    added = 0
+    skipped_existing = 0
+    skipped_invalid = 0
+    for p in projects:
+        name = (p.get("name") or "").strip()
+        if not name:
+            skipped_invalid += 1
+            continue
+        if name.lower() in existing_names_lower:
+            skipped_existing += 1
+            continue
+        pid = _make_id(name)
+        existing[pid] = {
+            "id":               pid,
+            "name":             name,
+            "summary":          p.get("summary") or "",
+            "status":           p.get("status") or "ongoing",
+            "category":         p.get("category") or "other",
+            "momentum":         "steady",
+            "participants":     p.get("participants") or [],
+            "key_topics":       p.get("key_topics") or [],
+            "next_action":      p.get("next_action") or "",
+            "deadline":         p.get("deadline") or "",
+            "thread_count":     0,
+            "conversation_ids": [],
+            "last_activity":    today,
+            "ignore":           False,
+            "updated_at":       today,
+            "source":           "bulk_upload",
+        }
+        existing_names_lower.add(name.lower())
+        added += 1
+
+    db["projects"] = existing
+    save_projects(_udir(uid), db)
+    return {"added": added, "skipped_existing": skipped_existing, "skipped_invalid": skipped_invalid}
 
 
 # ── M03 Meeting scan ──────────────────────────────────────
@@ -1894,6 +2232,243 @@ def get_projects(session: dict = Depends(require_session)):
         raise HTTPException(500, str(e))
 
 
+@app.post("/api/commitments/{commitment_id}/done")
+def commitment_mark_done(commitment_id: str, session: dict = Depends(require_session)):
+    from src.modules.commitments_state import mark_done
+    mark_done(_udir(session["user_id"]), commitment_id, method="user")
+    return {"ok": True, "id": commitment_id, "state": "done"}
+
+
+@app.post("/api/commitments/{commitment_id}/snooze")
+def commitment_snooze(commitment_id: str, body: dict | None = None,
+                      session: dict = Depends(require_session)):
+    from src.modules.commitments_state import mark_snoozed
+    days = int((body or {}).get("days") or 3)
+    mark_snoozed(_udir(session["user_id"]), commitment_id, days=days)
+    return {"ok": True, "id": commitment_id, "state": "snoozed", "days": days}
+
+
+# ── Email draft composer ──────────────────────────────────
+
+def _html_to_plain(html: str) -> str:
+    """Cheap HTML→text used when AI gets the original email body. Same shape
+    as src.modules.crm._strip_html; inlined here to avoid importing the
+    whole crm module."""
+    import re as _re
+    import html as _html
+    text = _re.sub(r"<[^>]+>", " ", html or "")
+    text = _html.unescape(text)
+    text = _re.sub(r"[ \t]+", " ", text)
+    text = _re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _plain_to_html(text: str) -> str:
+    """Convert plain-text draft body to the HTML payload Outlook expects.
+    Preserves blank-line paragraph breaks and single-line line breaks."""
+    import html as _html
+    escaped = _html.escape(text or "")
+    paras = escaped.split("\n\n")
+    return "".join(f"<p>{p.replace(chr(10), '<br>')}</p>" for p in paras if p.strip() or True)
+
+
+def _fetch_original_email(uid: str, email_id: str) -> dict:
+    """Return {subject, from_email, from_name, to_email, to_name, body_text,
+    sent_date} for any mailbox message (inbox or sent items).
+    Raises HTTPException(404) on failure."""
+    token = auth.get_valid_access_token(uid)
+    graph = GraphClient(token)
+    try:
+        msg = graph.get_message(email_id)
+    except Exception as e:
+        raise HTTPException(404, f"Could not fetch email: {e}")
+    from_obj = (msg.get("from") or {}).get("emailAddress") or {}
+    to_list  = msg.get("toRecipients") or []
+    to_obj   = (to_list[0].get("emailAddress") if to_list else {}) or {}
+    body_obj = msg.get("body") or {}
+    body_content = body_obj.get("content") or msg.get("bodyPreview") or ""
+    if (body_obj.get("contentType") or "").lower() == "html":
+        body_content = _html_to_plain(body_content)
+    return {
+        "subject":    msg.get("subject") or "(no subject)",
+        "from_email": (from_obj.get("address") or "").strip(),
+        "from_name":  (from_obj.get("name") or "").strip(),
+        "to_email":   (to_obj.get("address") or "").strip(),
+        "to_name":    (to_obj.get("name") or "").strip(),
+        "sent_date":  (msg.get("sentDateTime") or msg.get("receivedDateTime") or "")[:10],
+        "body_text":  body_content[:4000],
+    }
+
+
+@app.post("/api/drafts/generate")
+def draft_generate(body: dict, session: dict = Depends(require_session)):
+    """Generate a draft for one of two modes:
+      - mode='reply' (default): inbound email I need to respond to.
+        To = original sender.
+      - mode='followup': outbound email I sent that hasn't been replied to.
+        To = original recipient. Tone: polite nudge.
+    Both pull the original message via Graph and fuse with profile + writing-
+    style + per-item AI hints. Returns plain-text body."""
+    from src.modules.profile import load_profile_context
+    uid     = session["user_id"]
+    payload = body or {}
+    email_id = (payload.get("email_id") or "").strip()
+    mode     = (payload.get("mode") or "reply").strip().lower()
+    if mode not in ("reply", "followup"):
+        raise HTTPException(400, f"unknown mode: {mode}")
+    if not email_id:
+        raise HTTPException(400, "email_id required")
+
+    orig = _fetch_original_email(uid, email_id)
+
+    profile_ctx   = load_profile_context(_udir(uid))
+    settings      = _read_json(_user_settings(uid))
+    writing_style = settings.get("writing_style_note") or "Professional, concise, friendly."
+    display_name  = settings.get("display_name") or "the executive"
+
+    reason       = (payload.get("reason") or "").strip()
+    opening      = (payload.get("suggested_opening") or "").strip()
+    tone         = (payload.get("reply_tone") or "professional").strip()
+    urgency      = (payload.get("urgency") or "medium").strip()
+    days_waiting = payload.get("days_waiting")
+
+    if mode == "reply":
+        instr_path = _udir(uid) / "instructions" / "reply_needed.md"
+        user_instruction = instr_path.read_text() if instr_path.exists() else ""
+        subj = orig["subject"]
+        reply_subject = subj if subj.lower().startswith("re:") else f"Re: {subj}"
+        to_addr = orig["from_email"]
+        prompt = (
+            f"You are drafting an email reply on behalf of {display_name}.\n\n"
+            f"BUSINESS CONTEXT:\n{profile_ctx}\n\n"
+            f"WRITING STYLE (match this voice exactly):\n{writing_style}\n\n"
+            f"USER REPLY PREFERENCES:\n{user_instruction or '(none)'}\n\n"
+            f"ORIGINAL EMAIL from {orig['from_name'] or orig['from_email']} <{orig['from_email']}>:\n"
+            f"Subject: {orig['subject']}\n\n{orig['body_text']}\n\n"
+            f"WHY THIS NEEDS A REPLY:\n{reason or '(unspecified)'}\n\n"
+            f"Suggested tone: {tone}\n"
+            f"Suggested opening: {opening or '(none)'}\n\n"
+            "Write the COMPLETE reply body. Plain text only — no markdown, no "
+            "subject line, no extra commentary. Address the specific question(s) "
+            "in the original email. Do not invent facts not present above. End "
+            "with a natural sign-off."
+        )
+    else:  # followup
+        instr_path = _udir(uid) / "instructions" / "followup_needed.md"
+        user_instruction = instr_path.read_text() if instr_path.exists() else ""
+        subj = orig["subject"]
+        # Distinct subject so recipient sees it's a nudge, not a re-send.
+        reply_subject = subj if subj.lower().startswith(("re:", "following up")) else f"Following up: {subj}"
+        to_addr = orig["to_email"]
+        recipient_label = orig["to_name"] or orig["to_email"] or "the recipient"
+        days_str = f"{days_waiting} days" if isinstance(days_waiting, int) and days_waiting > 0 else "a while"
+        prompt = (
+            f"You are drafting a polite follow-up nudge on behalf of {display_name}.\n\n"
+            f"BUSINESS CONTEXT:\n{profile_ctx}\n\n"
+            f"WRITING STYLE (match this voice exactly):\n{writing_style}\n\n"
+            f"USER FOLLOWUP PREFERENCES:\n{user_instruction or '(none)'}\n\n"
+            f"ORIGINAL EMAIL I sent on {orig['sent_date']} to {recipient_label} <{orig['to_email']}>:\n"
+            f"Subject: {orig['subject']}\n\n{orig['body_text']}\n\n"
+            f"They have not replied in {days_str}. Urgency: {urgency}.\n"
+            f"Context for why a follow-up matters now: {reason or '(general nudge)'}\n\n"
+            "Write a SHORT, polite follow-up message body. Rules:\n"
+            "- Do NOT quote the full original email back to them.\n"
+            "- Acknowledge the prior thread in one sentence ('Just circling back on...').\n"
+            "- Make it easy for them to respond — ask a specific question or "
+            "offer to help unblock them.\n"
+            "- Tone: friendly but professional. Never aggressive or guilt-tripping.\n"
+            "- Plain text only, no markdown, no subject line. End with a sign-off."
+        )
+
+    if not to_addr or "@" not in to_addr:
+        raise HTTPException(
+            500,
+            f"Could not determine recipient ({'sender' if mode=='reply' else 'recipient'} "
+            f"missing on original email)",
+        )
+
+    try:
+        body_text = AIClient().generate(prompt).strip()
+    except Exception as e:
+        raise HTTPException(500, f"AI generation failed: {e}")
+    body_text = body_text.strip('"').strip("'").strip()
+
+    return {
+        "subject": reply_subject,
+        "to":      to_addr,
+        "body":    body_text,
+    }
+
+
+@app.post("/api/drafts/refine")
+def draft_refine(body: dict, session: dict = Depends(require_session)):
+    """Take the current draft body + a free-form user request ("make it
+    shorter", "add thanks") and return a revised draft body."""
+    uid     = session["user_id"]
+    payload = body or {}
+    email_id     = (payload.get("email_id") or "").strip()
+    current_body = (payload.get("current_body") or "").strip()
+    user_request = (payload.get("user_request") or "").strip()
+    if not current_body or not user_request:
+        raise HTTPException(400, "current_body and user_request required")
+
+    settings      = _read_json(_user_settings(uid))
+    writing_style = settings.get("writing_style_note") or "Professional, concise, friendly."
+    display_name  = settings.get("display_name") or "the executive"
+
+    orig_snippet = ""
+    if email_id:
+        try:
+            orig = _fetch_original_email(uid, email_id)
+            orig_snippet = orig["body_text"][:1500]
+        except Exception:
+            pass
+
+    prompt = (
+        f"You are refining {display_name}'s draft email reply.\n\n"
+        f"WRITING STYLE:\n{writing_style}\n\n"
+        f"ORIGINAL EMAIL (context only — do not quote):\n{orig_snippet or '(not available)'}\n\n"
+        f"CURRENT DRAFT:\n{current_body}\n\n"
+        f"USER WANTS YOU TO:\n{user_request}\n\n"
+        "Return ONLY the revised draft body — no preamble, no quotes around "
+        "it, no explanation. Preserve everything the user did not ask to "
+        "change. Plain text only."
+    )
+    try:
+        revised = AIClient().generate(prompt).strip()
+    except Exception as e:
+        raise HTTPException(500, f"AI refine failed: {e}")
+    return {"body": revised.strip('"').strip("'").strip()}
+
+
+@app.post("/api/drafts/save")
+def draft_save(body: dict, session: dict = Depends(require_session)):
+    """Create a real Outlook draft via Graph. Plain-text body in → HTML out."""
+    uid     = session["user_id"]
+    payload = body or {}
+    to       = (payload.get("to") or "").strip()
+    subject  = (payload.get("subject") or "").strip()
+    body_txt = (payload.get("body") or "").strip()
+
+    missing = [n for n, v in (("to", to), ("subject", subject), ("body", body_txt)) if not v]
+    if missing:
+        raise HTTPException(400, f"Missing required field(s): {', '.join(missing)}")
+    if "@" not in to:
+        raise HTTPException(400, f"'to' is not a valid email address: {to!r}")
+
+    token = auth.get_valid_access_token(uid)
+    graph = GraphClient(token)
+    try:
+        result = graph.create_draft(subject=subject, body=_plain_to_html(body_txt), to=to)
+    except Exception as e:
+        raise HTTPException(500, f"Draft save failed: {e}")
+    return {
+        "ok":       True,
+        "draft_id": result.get("id"),
+        "web_link": result.get("webLink") or "",
+    }
+
+
 @app.patch("/api/projects/{project_id}")
 def patch_project(project_id: str, body: dict, session: dict = Depends(require_session)):
     """Manually update a project. Allowed fields: status, momentum, category,
@@ -1912,7 +2487,7 @@ def patch_project(project_id: str, body: dict, session: dict = Depends(require_s
     if "momentum" in updates and updates["momentum"] not in _PROJECT_VALID_MOMENTUMS:
         raise HTTPException(400, f"Invalid momentum. Must be one of {sorted(_PROJECT_VALID_MOMENTUMS)}")
     projects[project_id].update(updates)
-    projects[project_id]["updated_at"] = datetime.now().strftime("%Y-%m-%d")
+    projects[project_id]["updated_at"] = today_local_str(_udir(uid))
     data["projects"] = projects
     # Atomic write
     tmp = proj_path.with_suffix(".tmp")
@@ -1997,6 +2572,39 @@ def patch_expense(row_id: str, body: dict, session: dict = Depends(require_sessi
     return updated_row
 
 
+@app.post("/api/expenses/scan")
+async def scan_expenses_historical(
+    body: dict, background_tasks: BackgroundTasks,
+    session: dict = Depends(require_session),
+):
+    """Manually trigger a historical receipt scan over email attachments.
+    Body: {days: int} — typically 90 or 180. Runs in background; results
+    stream into expenses_master.xlsx incrementally so the user can see new
+    rows appear by polling /api/expenses/all."""
+    uid  = session["user_id"]
+    days = int((body or {}).get("days") or 90)
+    days = max(7, min(days, 365))
+
+    def _run():
+        from src.sections.expenses import run as expenses_run
+        try:
+            token = auth.get_valid_access_token(uid)
+            graph = GraphClient(token)
+            ai    = AIClient()
+            result = expenses_run(
+                graph, ai, _udir(uid), days=days,
+                progress=lambda m: print(f"[ExpenseScan/{uid[:8]}] {m}"),
+            )
+            print(f"[ExpenseScan] Done for {uid} — captured {result.get('count', 0)} new items ({days}d)")
+        except Exception as e:
+            print(f"[ExpenseScan] Failed for {uid}: {e}")
+
+    background_tasks.add_task(_run)
+    # Rough heuristic — ~1 min per ~15 days of inbox (depends on volume + OCR speed)
+    est_min = max(2, days // 15)
+    return {"ok": True, "days": days, "estimated_minutes": est_min}
+
+
 @app.post("/api/expenses")
 def create_expense(body: dict, session: dict = Depends(require_session)):
     """Manually add a new receipt row to expenses_master.xlsx."""
@@ -2022,7 +2630,7 @@ def create_expense(body: dict, session: dict = Depends(require_session)):
         ws.title = "Expenses"
         ws.append(headers)
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = today_local_str(_udir(uid))
     manual_id = f"manual_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
     new_row = [
         body.get("Date") or today,
@@ -2171,6 +2779,68 @@ def get_last_outreach(session: dict = Depends(require_session)):
         return {"status": "not_run"}
 
 
+@app.get("/api/contacts/list")
+def list_contacts(session: dict = Depends(require_session),
+                  source: str = "",
+                  tag: str = "",
+                  since_hours: int = 0):
+    """Flat list of CRM contacts for the frontend table view.
+
+    Query params:
+      source       — filter by source field (e.g. 'teams_card', 'email_scan')
+      tag          — filter by tag (case-insensitive substring match)
+      since_hours  — only contacts added in the last N hours
+
+    Returns items sorted by added_at desc (newest first).
+    """
+    uid = session["user_id"]
+    from src.modules.crm import load_crm
+    crm = load_crm(_udir(uid))
+    contacts = crm.get("contacts", {}).values()
+
+    items = []
+    cutoff = None
+    if since_hours and since_hours > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+    tag_lower = tag.lower() if tag else ""
+
+    for c in contacts:
+        if source and c.get("source") != source:
+            continue
+        if tag_lower:
+            if not any(tag_lower in t.lower() for t in (c.get("tags") or [])):
+                continue
+        if cutoff:
+            added_at = c.get("added_at", "")
+            if not added_at:
+                continue
+            try:
+                dt = datetime.fromisoformat(added_at.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if dt < cutoff:
+                continue
+        items.append({
+            "email":        c.get("email", ""),
+            "name":         c.get("name", ""),
+            "company":      c.get("company", ""),
+            "role":         c.get("role", ""),
+            "phone":        c.get("phone", ""),
+            "linkedin":     c.get("linkedin", ""),
+            "source":       c.get("source", ""),
+            "tags":         c.get("tags") or [],
+            "added_at":     c.get("added_at", ""),
+            "last_contact": c.get("last_contact", ""),
+            "draft_link":   c.get("draft_link", ""),
+            "priority":     c.get("priority", ""),
+            "status":       c.get("status", ""),
+            "notes":        c.get("notes", ""),
+        })
+
+    items.sort(key=lambda x: x.get("added_at", ""), reverse=True)
+    return {"items": items, "count": len(items)}
+
+
 @app.get("/api/watchlist")
 def get_watchlist(session: dict = Depends(require_session)):
     uid  = session["user_id"]
@@ -2198,11 +2868,12 @@ async def save_watchlist(request: Request, session: dict = Depends(require_sessi
 
 @app.get("/api/profile")
 def get_profile(session: dict = Depends(require_session)):
-    from src.modules.profile import load_business_profile, load_market_segments
+    from src.modules.profile import load_business_profile, load_market_segments, load_personal_profile
     uid = session["user_id"]
     return {
         "business_profile": load_business_profile(_udir(uid)),
         "market_segments":  load_market_segments(_udir(uid)),
+        "personal_profile": load_personal_profile(_udir(uid)),
     }
 
 
@@ -2211,7 +2882,7 @@ async def save_business_profile_endpoint(request: Request, session: dict = Depen
     from src.modules.profile import save_business_profile
     uid  = session["user_id"]
     body = await request.json()
-    text = str(body.get("text", ""))
+    text = str(body.get("content") or body.get("text") or "")
     save_business_profile(_udir(uid), text)
     return {"ok": True}
 
@@ -2221,8 +2892,18 @@ async def save_market_segments_endpoint(request: Request, session: dict = Depend
     from src.modules.profile import save_market_segments
     uid  = session["user_id"]
     body = await request.json()
-    text = str(body.get("text", ""))
+    text = str(body.get("content") or body.get("text") or "")
     save_market_segments(_udir(uid), text)
+    return {"ok": True}
+
+
+@app.post("/api/profile/personal")
+async def save_personal_profile_endpoint(request: Request, session: dict = Depends(require_session)):
+    from src.modules.profile import save_personal_profile
+    uid  = session["user_id"]
+    body = await request.json()
+    text = str(body.get("content") or body.get("text") or "")
+    save_personal_profile(_udir(uid), text)
     return {"ok": True}
 
 
@@ -2253,7 +2934,9 @@ def confirm_profile(session: dict = Depends(require_session)):
 @app.post("/api/init/start")
 def start_init(session: dict = Depends(require_session)):
     """User has confirmed the right account is logged in — start the first-login init chain.
-    Idempotent: if init is already running or completed, returns the current stage without re-triggering."""
+    Idempotent: if init is already running or completed, returns the current stage without re-triggering.
+    Uses the history_months saved in settings (default 12) — for explicit control, use
+    POST /api/onboarding/preferences instead."""
     from src.modules.profile import load_init_status, save_init_status
     uid = session["user_id"]
     stage = load_init_status(_udir(uid)).get("stage", "pending")
@@ -2266,11 +2949,100 @@ def start_init(session: dict = Depends(require_session)):
     return {"ok": True, "stage": "generating"}
 
 
+@app.post("/api/onboarding/preferences")
+async def submit_onboarding_preferences(request: Request, session: dict = Depends(require_session)):
+    """Wizard-driven init: writes user-chosen history depth, briefing/monitor
+    presets, and personal profile draft, then kicks off the init chain.
+    Body: {
+      history_months:   int (3-24, default 12),
+      briefings_preset: 'recommended'|'minimal'|'none'|'custom' (custom = leave existing),
+      monitor_preset:   'recommended'|'quiet'|'off'|'custom',
+      personal_profile: str (optional)
+    }"""
+    from src.modules.profile import (
+        load_init_status, save_init_status, save_personal_profile,
+    )
+    from src.modules.schedules import (
+        apply_briefing_preset, apply_monitor_preset, load_schedules,
+    )
+
+    uid  = session["user_id"]
+    body = await request.json()
+
+    history_months   = max(1, min(int(body.get("history_months") or 12), 24))
+    briefings_preset = (body.get("briefings_preset") or "recommended").lower()
+    monitor_preset   = (body.get("monitor_preset")   or "recommended").lower()
+    personal_text    = body.get("personal_profile")
+
+    # 1. Persist history depth so _run_first_login_init picks it up
+    settings = _read_json(_user_settings(uid))
+    settings["onboarding_history_months"] = history_months
+    _write_json(_user_settings(uid), settings)
+    tz = settings.get("timezone") or "UTC"
+
+    # 2. Personal profile draft (optional — wizard skips it if blank)
+    if personal_text:
+        save_personal_profile(_udir(uid), str(personal_text))
+
+    # 3. Schedule presets (skip 'custom' so we don't clobber prior config)
+    if briefings_preset != "custom":
+        apply_briefing_preset(_udir(uid), briefings_preset, tz)
+        # Hot-register the new briefings with the live scheduler so cron starts ticking
+        # without waiting for a server restart.
+        for b in load_schedules(_udir(uid)).get("briefings", []):
+            try:
+                _register_briefing(uid, b)
+            except Exception as e:
+                print(f"[Onboarding] briefing register failed for {b.get('id')}: {e}")
+    if monitor_preset != "custom":
+        apply_monitor_preset(_udir(uid), monitor_preset)
+
+    # 4. Trigger init (idempotent)
+    stage = load_init_status(_udir(uid)).get("stage", "pending")
+    if stage in ("generating", "draft_ready", "user_confirmed"):
+        return {"ok": True, "stage": stage, "message": "Init already running"}
+    save_init_status(_udir(uid), "generating")
+    threading.Thread(
+        target=_run_first_login_init,
+        args=(uid,),
+        kwargs={"history_months": history_months},
+        daemon=True,
+    ).start()
+    print(f"[Onboarding] wizard submitted for {uid} — history={history_months}mo, "
+          f"briefings={briefings_preset}, monitor={monitor_preset}")
+    return {"ok": True, "stage": "generating", "history_months": history_months}
+
+
 @app.get("/api/init/status")
 def get_init_status(session: dict = Depends(require_session)):
     """Frontend polls this to know what to show: awaiting_confirmation / generating / draft_ready / user_confirmed."""
     from src.modules.profile import load_init_status
     return load_init_status(_udir(session["user_id"]))
+
+
+@app.post("/api/onboarding/restart")
+def restart_onboarding(session: dict = Depends(require_session)):
+    """Wipe init artifacts and send the user back through the wizard. Unlike
+    /api/init/reset (which immediately re-runs init), this leaves stage at
+    'awaiting_confirmation' so the OnboardingWizard renders again. The user
+    re-picks history depth / briefing preset / monitor preset before any
+    scan starts."""
+    from src.modules.profile import save_init_status
+    uid  = session["user_id"]
+    udir = _udir(uid)
+    for fname in ("crm.json", "projects.json"):
+        p = udir / fname
+        if p.exists():
+            try: p.unlink()
+            except Exception: pass
+    status_path = udir / "profile" / "init_status.json"
+    if status_path.exists():
+        try: status_path.unlink()
+        except Exception: pass
+    save_init_status(udir, "awaiting_confirmation",
+                     current_message="Awaiting new preferences from wizard.")
+    print(f"[Onboarding] Restart requested for {uid} — wizard will run again")
+    return {"ok": True, "stage": "awaiting_confirmation"}
 
 
 @app.post("/api/init/reset")
@@ -2314,6 +3086,188 @@ def regenerate_profile(session: dict = Depends(require_session)):
     return {"ok": True}
 
 
+# ── DB Cleanup (duplicate detection + stale archival) ────
+
+def _run_cleanup_scan_for_user(uid: str, auto_apply: bool = False, send_digest: bool = False) -> None:
+    """Run a full scan for one user. If auto_apply, immediately approve high-confidence
+    duplicates and/or stale records based on user's settings. If send_digest, push a
+    Teams Adaptive Card summary to the user's bot chat afterwards."""
+    from src.modules.db_cleaner import (
+        run_full_scan, approve_candidates, load_pending, load_last_scan, build_digest_card,
+    )
+    # Skip if no data to scan (e.g. bot accounts have no crm/projects)
+    if not (_udir(uid) / "crm.json").exists() and not (_udir(uid) / "projects.json").exists():
+        return
+
+    try:
+        ai = AIClient()
+        settings = _read_json(_user_settings(uid))
+        run_full_scan(_udir(uid), ai)
+
+        auto_applied_count = 0
+        if auto_apply:
+            pending = load_pending(_udir(uid))
+            auto_ids: list[str] = []
+            if settings.get("auto_merge_high_confidence") in (True, "true"):
+                auto_ids += [c["id"] for c in pending
+                             if c.get("confidence") == "high"
+                             and c.get("type") in ("project_duplicate", "contact_duplicate")]
+            if settings.get("auto_archive_stale") in (True, "true"):
+                auto_ids += [c["id"] for c in pending
+                             if c.get("type") in ("stale_project", "stale_contact")]
+            if auto_ids:
+                result = approve_candidates(_udir(uid), auto_ids)
+                auto_applied_count = len(auto_ids)
+                print(f"[DBCleanup] {uid} auto-applied {auto_applied_count} candidates: {result}")
+
+        if send_digest and settings.get("cleanup_digest_enabled") not in (False, "false"):
+            summary = load_last_scan(_udir(uid)).get("summary", {})
+            # Subtract auto-applied from the high/stale totals shown to the user
+            if auto_applied_count:
+                summary = dict(summary)
+                summary["total"] = max(0, summary.get("total", 0) - auto_applied_count)
+
+            origin = os.getenv("FRONTEND_URL") or FRONTEND_URL
+            cleanup_url = f"{origin.rstrip('/')}/?page=records&tab=cleanup"
+            card = build_digest_card(summary, cleanup_url, auto_applied=auto_applied_count)
+            _send_card_to_owner_bot_chat(uid, card)
+    except Exception as e:
+        print(f"[DBCleanup] Scan failed for {uid}: {e}")
+
+
+def _send_card_to_owner_bot_chat(owner_uid: str, card: dict) -> None:
+    """Find the bot account linked to this owner and push a card to their 1:1 chat."""
+    from src.modules.email_monitor import _send_adaptive_card
+    sessions_dir = auth.DATA_DIR / "_sessions"
+    if not sessions_dir.exists():
+        return
+    for f in sessions_dir.glob("*.json"):
+        bot_uid = f.stem
+        bp = _bot_state_path(bot_uid)
+        if not bp.exists():
+            continue
+        try:
+            bs = _read_json(bp)
+            if (bs.get("enabled")
+                    and bs.get("is_registered_bot")
+                    and bs.get("owner_uid") == owner_uid
+                    and bs.get("chat_id")):
+                bot_graph = GraphClient(auth.get_valid_access_token(bot_uid))
+                _send_adaptive_card(bot_graph, bs["chat_id"], card)
+                return
+        except Exception as e:
+            print(f"[DBCleanup] Card push failed for owner={owner_uid} bot={bot_uid}: {e}")
+
+
+def _weekly_cleanup_scan_all_users() -> None:
+    sessions_dir = auth.DATA_DIR / "_sessions"
+    if not sessions_dir.exists():
+        return
+    for f in sessions_dir.glob("*.json"):
+        threading.Thread(
+            target=_run_cleanup_scan_for_user,
+            kwargs={"uid": f.stem, "auto_apply": True, "send_digest": True},
+            daemon=True,
+        ).start()
+
+
+@app.get("/api/db-cleanup/pending")
+def db_cleanup_pending(session: dict = Depends(require_session)):
+    from src.modules.db_cleaner import load_pending, load_last_scan
+    uid = session["user_id"]
+    return {
+        "candidates": load_pending(_udir(uid)),
+        "last_scan":  load_last_scan(_udir(uid)),
+    }
+
+
+@app.post("/api/db-cleanup/scan")
+def db_cleanup_scan(session: dict = Depends(require_session)):
+    uid = session["user_id"]
+    threading.Thread(
+        target=_run_cleanup_scan_for_user,
+        args=(uid, False),  # manual scan: never auto-apply (user wants to review)
+        daemon=True,
+    ).start()
+    return {"ok": True, "message": "Scan started in background"}
+
+
+@app.post("/api/db-cleanup/approve")
+async def db_cleanup_approve(request: Request, session: dict = Depends(require_session)):
+    from src.modules.db_cleaner import approve_candidates
+    uid  = session["user_id"]
+    body = await request.json()
+    ids  = body.get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(400, "ids must be a non-empty list")
+    return approve_candidates(_udir(uid), [str(i) for i in ids])
+
+
+@app.post("/api/db-cleanup/reject")
+async def db_cleanup_reject(request: Request, session: dict = Depends(require_session)):
+    from src.modules.db_cleaner import reject_candidates
+    uid  = session["user_id"]
+    body = await request.json()
+    ids  = body.get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(400, "ids must be a non-empty list")
+    return reject_candidates(_udir(uid), [str(i) for i in ids])
+
+
+@app.post("/api/db-cleanup/merge-projects-direct")
+async def db_cleanup_merge_projects_direct(request: Request, session: dict = Depends(require_session)):
+    """Manual merge: user picks both projects, no AI candidate required."""
+    from src.modules.db_cleaner import merge_projects
+    uid  = session["user_id"]
+    body = await request.json()
+    keep_id  = str(body.get("keep_id") or "").strip()
+    merge_id = str(body.get("merge_id") or "").strip()
+    if not keep_id or not merge_id:
+        raise HTTPException(400, "keep_id and merge_id are required")
+    if keep_id == merge_id:
+        raise HTTPException(400, "keep_id and merge_id must be different")
+    result = merge_projects(_udir(uid), keep_id, merge_id)
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "merge failed"))
+    return result
+
+
+@app.post("/api/db-cleanup/merge-contacts-direct")
+async def db_cleanup_merge_contacts_direct(request: Request, session: dict = Depends(require_session)):
+    """Manual merge: user picks both contacts, no AI candidate required."""
+    from src.modules.db_cleaner import merge_contacts
+    uid  = session["user_id"]
+    body = await request.json()
+    keep_email  = str(body.get("keep_email") or "").strip()
+    merge_email = str(body.get("merge_email") or "").strip()
+    if not keep_email or not merge_email:
+        raise HTTPException(400, "keep_email and merge_email are required")
+    if keep_email.lower() == merge_email.lower():
+        raise HTTPException(400, "keep_email and merge_email must be different")
+    result = merge_contacts(_udir(uid), keep_email, merge_email)
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "merge failed"))
+    return result
+
+
+@app.post("/api/db-cleanup/archive")
+async def db_cleanup_archive_direct(request: Request, session: dict = Depends(require_session)):
+    """Manual archive: set archived=true on a single project or contact."""
+    from src.modules.db_cleaner import archive_record
+    uid  = session["user_id"]
+    body = await request.json()
+    kind = str(body.get("kind") or "").strip()
+    ident = str(body.get("id") or "").strip()
+    if kind not in ("project", "contact"):
+        raise HTTPException(400, "kind must be 'project' or 'contact'")
+    if not ident:
+        raise HTTPException(400, "id is required")
+    result = archive_record(_udir(uid), kind, ident)
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "archive failed"))
+    return result
+
+
 # ── Health check ──────────────────────────────────────────
 
 @app.get("/health")
@@ -2353,13 +3307,20 @@ def _run_briefing_for_user(uid: str, briefing_id: str, force: bool = False) -> N
             # Mirror _run_section_for_user but track pushed vs empty
             results_dir = _udir(uid) / "results"
             results_dir.mkdir(parents=True, exist_ok=True)
-            token    = auth.get_valid_access_token(uid)
-            graph    = GraphClient(token)
-            ai       = AIClient()
-            settings = _read_json(_user_settings(uid))
-            result   = _SECTION_RUNNERS[sid](graph, ai, _udir(uid), settings, None)
-            _write_json(results_dir / f"{sid}.json", result)
-            msg = _format_section_for_teams(result)
+            # Freshness check: if ai_summary already refreshed this dep within
+            # the last 30 minutes (or any other recent run wrote it), reuse the
+            # file instead of double-running the same skill in one briefing.
+            existing = _read_json(results_dir / f"{sid}.json")
+            if existing and _within(existing.get("last_run"), 30 * 60):
+                result = existing
+            else:
+                token    = auth.get_valid_access_token(uid)
+                graph    = GraphClient(token)
+                ai       = AIClient()
+                settings = _read_json(_user_settings(uid))
+                result   = _SECTION_RUNNERS[sid](graph, ai, _udir(uid), settings, None)
+                _write_json(results_dir / f"{sid}.json", result)
+            msg = _format_section_for_teams(result, get_user_tz(_udir(uid)))
             if msg:
                 bot_uid, chat_id = _find_bot_for_user(uid)
                 if bot_uid and chat_id:
@@ -2676,5 +3637,22 @@ def startup_event():
         max_instances=1,
         coalesce=True,
     )
+    _scheduler.add_job(
+        _weekly_cleanup_scan_all_users,
+        trigger="cron",
+        day_of_week="mon", hour=7, minute=0,
+        id="db_cleanup_weekly",
+        replace_existing=True,
+        max_instances=1,
+    )
+    _scheduler.add_job(
+        _poll_meeting_recordings_all_users,
+        trigger="interval",
+        minutes=20,
+        id="meeting_recordings_poll",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
     _load_all_user_schedules_at_startup()
-    print("[Scheduler] Teams bot 10s | Email monitor 1m | Expense scan 1m | Meeting prep 5m | CRM refresh daily 06:00 UTC | Projects refresh daily 06:30 UTC")
+    print("[Scheduler] Teams bot 10s | Email monitor 1m | Expense scan 1m | Meeting prep 5m | Meeting recordings 20m | CRM refresh daily 06:00 UTC | Projects refresh daily 06:30 UTC | DB cleanup weekly Mon 07:00 UTC")

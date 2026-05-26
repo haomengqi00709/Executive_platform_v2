@@ -133,6 +133,89 @@ def delete_briefing(data_dir: Path, briefing_id: str) -> None:
     save_schedules(data_dir, schedules)
 
 
+# ── Onboarding presets ────────────────────────────────────
+
+def apply_briefing_preset(data_dir: Path, preset: str, tz: str = "UTC") -> list[dict]:
+    """Replace the briefings list with one of the named presets used by onboarding.
+    preset: 'recommended' | 'minimal' | 'none'. Unknown preset → no-op.
+    Returns the new briefings list."""
+    preset = (preset or "").lower()
+    if preset == "minimal":
+        briefings = [{
+            "id": _new_briefing_id(),
+            "name": "Morning Briefing",
+            "enabled": True,
+            # Mon-Fri only (0-4 in our cron dialect = Mon-Fri) — executives
+            # rarely want a 7am business briefing on Saturday/Sunday.
+            "cron": "0 7 * * 1-5",
+            "tz": tz,
+            "skills": ["ai_summary"],
+        }]
+    elif preset == "recommended":
+        briefings = [
+            {
+                "id": _new_briefing_id(),
+                "name": "Morning Briefing",
+                "enabled": True,
+                "cron": "0 7 * * 1-5",  # weekdays only
+                "tz": tz,
+                "skills": ["ai_summary", "reply_needed", "due_today"],
+            },
+            {
+                "id": _new_briefing_id(),
+                "name": "Weekly Summary",
+                "enabled": True,
+                "cron": "0 8 * * 1",  # Monday morning recap
+                "tz": tz,
+                "skills": ["business_insights"],
+            },
+            {
+                "id": _new_briefing_id(),
+                "name": "Market & Company Intel",
+                "enabled": True,
+                # Every 3rd day of the month at 6am. Weekday-only would be
+                "cron": "0 6 */3 * *",
+                "tz": tz,
+                "skills": ["market_intelligence", "company_intelligence"],
+            },
+        ]
+    elif preset == "none":
+        briefings = []
+    else:
+        return load_schedules(data_dir)["briefings"]
+
+    schedules = load_schedules(data_dir)
+    schedules["briefings"] = briefings
+    save_schedules(data_dir, schedules)
+    return briefings
+
+
+def apply_monitor_preset(data_dir: Path, preset: str) -> dict:
+    """Replace email_monitor with one of the named presets.
+    preset: 'recommended' | 'quiet' | 'off'. Unknown preset → no-op."""
+    preset = (preset or "").lower()
+    if preset == "recommended":
+        monitor = {"priority_immediate": True, "interval_minutes": 15,
+                   "active_start": "08:00", "active_end": "20:00"}
+    elif preset == "quiet":
+        monitor = {"priority_immediate": False, "interval_minutes": 60,
+                   "active_start": "09:00", "active_end": "18:00"}
+    elif preset == "off":
+        # NOTE: don't use interval_minutes=0 — downstream consumers divide by
+        # this value (email_monitor.py converts to hours), and 0 would either
+        # crash or trigger an infinite-loop fast-poll. 1440 = once per day,
+        # which combined with priority_immediate=False is effectively "quiet".
+        monitor = {"priority_immediate": False, "interval_minutes": 1440,
+                   "active_start": "08:00", "active_end": "20:00"}
+    else:
+        return load_schedules(data_dir)["email_monitor"]
+
+    schedules = load_schedules(data_dir)
+    schedules["email_monitor"] = monitor
+    save_schedules(data_dir, schedules)
+    return monitor
+
+
 # ── Auto-triggered tools ──────────────────────────────────
 
 def update_email_monitor(data_dir: Path, patch: dict) -> dict:

@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Loader2, Search, Trash2, Check, X, Pencil, Plus, Image as ImageIcon,
+  History, RefreshCw,
 } from 'lucide-react';
 import {
   getAllExpenses, patchExpense, deleteExpense, createExpense, expensePhotoUrl,
+  scanHistoricalExpenses,
 } from '../../lib/api';
 import type { ExpenseRow } from '../../lib/api';
 
@@ -102,6 +104,8 @@ export default function ExpensesTab() {
 
   return (
     <div className="space-y-4">
+      <HistoricalScanBanner onRowsChanged={refresh} initialRowCount={rows.length} />
+
       <header className="flex flex-wrap items-center gap-3 justify-between">
         <div className="text-xs text-executive-muted">
           {loading ? 'Loading…' : `${rows.length} receipts captured`}
@@ -457,5 +461,99 @@ function EditCell({
         <X size={12} />
       </button>
     </span>
+  );
+}
+
+// ── Historical scan banner ────────────────────────────────
+
+function HistoricalScanBanner({
+  onRowsChanged, initialRowCount,
+}: { onRowsChanged: () => void; initialRowCount: number }) {
+  const [state, setState] = useState<null | {
+    days: number; estMin: number; startedAt: number; baselineCount: number;
+  }>(null);
+  const [error, setError] = useState<string | null>(null);
+  const pollRef = useRef<number | null>(null);
+
+  const start = async (days: number) => {
+    setError(null);
+    try {
+      const r = await scanHistoricalExpenses(days);
+      setState({
+        days:          r.days,
+        estMin:        r.estimated_minutes,
+        startedAt:     Date.now(),
+        baselineCount: initialRowCount,
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  // While scanning, auto-refresh the table every 15s for up to estMin + 5 min
+  // (so the user sees new rows stream in without manual refresh).
+  useEffect(() => {
+    if (!state) return;
+    const maxMs = (state.estMin + 5) * 60 * 1000;
+    pollRef.current = window.setInterval(() => {
+      if (Date.now() - state.startedAt > maxMs) {
+        if (pollRef.current) window.clearInterval(pollRef.current);
+        setState(null);
+        return;
+      }
+      onRowsChanged();
+    }, 15_000);
+    return () => {
+      if (pollRef.current) window.clearInterval(pollRef.current);
+    };
+  }, [state, onRowsChanged]);
+
+  if (state) {
+    return (
+      <div className="flex items-center justify-between gap-3 p-3 rounded-lg bg-amber-400/10 border border-amber-400/30">
+        <div className="flex items-center gap-2 min-w-0">
+          <Loader2 size={14} className="animate-spin text-amber-400 shrink-0" />
+          <span className="text-xs text-amber-200">
+            Scanning last <span className="font-semibold">{state.days} days</span> of email
+            attachments — estimated ~{state.estMin} min total. Table refreshes automatically.
+          </span>
+        </div>
+        <button
+          onClick={() => setState(null)}
+          className="text-xs text-amber-300 hover:text-amber-200 shrink-0"
+        >
+          Dismiss
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 p-3 rounded-lg bg-executive-card border border-executive-border">
+      <div className="flex items-center gap-2 min-w-0">
+        <History size={14} className="text-executive-muted shrink-0" />
+        <span className="text-xs text-executive-muted">
+          <span className="text-executive-text font-medium">Scan historical receipts</span>
+          {' '}— pull receipts from older emails. New mail is already captured automatically by the monitor.
+        </span>
+      </div>
+      <div className="flex items-center gap-2 shrink-0">
+        <button
+          onClick={() => start(90)}
+          className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-executive-border hover:bg-executive-border/30 text-executive-text transition-colors"
+        >
+          <RefreshCw size={11} /> Last 3 months
+        </button>
+        <button
+          onClick={() => start(180)}
+          className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-executive-border hover:bg-executive-border/30 text-executive-text transition-colors"
+        >
+          <RefreshCw size={11} /> Last 6 months
+        </button>
+      </div>
+      {error && (
+        <p className="text-xs text-rose-400 w-full">{error}</p>
+      )}
+    </div>
   );
 }

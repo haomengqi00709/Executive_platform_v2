@@ -20,6 +20,7 @@ from pathlib import Path
 
 from src.ai import AIClient
 from src.graph import GraphClient
+from src.modules.tz import get_user_tz, format_local_time
 
 
 _RESULT_ID = "meeting_prep"
@@ -41,16 +42,6 @@ def _save_json(path: Path, data) -> None:
     tmp.replace(path)
 
 
-def _format_time(iso_str: str) -> str:
-    if not iso_str:
-        return ""
-    try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        return dt.strftime("%H:%M")
-    except Exception:
-        return iso_str[11:16] if len(iso_str) >= 16 else iso_str
-
-
 def _build_attendee_context(email: str, crm: dict, contacts_by_email: dict) -> dict:
     c = contacts_by_email.get(email.lower()) or {}
     return {
@@ -70,7 +61,7 @@ def _related_projects(attendee_emails: set, projects_data: dict) -> list[dict]:
     out = []
     active_states = {"ongoing", "needs_attention", "paused", "early_stage"}
     for p in projects_data.get("projects", {}).values():
-        if p.get("ignore"):
+        if p.get("ignore") or p.get("archived"):
             continue
         if p.get("status") not in active_states:
             continue
@@ -108,8 +99,30 @@ def _open_actions_for_attendees(attendee_emails: set, action_items: list[dict]) 
     return out[:8]
 
 
+_DEFAULT_INSTRUCTION = """\
+# Meeting Prep — User Preferences
+
+Customise what the pre-meeting reminder should emphasise. Examples:
+
+- "Always remind me of any outstanding action items I owe the attendees"
+- "Lead with the deal value if there's a pipeline opportunity"
+- "Skip prep for internal 1:1s with my direct reports"
+- "Mention what their company has been in the news for recently"
+"""
+
+
+def _load_user_instruction(data_dir: Path) -> str:
+    path = data_dir / "instructions" / f"{_RESULT_ID}.md"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_DEFAULT_INSTRUCTION)
+        return _DEFAULT_INSTRUCTION.strip()
+    return path.read_text().strip()
+
+
 def _ai_remember_hint(meeting: dict, attendee_ctx: list[dict], projects: list[dict],
-                     open_actions: list[dict], ai: AIClient, display_name: str) -> str:
+                     open_actions: list[dict], ai: AIClient, display_name: str,
+                     user_instruction: str = "") -> str:
     """Ask AI for a 2-sentence remember-this hint."""
     lines = [
         f"You are about to draft a pre-meeting reminder for {display_name}.",
@@ -139,6 +152,10 @@ def _ai_remember_hint(meeting: dict, attendee_ctx: list[dict], projects: list[di
         "that names the most important context and the one outstanding thing the executive "
         "should bring up. Use real names. No filler."
     )
+    if user_instruction:
+        lines.append("")
+        lines.append("USER PREFERENCES (override anything above if contradicted):")
+        lines.append(user_instruction)
     try:
         text = ai.generate("\n".join(lines)).strip()
         if text.startswith("```"):
@@ -206,6 +223,8 @@ def run(
     results_path = data_dir / "results" / f"{_RESULT_ID}.json"
     results_path.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
+    tz = get_user_tz(data_dir)
+    user_instruction = _load_user_instruction(data_dir)
 
     # Load schedule config for prep_minutes_before
     from src.modules.schedules import load_schedules
@@ -293,12 +312,13 @@ def run(
         meeting_summary = {
             "subject":     ev.get("subject") or "(no subject)",
             "start":       start_iso,
-            "start_local": _format_time(start_iso),
+            "start_local": format_local_time(start_iso, tz),
             "end":         (ev.get("end") or {}).get("dateTime") or "",
             "location":    (ev.get("location") or {}).get("displayName", ""),
         }
 
-        remember = _ai_remember_hint(meeting_summary, attendee_ctx, related, open_actions, ai, display_name)
+        remember = _ai_remember_hint(meeting_summary, attendee_ctx, related, open_actions, ai, display_name,
+                                     user_instruction=user_instruction)
 
         prep = {
             "id":          hashlib.sha1(ev_id.encode()).hexdigest()[:16],

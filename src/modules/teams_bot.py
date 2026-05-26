@@ -19,9 +19,79 @@ from pathlib import Path
 
 # ── Receipt extraction (unchanged from original) ──────────────────────────
 
-_RECEIPT_EXTS  = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".pdf", ".tiff"}
+_RECEIPT_EXTS  = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".pdf", ".tiff",
+                  ".csv", ".xlsx", ".xls"}
 _RECEIPT_MIMES = {"image/jpeg", "image/jpg", "image/png", "image/gif",
-                  "image/webp", "application/pdf", "image/tiff"}
+                  "image/webp", "application/pdf", "image/tiff",
+                  "text/csv", "application/csv",
+                  "application/vnd.ms-excel",
+                  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+_TABULAR_EXTS  = {".csv", ".xlsx", ".xls"}
+
+
+def _classify_tabular_purpose(ai, file_bytes: bytes, ext: str) -> str:
+    """Show AI the header + first 3 data rows of a tabular file, ask what it's for.
+
+    Returns one of:
+      'contact_list'  — names/emails/companies, suitable for outreach
+      'other'         — unknown / not yet supported
+
+    Future doc-types can be added here without changing the upstream router.
+    """
+    import csv as _csv, io as _io
+    sample_rows: list = []
+    try:
+        if ext == ".csv":
+            text = file_bytes.decode("utf-8-sig", errors="replace")
+            reader = _csv.reader(_io.StringIO(text))
+            for i, row in enumerate(reader):
+                if i >= 4:
+                    break
+                sample_rows.append(row)
+        else:
+            import openpyxl, tempfile, os
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
+                f.write(file_bytes)
+                tmp = f.name
+            wb = openpyxl.load_workbook(tmp, data_only=True)
+            ws = wb.active
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i >= 4:
+                    break
+                sample_rows.append([str(c) if c is not None else "" for c in row])
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[TabularClassify] Parse failed: {e}")
+        return "other"
+
+    if not sample_rows:
+        return "other"
+
+    preview = "\n".join("\t".join(r) for r in sample_rows[:4])
+    prompt = f"""Look at this table sample (header + up to 3 data rows). What is this file for?
+
+Sample:
+{preview}
+
+Return JSON with one field:
+"purpose": one of:
+  - "contact_list"  — a list of people with names/emails/companies (suitable for outreach)
+  - "other"         — anything else (financial report, project tracker, inventory, etc.)
+
+Respond with valid JSON only."""
+
+    try:
+        raw = ai.extract_json(prompt)
+        import json as _j, re as _re
+        m = _re.search(r"\{.*\}", raw, _re.DOTALL)
+        if m:
+            return _j.loads(m.group()).get("purpose", "other")
+    except Exception as e:
+        print(f"[TabularClassify] AI failed: {e}")
+    return "other"
 
 
 def _mime_for_ext(ext: str) -> str:
@@ -29,6 +99,9 @@ def _mime_for_ext(ext: str) -> str:
         ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
         ".gif": "image/gif",  ".webp": "image/webp",  ".pdf": "application/pdf",
         ".tiff": "image/tiff",
+        ".csv":  "text/csv",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xls":  "application/vnd.ms-excel",
     }.get(ext, "application/octet-stream")
 
 
@@ -132,11 +205,12 @@ def _extract_receipt_bytes(msg: dict, chat_id: str, graph, owner_graph=None) -> 
 
 
 def _handle_teams_receipt(msg: dict, chat_id: str, graph, ai,
-                           owner_graph=None, data_dir=None) -> tuple:
+                           owner_graph=None, data_dir=None, settings=None) -> tuple:
     """
-    Route a Teams message to the Expense Agent.
+    Route a Teams attachment to the right pipeline.
+    AI classifies the document — receipt/invoice/contract → expense flow;
+    business_card → CRM ingest + auto-draft outreach.
     Returns (reply_str | None, pending_expense | None).
-    pending_expense is non-None only when a field-duplicate is detected.
     """
     # Check for attachment bytes first — no heavy imports until we know there's a receipt
     img_bytes, mime, filename = _extract_receipt_bytes(msg, chat_id, graph, owner_graph)
@@ -168,9 +242,31 @@ def _handle_teams_receipt(msg: dict, chat_id: str, graph, ai,
     if dedup_key in seen:
         return None, None
 
-    hashes = _load_hashes(hashes_file)
-    h      = _compute_hash(img_bytes)
-    if h in hashes:
+    # ── Early branch: CSV / XLSX → AI classifies purpose, then route ──
+    ext = Path(filename).suffix.lower()
+    if ext in _TABULAR_EXTS:
+        seen.add(dedup_key)
+        _save_seen(seen, seen_file)
+        purpose = _classify_tabular_purpose(ai, img_bytes, ext)
+        print(f"[ExpenseAgent] Tabular file purpose: {purpose}")
+        if purpose == "contact_list":
+            from src.modules.outreach import _extract_from_csv, _extract_from_xlsx
+            raw_contacts = _extract_from_csv(img_bytes) if ext == ".csv" else _extract_from_xlsx(img_bytes)
+            # Reuse business_card path below by faking the result shape
+            result = {"document_type": "business_card", "contacts": raw_contacts}
+            doc_type = "business_card"
+            _skip_vision = True
+        else:
+            return (f"I received a {ext.lstrip('.').upper()} file but it doesn't look like a contact list. "
+                    f"Currently I can only process contact lists from CSV/Excel files. "
+                    f"Other file types (financial reports, project trackers, etc.) aren't supported yet."), None
+    else:
+        _skip_vision = False
+
+    # Skip receipt-hash dedup for tabular files (CSV/XLSX) — receipt hashing is image-only
+    hashes = _load_hashes(hashes_file) if not _skip_vision else {}
+    h      = _compute_hash(img_bytes) if not _skip_vision else ""
+    if not _skip_vision and h in hashes:
         seen.add(dedup_key)
         _save_seen(seen, seen_file)
         meta  = hashes[h]
@@ -210,15 +306,123 @@ def _handle_teams_receipt(msg: dict, chat_id: str, graph, ai,
             return reply, pending
         return "This receipt has already been captured (exact duplicate). No action taken.", None
 
-    print(f"[ExpenseAgent] Processing Teams receipt: {filename}")
-    result = _extract_from_attachment(img_bytes, mime, filename, ai)
+    if not _skip_vision:
+        print(f"[ExpenseAgent] Processing Teams attachment: {filename}")
+        result = _extract_from_attachment(img_bytes, mime, filename, ai)
 
-    seen.add(dedup_key)
-    _save_seen(seen, seen_file)
+        seen.add(dedup_key)
+        _save_seen(seen, seen_file)
 
-    if not result or not result.get("is_receipt"):
-        return ("I received your attachment but it doesn't look like a receipt or invoice. "
-                "If this is an expense document, please send the actual receipt image."), None
+        if not result:
+            return ("I received your attachment but couldn't analyze it. "
+                    "If this is a receipt or contact card, please resend a clearer image."), None
+
+        doc_type = result.get("document_type", "")
+
+    # ── Business card / contact list → CRM ingest + auto-draft ────────
+    if doc_type == "business_card":
+        from src.modules.crm import add_contacts_bulk
+        from src.modules.outreach import _generate_draft
+        from src.modules.profile import load_profile_context
+
+        raw_contacts = result.get("contacts") or []
+        skipped_no_email = sum(1 for c in raw_contacts if not (c.get("email") or "").strip())
+        valid_contacts = [c for c in raw_contacts if (c.get("email") or "").strip()]
+
+        if not valid_contacts:
+            return ("I detected a business card / contact list, but no email addresses were visible. "
+                    "Please resend a clearer image, or include an email in your message."), None
+
+        bulk_result = add_contacts_bulk(data_dir, valid_contacts, source="teams_card")
+
+        # Auto-draft outreach for newly added contacts (skip already-existing ones)
+        _settings = settings or {}
+        display_name     = _settings.get("display_name", "the executive")
+        business_context = load_profile_context(data_dir) if data_dir else ""
+        writing_style    = _settings.get("writing_style_note", "")
+        signoff          = _settings.get("outreach_default_signoff", "")
+        # Use any text the user sent alongside the photo as context
+        body_text = _strip_html(msg.get("body", {}).get("content", "")).strip()
+        context_note = body_text or "Following up from our recent meeting"
+
+        draft_links = {}
+        if owner_graph:
+            for c in valid_contacts:
+                email = c["email"].strip().lower()
+                if bulk_result["by_email"].get(email) != "added":
+                    continue  # already in CRM, don't re-draft
+                draft = _generate_draft(ai, c, context_note,
+                                        display_name, business_context, writing_style, signoff)
+                if not draft:
+                    continue
+                try:
+                    gr = owner_graph.create_draft(subject=draft["subject"], body=draft["body"], to=email)
+                    web_link = gr.get("webLink", "")
+                    draft_links[email] = web_link
+                    # Persist link on the contact
+                    try:
+                        from src.modules.crm import update_contact
+                        if web_link:
+                            update_contact(data_dir, email, "draft_link", web_link)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print(f"[ContactIngest] Draft create failed for {email}: {e}")
+
+        # Append newly added contacts to the OneDrive master Excel
+        # (read-only mirror of CRM — user can open in Excel app or share).
+        if bulk_result.get("added") and owner_graph:
+            try:
+                from src.modules.contacts_excel import append_contacts as _excel_append
+                from src.modules.crm import load_crm
+                crm = load_crm(data_dir).get("contacts", {})
+                # Pull the enriched CRM records (with added_at, draft_link, source, tags)
+                # for the contacts we just added in this batch
+                added_emails = {
+                    e for e, status in bulk_result["by_email"].items()
+                    if status == "added"
+                }
+                rows = [crm[e] for e in added_emails if e in crm]
+                xr = _excel_append(owner_graph, rows)
+                if xr.get("error"):
+                    print(f"[ContactIngest] OneDrive excel append failed: {xr['error']}")
+                else:
+                    print(f"[ContactIngest] Appended {xr['appended']} rows to OneDrive contacts_master.xlsx")
+            except Exception as e:
+                print(f"[ContactIngest] OneDrive excel append error: {e}")
+
+        # Build reply
+        lines = [f"🆕 Captured {bulk_result['added']} new contact{'s' if bulk_result['added'] != 1 else ''}:"]
+        for c in valid_contacts:
+            email = c["email"].strip().lower()
+            if bulk_result["by_email"].get(email) != "added":
+                continue
+            name = c.get("name") or email
+            company = c.get("company", "")
+            role = c.get("role", "")
+            details = " · ".join(filter(None, [role, company]))
+            lines.append(f"• {name}" + (f" — {details}" if details else "") + f" ({email})")
+        if bulk_result["updated"]:
+            lines.append(f"\n({bulk_result['updated']} already in CRM — merged tags/notes, no new draft)")
+        if skipped_no_email:
+            lines.append(f"({skipped_no_email} card{'s' if skipped_no_email != 1 else ''} skipped — no email visible)")
+        if draft_links:
+            lines.append(f"\n📬 {len(draft_links)} draft{'s' if len(draft_links) != 1 else ''} saved to Outlook.")
+        if bulk_result["added"]:
+            lines.append(f"📊 Updated OneDrive › Conferences › contacts_master.xlsx")
+            lines.append("Send 'tag as X' to group these contacts.")
+
+        return "\n".join(lines), None
+
+    # ── Document is not a receipt — give a useful error ────────────────
+    if doc_type not in ("receipt", "invoice", "contract"):
+        return ("I received your attachment but it doesn't look like a receipt, invoice, contract, or business card. "
+                "If you meant to capture something specific, please resend with a clearer image."), None
+
+    # Back-compat with code below that checks is_receipt
+    if doc_type != "receipt":
+        return (f"Detected a {doc_type} — currently only receipts auto-add to your expense Excel. "
+                "I've logged it but skipped Excel write."), None
 
     today      = datetime.now().strftime("%Y-%m-%d")
     amount     = result.get("amount") or 0
@@ -370,9 +574,9 @@ def poll_and_reply(bot_state: dict, graph, ai, owner_graph=None,
     for msg in new_msgs:
         last_seen_ts = msg["createdDateTime"]
 
-        # Receipt attachment handling
+        # Attachment handling (routes to receipt/invoice/contract or business_card → CRM)
         expense_reply, pending_expense = _handle_teams_receipt(
-            msg, chat_id, graph, ai, owner_graph, owner_data_dir
+            msg, chat_id, graph, ai, owner_graph, owner_data_dir, settings=settings
         )
         if pending_expense:
             bot_state["pending_expense"] = pending_expense

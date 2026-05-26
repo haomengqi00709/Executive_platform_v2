@@ -219,9 +219,10 @@ def build_projects(
     data_dir: Path,
     settings: dict = None,
     progress_cb=None,
+    months: int = 6,
 ) -> dict:
     """
-    Full project extraction from the last 6 months of email.
+    Full project extraction from the last `months` of email.
     Returns a new projects dict; caller must call save_projects().
     """
     def log(msg: str):
@@ -234,11 +235,12 @@ def build_projects(
     display_name = settings.get("display_name", "the executive")
     business_context = load_profile_context(data_dir)
     today_str = datetime.now().strftime("%Y-%m-%d")
+    days_window = max(1, int(months)) * 30
 
     # ── Phase 1: Fetch inbox messages (with bodyPreview) ──
-    log("Fetching inbox messages (6 months)...")
+    log(f"Fetching inbox messages ({months} months)...")
     try:
-        inbox_msgs = graph.get_messages_since(days=180, max_results=500)
+        inbox_msgs = graph.get_messages_since(days=days_window, max_results=500)
     except Exception as e:
         log(f"Inbox fetch failed: {e}")
         inbox_msgs = []
@@ -250,7 +252,7 @@ def build_projects(
         crm_data = load_crm(data_dir)
         ignored_emails = {
             email for email, c in crm_data.get("contacts", {}).items()
-            if c.get("ignore")
+            if c.get("ignore") or c.get("archived")
         }
     except Exception:
         pass
@@ -359,7 +361,7 @@ def refresh_projects(
         crm_data = load_crm(data_dir)
         ignored_emails = {
             email for email, c in crm_data.get("contacts", {}).items()
-            if c.get("ignore")
+            if c.get("ignore") or c.get("archived")
         }
     except Exception:
         pass
@@ -451,7 +453,7 @@ def refresh_projects(
     for pid, proj in list(existing.get("projects", {}).items()):
         if proj.get("status") == "completed":
             continue
-        if proj.get("ignore"):
+        if proj.get("ignore") or proj.get("archived"):
             continue
         last_act = proj.get("last_activity", "")
         if last_act and last_act < inactive_threshold:

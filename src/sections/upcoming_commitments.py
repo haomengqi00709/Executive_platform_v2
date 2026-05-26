@@ -16,6 +16,7 @@ from pathlib import Path
 from src.graph import GraphClient
 from src.ai import AIClient
 from src.modules.commitments_state import load_state, should_show, expire_asked, save_state
+from src.modules.tz import now_local
 
 
 def _save_result(data_dir: Path, result: dict) -> None:
@@ -53,7 +54,7 @@ def run(
     settings = settings or {}
     window_days = int(settings.get("upcoming_commitments_days") or 7)
 
-    today = datetime.now().date()
+    today = now_local(data_dir).date()
     cutoff = today + timedelta(days=window_days)
     today_str = today.strftime("%Y-%m-%d")
     cutoff_str = cutoff.strftime("%Y-%m-%d")

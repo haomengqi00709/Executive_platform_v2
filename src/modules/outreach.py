@@ -157,17 +157,22 @@ def _extract_from_csv(file_bytes: bytes) -> list[dict]:
     try:
         text = file_bytes.decode("utf-8-sig", errors="replace")
         reader = csv.DictReader(io.StringIO(text))
+        _known_keys = {"email", "e-mail", "email address", "name", "first name", "last name",
+                       "company", "organization", "org", "role", "title", "job title"}
         for row in reader:
             normalized = {k.lower().strip(): (v or "").strip() for k, v in row.items() if k}
             email = (normalized.get("email") or normalized.get("e-mail")
                      or normalized.get("email address") or "")
             if not email or "@" not in email:
                 continue
+            # Any column NOT in known_keys becomes free-form context (notes, comments, etc.)
+            extras = [f"{k}: {v}" for k, v in normalized.items() if k not in _known_keys and v]
             contacts.append({
                 "name":    normalized.get("name") or f"{normalized.get('first name','')} {normalized.get('last name','')}".strip(),
                 "email":   email,
                 "company": normalized.get("company") or normalized.get("organization") or normalized.get("org") or "",
                 "role":    normalized.get("role") or normalized.get("title") or normalized.get("job title") or "",
+                "notes":   " | ".join(extras),
             })
     except Exception as e:
         print(f"[Outreach] CSV parse failed: {e}")
@@ -189,16 +194,20 @@ def _extract_from_xlsx(file_bytes: bytes) -> list[dict]:
         if not rows:
             return []
         headers = [str(h or "").lower().strip() for h in rows[0]]
+        _known_keys = {"email", "e-mail", "email address", "name", "first name", "last name",
+                       "company", "organization", "org", "role", "title", "job title"}
         for r in rows[1:]:
             row = dict(zip(headers, [str(v or "").strip() for v in r]))
             email = (row.get("email") or row.get("e-mail") or row.get("email address") or "")
             if not email or "@" not in email:
                 continue
+            extras = [f"{k}: {v}" for k, v in row.items() if k not in _known_keys and v]
             contacts.append({
                 "name":    row.get("name") or f"{row.get('first name','')} {row.get('last name','')}".strip(),
                 "email":   email,
                 "company": row.get("company") or row.get("organization") or "",
                 "role":    row.get("role") or row.get("title") or "",
+                "notes":   " | ".join(extras),
             })
         try:
             os.unlink(tmp_path)
@@ -214,11 +223,21 @@ def _extract_from_xlsx(file_bytes: bytes) -> list[dict]:
 def _generate_draft(ai: AIClient, contact: dict, context_note: str,
                     display_name: str, business_context: str,
                     writing_style: str, signoff: str) -> dict | None:
-    """Generate subject + body for one contact. Returns None on failure."""
-    bc_block = f"Business context:\n{business_context.strip()}\n\n" if business_context.strip() else ""
+    """Generate subject + body for one contact. Returns None on failure.
+
+    business_context already includes the user's Personal Profile, Business Profile,
+    and Market Segments (merged by load_profile_context). Personal Profile is where
+    AI learns the user's name, title, and sign-off preference.
+    """
+    bc_block = f"User profile (personal + business + market):\n{business_context.strip()}\n\n" if business_context.strip() else ""
     style_block = f"Writing style to match:\n{writing_style.strip()}\n\n" if writing_style.strip() else ""
     ctx_block = f"How the user knows this contact:\n{context_note.strip()}\n\n" if context_note.strip() else ""
-    signoff_block = f"\nClose with this sign-off:\n{signoff}\n" if signoff.strip() else ""
+    notes_block = f"Specific notes from past interaction with this contact:\n{contact.get('notes', '')}\n\n" if (contact.get('notes') or '').strip() else ""
+    signoff_block = (
+        f"\nSign-off: use this exact sign-off:\n{signoff}\n"
+        if signoff.strip()
+        else "\nSign-off: use the sign-off implied by the user's Personal Profile above; if none is specified, close with 'Best regards,' on its own line followed by the user's name from the profile.\n"
+    )
 
     prompt = f"""You are drafting a personal outreach email on behalf of {display_name}.
 
@@ -228,10 +247,20 @@ def _generate_draft(ai: AIClient, contact: dict, context_note: str,
   Company: {contact.get('company', '')}
   Role: {contact.get('role', '')}
 
-Write a brief, warm outreach email (3-5 short sentences). Reference the meeting context naturally if provided.
-Mention something specific about their company or role to show this is personalized, not a mass email.
+{notes_block}Write a personalized outreach email with these requirements:
+
+1. STRUCTURE — at least 3 short paragraphs:
+   • Opening: greeting on its own line, then 1-2 sentences referencing the meeting context (or how you know them).
+   • Middle: 1-2 sentences connecting their company/role/notes to what the user offers. If "notes from past interaction" exist, weave them in specifically — that's the most personal hook.
+   • Closing: 1 sentence with a clear next step (a call, a quick chat, a question), then the sign-off.
+
+2. FORMAT — return the body as HTML. Each paragraph wrapped in <p>...</p>. Use <br> only inside a paragraph for the line break between sign-off and signature name. Do NOT use <div>, headers, lists, or styles.
+
+3. TONE — warm but specific. Avoid generic phrases like "great to connect" without a follow-up specific. No marketing jargon.
+
+4. LENGTH — keep total body 60-120 words.
 {signoff_block}
-Return JSON only: {{"subject": "...", "body": "..."}}"""
+Return JSON only: {{"subject": "...", "body": "<p>...</p><p>...</p><p>...</p>"}}"""
 
     try:
         raw = ai.generate(prompt).strip()
@@ -250,13 +279,16 @@ Return JSON only: {{"subject": "...", "body": "..."}}"""
 # ── Main entry ─────────────────────────────────────────────────────────────
 
 def run(graph: GraphClient, ai: AIClient, data_dir: Path, settings: dict,
-        context_note: str = "", folder: str = "", progress=None) -> dict:
+        context_note: str = "", folder: str = "",
+        tag: str = "", recent_hours: int = 0, progress=None) -> dict:
     """
-    Scan OneDrive folder, extract contacts, generate Outlook drafts.
+    Generate Outlook drafts for a batch of contacts. Three modes:
 
-    folder: OneDrive path relative to drive root (e.g. "Conferences/TechConf").
-            If empty, uses settings["outreach_folder"].
-    context_note: brief context to inject into each draft.
+      folder       — scan OneDrive folder for files (cards/csv/xlsx/pdf), extract contacts, draft.
+      tag          — pull contacts from CRM that have this tag, draft.
+      recent_hours — pull contacts from CRM added in the last N hours, draft.
+
+    Defaults to folder mode if none specified. context_note is injected into each draft prompt.
     """
     def log(msg: str):
         print(f"[Outreach] {msg}")
@@ -264,11 +296,73 @@ def run(graph: GraphClient, ai: AIClient, data_dir: Path, settings: dict,
             progress(msg)
 
     data_dir = Path(data_dir)
+    display_name     = settings.get("display_name", "the executive")
+    business_context = load_profile_context(data_dir) if data_dir else ""
+    writing_style    = settings.get("writing_style_note", "")
+    signoff          = settings.get("outreach_default_signoff", "")
+
+    drafts_created = []
+    contacts_skipped = []
+    files_processed = []
+    errors = []
+
+    # ── Mode 1: CRM by tag or recency ─────────────────────────────────
+    if tag or recent_hours:
+        from src.modules.crm import find_contacts_by_tag, find_contacts_added_since
+        crm_contacts = (find_contacts_by_tag(data_dir, tag) if tag
+                        else find_contacts_added_since(data_dir, recent_hours))
+        log(f"CRM lookup ({'tag='+tag if tag else 'recent_hours='+str(recent_hours)}) → {len(crm_contacts)} contacts")
+
+        for contact in crm_contacts:
+            email = (contact.get("email") or "").strip()
+            if not email or "@" not in email:
+                contacts_skipped.append({"reason": "no_email", "contact": contact})
+                continue
+            draft = _generate_draft(ai, contact, context_note,
+                                    display_name, business_context, writing_style, signoff)
+            if not draft:
+                contacts_skipped.append({"reason": "draft_gen_failed", "contact": contact})
+                continue
+            try:
+                gr = graph.create_draft(subject=draft["subject"], body=draft["body"], to=email)
+                drafts_created.append({
+                    "to": email, "name": contact.get("name", ""),
+                    "company": contact.get("company", ""),
+                    "subject": draft["subject"],
+                    "web_link": gr.get("webLink", ""),
+                    "source_file": f"CRM:{tag or 'recent'}",
+                })
+                log(f"  ✅ Draft created: {email}")
+            except Exception as e:
+                errors.append({"contact": email, "error": str(e)})
+
+        result = {
+            "status": "fresh",
+            "last_run": datetime.now(timezone.utc).isoformat(),
+            "mode": "crm",
+            "source": tag or f"recent_{recent_hours}h",
+            "context_note": context_note,
+            "drafts_created": drafts_created,
+            "files_processed": [],
+            "contacts_skipped": contacts_skipped,
+            "errors": errors,
+            "summary": {
+                "drafts": len(drafts_created),
+                "files": 0,
+                "skipped": len(contacts_skipped),
+                "errors": len(errors),
+            },
+        }
+        _save_result(data_dir, result)
+        log(f"Done — {len(drafts_created)} drafts, {len(contacts_skipped)} skipped")
+        return result
+
+    # ── Mode 2: OneDrive folder (original) ─────────────────────────────
     folder = (folder or settings.get("outreach_folder", "")).strip().strip("/")
     if not folder:
         return {
             "status": "not_run",
-            "error": "No folder specified — set outreach_folder in settings or pass folder argument.",
+            "error": "No folder/tag/recent_hours specified.",
             "drafts_created": 0,
             "files_processed": 0,
             "contacts_skipped": 0,
@@ -288,16 +382,6 @@ def run(graph: GraphClient, ai: AIClient, data_dir: Path, settings: dict,
 
     state = _load_state(data_dir)
     processed = state.get("processed_files", {})
-
-    display_name     = settings.get("display_name", "the executive")
-    business_context = load_profile_context(data_dir) if data_dir else ""
-    writing_style    = settings.get("writing_style_note", "")
-    signoff          = settings.get("outreach_default_signoff", "")
-
-    drafts_created = []
-    contacts_skipped = []
-    files_processed = []
-    errors = []
 
     for item in items:
         if item.get("folder"):

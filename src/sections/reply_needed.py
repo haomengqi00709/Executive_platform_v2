@@ -18,6 +18,7 @@ from src.modules.screener import screen_emails
 from src.modules.crm import load_crm
 from src.modules.projects import load_projects
 from src.modules.validator import validate_output
+from src.modules.tz import now_local, today_local_str
 from src.modules.profile import load_profile_context
 
 _SKILL_FILE = Path(__file__).parent.parent / "skills" / "reply_needed" / "skill.md"
@@ -52,7 +53,7 @@ def _find_projects_for_email(
     matched: dict[str, dict] = {}
 
     for p in all_projects:
-        if p.get("ignore") or p.get("priority") == "ignore" or p.get("status") == "completed":
+        if p.get("ignore") or p.get("archived") or p.get("priority") == "ignore" or p.get("status") == "completed":
             continue
         pid = p.get("id", "")
 
@@ -100,7 +101,8 @@ def _build_email_context_block(
         last_contact = contact.get("last_contact", "unknown")
         try:
             from datetime import date
-            delta = (date.today() - date.fromisoformat(last_contact)).days
+            today = date.fromisoformat(today_str)
+            delta = (today - date.fromisoformat(last_contact)).days
             days_ago = f" ({delta} days ago)"
         except Exception:
             days_ago = ""
@@ -190,8 +192,8 @@ def run(
     settings = settings or {}
     display_name = settings.get("display_name", "the executive")
     business_context = load_profile_context(data_dir)
-    date_str = datetime.now().strftime("%A, %B %d, %Y")
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    date_str = now_local(data_dir).strftime("%A, %B %d, %Y")
+    today_str = today_local_str(data_dir)
 
     # ── 1. Skill + user instruction ───────────────────────
     skill_text = _SKILL_FILE.read_text() if _SKILL_FILE.exists() else ""
@@ -204,7 +206,7 @@ def run(
     crm_contacts = crm_data.get("contacts", {})
     ignored_emails: set = {
         email for email, c in crm_contacts.items()
-        if c.get("ignore") or c.get("priority") == "ignore"
+        if c.get("ignore") or c.get("archived") or c.get("priority") == "ignore"
     }
 
     projects_db = load_projects(data_dir)
