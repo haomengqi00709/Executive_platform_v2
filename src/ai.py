@@ -131,9 +131,19 @@ class AIClient:
                         contents=[
                             types.Part.from_uri(file_uri=uploaded.uri, mime_type="video/mp4"),
                             "Transcribe all speech in this video. Label each speaker by name if visible, otherwise 'Speaker 1', 'Speaker 2', etc. Include timestamps. Be complete and accurate.",
-                        ]
+                        ],
+                        # Same fix as transcribe_audio — without this Gemini truncates
+                        # long meetings at the ~8K default output cap.
+                        config=types.GenerateContentConfig(max_output_tokens=65535),
                     )
                     text = response.text
+                    try:
+                        fr = (response.candidates or [None])[0]
+                        finish = getattr(fr, "finish_reason", None) if fr else None
+                        if finish and str(finish).upper().endswith("MAX_TOKENS"):
+                            print(f"[ai.transcribe_video] WARN: hit MAX_TOKENS on {filename} — transcript may be truncated")
+                    except Exception:
+                        pass
                     if text and text.strip():
                         return text
                     if attempt < 2:
