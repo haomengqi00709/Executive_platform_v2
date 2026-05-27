@@ -261,6 +261,28 @@ class GraphClient:
             params = None
         return results[:max_results]
 
+    def get_drafts_since(self, days: int = 14, max_results: int = 100) -> list:
+        """Fetch draft messages modified in the past N days.
+        Used by reply_needed to treat a started-but-unsent draft as 'handled'."""
+        from datetime import datetime, timedelta, timezone
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        params = {
+            "$top":     250,
+            "$orderby": "lastModifiedDateTime desc",
+            "$filter":  f"lastModifiedDateTime ge {since}",
+            "$select":  "id,subject,conversationId,lastModifiedDateTime",
+        }
+        results = []
+        endpoint = f"{BASE}/me/mailFolders/Drafts/messages"
+        while endpoint and len(results) < max_results:
+            r = requests.get(endpoint, headers=self.headers, params=params)
+            r.raise_for_status()
+            data = r.json()
+            results.extend(data.get("value", []))
+            endpoint = data.get("@odata.nextLink")
+            params = None
+        return results[:max_results]
+
     def get_inbox_conv_since(self, days: int = 30, max_results: int = 500) -> list:
         """Inbox messages with conversationId — used for reply-needed detection."""
         from datetime import datetime, timedelta, timezone

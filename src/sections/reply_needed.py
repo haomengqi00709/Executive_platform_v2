@@ -213,9 +213,9 @@ def run(
     all_projects = list(projects_db.get("projects", {}).values())
 
     # ── 3. Fetch inbox ────────────────────────────────────
-    log("Fetching inbox (last 7 days)...")
+    log("Fetching inbox (last 14 days)...")
     try:
-        raw_messages = graph.get_messages_since(days=7, max_results=200)
+        raw_messages = graph.get_messages_since(days=14, max_results=200)
     except Exception as e:
         log(f"Inbox fetch failed: {e}")
         raw_messages = []
@@ -240,16 +240,25 @@ def run(
     # ── 5. Already-replied filter ─────────────────────────
     log("Checking sent folder for already-replied threads...")
     try:
-        sent_msgs = graph.get_sent_messages_since(days=7, max_results=100)
+        sent_msgs = graph.get_sent_messages_since(days=14, max_results=100)
         sent_conv_ids = {m.get("conversationId") for m in sent_msgs if m.get("conversationId")}
     except Exception as e:
         log(f"Sent folder fetch failed: {e}")
         sent_conv_ids = set()
 
-    # Already-replied filter
+    log("Checking drafts folder (user-started but unsent replies)...")
+    try:
+        draft_msgs = graph.get_drafts_since(days=14, max_results=100)
+        draft_conv_ids = {m.get("conversationId") for m in draft_msgs if m.get("conversationId")}
+    except Exception as e:
+        log(f"Drafts folder fetch failed: {e}")
+        draft_conv_ids = set()
+
+    # Already-handled filter: replied (SentItems) OR drafted (Drafts)
+    handled_conv_ids = sent_conv_ids | draft_conv_ids
     not_replied = [
         m for m in visible
-        if m.get("conversationId") not in sent_conv_ids
+        if m.get("conversationId") not in handled_conv_ids
     ]
 
     # Skip emails the user sent to themselves
@@ -365,6 +374,7 @@ def run(
             "suggested_opening": assessment.get("suggested_opening", ""),
             "contact":          contact_summary,
             "projects":         project_summaries,
+            "digested_at":      "",
         })
 
     # ── 9. Validator Agent ────────────────────────────────
@@ -383,6 +393,24 @@ def run(
     # Sort: high → medium → low
     priority_order = {"high": 0, "medium": 1, "low": 2}
     items.sort(key=lambda x: priority_order.get(x.get("priority", "medium"), 1))
+
+    # Preserve digested_at across scans — emails already mentioned in a Teams
+    # digest must keep that marker so they aren't repeated.
+    prior_path = data_dir / "results" / "reply_needed.json"
+    if prior_path.exists():
+        try:
+            prior = json.loads(prior_path.read_text())
+            prior_digested = {
+                it.get("email_id"): it.get("digested_at", "")
+                for it in (prior.get("items") or [])
+                if it.get("email_id") and it.get("digested_at")
+            }
+            for it in items:
+                eid = it.get("email_id")
+                if eid in prior_digested:
+                    it["digested_at"] = prior_digested[eid]
+        except Exception:
+            pass
 
     result = {
         "id":       "reply_needed",

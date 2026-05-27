@@ -41,9 +41,9 @@ def _load_monitor_state(data_dir: Path) -> dict:
     return {
         "last_checked_ts": "",
         "last_digest_ts": "",
+        "last_expiry_warning_date": "",
         "processed_conv_ids": [],
-        "pending_digest": [],
-        "pending_priority_followup": [],
+        "pending_priority_followup": [],   # legacy — kept for bot.py:dismiss_email_followup
         "last_notified_emails": [],
     }
 
@@ -329,13 +329,38 @@ def _build_digest_html(emails: list, since_time_str: str = "") -> str:
 
 # ── Digest timing ─────────────────────────────────────────────────────────
 
-def _should_send_digest(monitor_state: dict, settings: dict) -> bool:
-    """True when digest interval has elapsed, within active hours, and queue is non-empty."""
+def _load_reply_needed(data_dir: Path) -> dict:
+    path = Path(data_dir) / "results" / "reply_needed.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _save_reply_needed(data_dir: Path, data: dict) -> None:
+    """Write reply_needed.json. Atomic via tmp file."""
+    path = Path(data_dir) / "results" / "reply_needed.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    tmp.replace(path)
+
+
+def _undigested_items(data_dir: Path) -> list:
+    data = _load_reply_needed(data_dir)
+    return [it for it in (data.get("items") or []) if not it.get("digested_at")]
+
+
+def _should_send_digest(data_dir: Path, monitor_state: dict, settings: dict) -> bool:
+    """True when digest interval has elapsed, within active hours,
+    and reply_needed.json has at least one item with empty digested_at."""
     interval_h = float(settings.get("email_digest_interval_hours", _DEFAULT_DIGEST_INTERVAL_H))
     if interval_h <= 0:
         return False
 
-    if not monitor_state.get("pending_digest") and not monitor_state.get("pending_priority_followup"):
+    if not _undigested_items(data_dir):
         return False
 
     active = settings.get("email_active_hours") or _DEFAULT_ACTIVE_HOURS
@@ -422,32 +447,34 @@ def _check_replied(followups: list, owner_graph) -> list:
 
 # ── Digest layer ──────────────────────────────────────────────────────────
 
-def _maybe_send_digest(graph, chat_id: str, monitor_state: dict, settings: dict) -> None:
-    """Send digest card if interval has elapsed and there are pending items or unreplied priority emails."""
-    if not _should_send_digest(monitor_state, settings):
+def _reply_needed_to_digest_item(it: dict) -> dict:
+    """Map a reply_needed item into the field shape _build_digest_html expects."""
+    priority = it.get("priority", "medium")
+    return {
+        "_importance":      "priority" if priority == "high" else "review",
+        "_ai_summary":      it.get("reason", ""),
+        "from_name":        it.get("from_name", ""),
+        "subject":          it.get("subject", ""),
+        "receivedDateTime": it.get("received", ""),
+        "_crm_company":     ((it.get("contact") or {}).get("company") or ""),
+        "_email_id":        it.get("email_id", ""),
+    }
+
+
+def _maybe_send_digest(graph, chat_id: str, data_dir: Path, monitor_state: dict, settings: dict) -> None:
+    """Send digest of reply_needed items that haven't been mentioned yet.
+    After sending, stamps digested_at on each item so they're not repeated."""
+    if not _should_send_digest(data_dir, monitor_state, settings):
         return
 
-    pending = list(monitor_state.get("pending_digest") or [])
-    followups = list(monitor_state.get("pending_priority_followup") or [])
-
-    # Convert followup items to digest-compatible format with "unreplied" label
-    followup_items = [
-        {
-            "_importance": "priority",
-            "_ai_summary": f.get("_ai_summary") or f.get("_ai_reason") or "⏰ Awaiting your reply",
-            "from_name": f.get("from_name", ""),
-            "subject": f.get("subject", ""),
-            "receivedDateTime": f.get("pushed_at", ""),
-            "_crm_company": f.get("_crm_company", ""),
-        }
-        for f in followups
-    ]
-
-    all_items = followup_items + pending
-    if not all_items:
+    rn = _load_reply_needed(data_dir)
+    items = rn.get("items") or []
+    pending = [it for it in items if not it.get("digested_at")]
+    if not pending:
         return
 
-    # Compute "since" label from last digest timestamp
+    mapped = [_reply_needed_to_digest_item(it) for it in pending]
+
     since_str = ""
     last_ts = monitor_state.get("last_digest_ts") or ""
     if last_ts:
@@ -458,14 +485,84 @@ def _maybe_send_digest(graph, chat_id: str, monitor_state: dict, settings: dict)
             pass
 
     try:
-        html = _build_digest_html(all_items, since_time_str=since_str)
+        html = _build_digest_html(mapped, since_time_str=since_str)
         graph.send_html_message(chat_id, html)
-        print(f"[EmailMonitor] Digest sent: {len(all_items)} items ({len(followup_items)} unreplied, {len(pending)} new)")
-        monitor_state["pending_digest"] = []
-        monitor_state["last_digest_ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        # pending_priority_followup is intentionally NOT cleared — it persists until replied or 7 days old
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Stamp digested_at on every item we just sent
+        sent_ids = {it.get("email_id") for it in pending if it.get("email_id")}
+        for it in items:
+            if it.get("email_id") in sent_ids:
+                it["digested_at"] = now_iso
+        rn["items"] = items
+        _save_reply_needed(data_dir, rn)
+        monitor_state["last_digest_ts"] = now_iso
+        print(f"[EmailMonitor] Digest sent: {len(pending)} items")
     except Exception as e:
         print(f"[EmailMonitor] Digest send failed: {e}")
+
+
+# ── Expiry warning ────────────────────────────────────────────────────────
+
+def _maybe_send_expiry_warning(graph, chat_id: str, data_dir: Path,
+                                monitor_state: dict, settings: dict) -> None:
+    """Day-before-expiry heads-up: fire once daily at active_end - 2h
+    when reply_needed items are 13-14 days old (will drop off the next scan)."""
+    active = settings.get("email_active_hours") or _DEFAULT_ACTIVE_HOURS
+    target_hour = max(0, int(active[1]) - 2)
+
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(settings.get("timezone", "UTC"))
+        now_local = datetime.now(tz)
+    except Exception:
+        now_local = datetime.now(timezone.utc)
+
+    if now_local.hour != target_hour:
+        return
+
+    today_key = now_local.strftime("%Y-%m-%d")
+    if monitor_state.get("last_expiry_warning_date") == today_key:
+        return
+
+    items = (_load_reply_needed(data_dir).get("items") or [])
+    if not items:
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    expiring: list = []
+    for it in items:
+        received_str = it.get("received", "")
+        if not received_str:
+            continue
+        try:
+            received_dt = datetime.fromisoformat(received_str.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        age_days = (now_utc - received_dt).total_seconds() / 86400.0
+        if 13.0 <= age_days < 14.0:
+            expiring.append(it)
+
+    if not expiring:
+        monitor_state["last_expiry_warning_date"] = today_key
+        return
+
+    lines = ["<p><b>⚠️ 以下邮件明天将自动从待回复列表移除：</b></p>"]
+    for it in expiring[:10]:
+        name = it.get("from_name") or it.get("from_email") or "Unknown"
+        subj = (it.get("subject") or "(no subject)")[:120]
+        received_short = (it.get("received") or "")[:10]
+        lines.append(f"<p>• <b>{name}</b> — \"{subj}\" ({received_short})</p>")
+    if len(expiring) > 10:
+        lines.append(f"<p><i>... 还有 {len(expiring) - 10} 封</i></p>")
+    lines.append("<p><i>如需保留，请回复这些邮件、把它们存入 Outlook 草稿，或告诉我哪封要继续跟进。</i></p>")
+    html = "".join(lines)
+
+    try:
+        graph.send_html_message(chat_id, html)
+        monitor_state["last_expiry_warning_date"] = today_key
+        print(f"[EmailMonitor] Expiry warning sent: {len(expiring)} items")
+    except Exception as e:
+        print(f"[EmailMonitor] Expiry warning send failed: {e}")
 
 
 # ── Main entry point ──────────────────────────────────────────────────────
@@ -539,7 +636,7 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
         )
     except Exception as e:
         print(f"[EmailMonitor] Fetch failed: {e}")
-        _maybe_send_digest(graph, chat_id, monitor_state, settings)
+        _maybe_send_digest(graph, chat_id, data_dir, monitor_state, settings)
         _save_monitor_state(data_dir, monitor_state)
         return
 
@@ -626,6 +723,7 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
             realtime_push = realtime_push.lower() not in ("false", "0", "no")
 
         notified = list(monitor_state.get("last_notified_emails") or [])
+        new_actionable = False
 
         for email_item in triaged:
             importance = email_item.get("_importance", "review")
@@ -635,6 +733,7 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
             if importance == "skip":
                 continue
 
+            new_actionable = True
             summary = {
                 "from": _from_addr(email_item),
                 "subject": email_item.get("subject", ""),
@@ -647,34 +746,11 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
                     _send_adaptive_card(graph, chat_id, card)
                     notified.append(summary)
                     print(f"[EmailMonitor] Priority push: {_from_addr(email_item)} — {email_item.get('subject','')[:60]}")
-                    # Track for follow-up reminders (appears in digest if user hasn't replied)
-                    monitor_state.setdefault("pending_priority_followup", []).append({
-                        "conv_id": conv_id,
-                        "from": _from_addr(email_item),
-                        "from_name": _from_name(email_item),
-                        "subject": email_item.get("subject", ""),
-                        "pushed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        "_crm_company": email_item.get("_crm_company", ""),
-                        "_ai_reason": email_item.get("_ai_reason", ""),
-                        "_ai_summary": email_item.get("_ai_summary", ""),
-                    })
                 except Exception as e:
                     print(f"[EmailMonitor] Card send failed: {e}")
             else:
-                monitor_state.setdefault("pending_digest", []).append({
-                    **summary,
-                    "receivedDateTime": email_item.get("receivedDateTime", ""),
-                    "importance": importance,
-                    "_importance": importance,
-                    "_ai_reason": email_item.get("_ai_reason", ""),
-                    "_ai_summary": email_item.get("_ai_summary", ""),
-                    "_ai_action": email_item.get("_ai_action", ""),
-                    "_crm_company": email_item.get("_crm_company", ""),
-                    "crm_priority": email_item.get("_crm_priority", ""),
-                    "calendar_note": email_item.get("_calendar_note", ""),
-                    "from_name": _from_name(email_item),
-                    "from_email": _from_addr(email_item),
-                })
+                # Non-priority (review) emails surface via reply_needed.json,
+                # which the digest reads. No separate pending_digest queue.
                 notified.append(summary)
 
         if len(processed_ids) > _MAX_PROCESSED_IDS:
@@ -683,7 +759,16 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
         monitor_state["processed_conv_ids"] = list(processed_ids)
         monitor_state["last_notified_emails"] = notified[-20:]
 
+        # Refresh reply_needed.json now so the digest + frontend reflect this batch.
+        if new_actionable:
+            try:
+                from src.sections.reply_needed import run as run_reply_needed
+                run_reply_needed(owner_graph, ai, data_dir, settings)
+            except Exception as e:
+                print(f"[EmailMonitor] reply_needed refresh failed: {e}")
+
     monitor_state["last_checked_ts"] = newest_ts
 
-    _maybe_send_digest(graph, chat_id, monitor_state, settings)
+    _maybe_send_digest(graph, chat_id, data_dir, monitor_state, settings)
+    _maybe_send_expiry_warning(graph, chat_id, data_dir, monitor_state, settings)
     _save_monitor_state(data_dir, monitor_state)
