@@ -583,8 +583,11 @@ def _poll_meeting_prep_all_users():
 def _poll_meeting_recordings_all_users():
     """Every 20 min, scan each user's OneDrive Recordings/ for newly added mp4s.
     Processes at most 3 new recordings per user per cycle (Gemini transcription is slow + expensive).
-    Already-processed mp4s are skipped via wiki/_index.json."""
-    from src.modules.m03_meeting import run as m03_run
+    Already-processed mp4s are skipped via wiki/_index.json.
+    For each newly processed meeting, also pushes a summary card to the user's
+    Audrey 1:1 chat (gated by sched.meeting.summary_enabled, default true)."""
+    from src.modules.m03_meeting import run as m03_run, format_meeting_summary_html
+    from src.modules.schedules import load_schedules
     sessions_dir = auth.DATA_DIR / "_sessions"
     if not sessions_dir.exists():
         return
@@ -602,8 +605,29 @@ def _poll_meeting_recordings_all_users():
             result   = m03_run(graph, ai, _udir(uid), settings=settings,
                                months=6, max_to_process=3)
             n = result.get("processed", 0)
-            if n:
-                print(f"[m03 poll] Processed {n} new recording(s) for {uid}")
+            if not n:
+                continue
+            print(f"[m03 poll] Processed {n} new recording(s) for {uid}")
+
+            # Push summary to Teams unless the user disabled it
+            try:
+                sched = load_schedules(_udir(uid))
+                if not sched.get("meeting", {}).get("summary_enabled", True):
+                    continue
+                bot_uid, chat_id = _find_bot_for_user(uid)
+                if not (bot_uid and chat_id):
+                    print(f"[m03 poll] No bot bound for {uid} — skipping Teams summary")
+                    continue
+                bot_token = auth.get_valid_access_token(bot_uid)
+                bot_graph = GraphClient(bot_token)
+                for rec in result.get("results", []):
+                    if rec.get("status") != "processed":
+                        continue
+                    html = format_meeting_summary_html(rec)
+                    bot_graph.send_html_message(chat_id, html)
+                    print(f"[m03 poll] Teams summary sent: {rec.get('meeting_id','')} — {rec.get('title','')[:50]}")
+            except Exception as ne:
+                print(f"[m03 poll] Teams summary failed for {uid}: {ne}")
         except Exception as e:
             msg = str(e)
             if not any(c in msg for c in ("502", "503", "504", "ConnectionError", "Timeout")):

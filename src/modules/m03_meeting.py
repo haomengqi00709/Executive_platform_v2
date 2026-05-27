@@ -724,6 +724,56 @@ def _generate_followup_draft(record: dict) -> str:
     return "\n".join(lines)
 
 
+def format_meeting_summary_html(record: dict) -> str:
+    """Format a processed meeting record as Teams HTML — sent by the poll loop
+    after m03 finishes a new recording. Includes summary, decisions, action items
+    grouped by owner, plus a link to the saved Outlook draft when available."""
+    import html as _html
+
+    def esc(v) -> str:
+        return _html.escape(str(v or ""), quote=True)
+
+    title    = esc(record.get("title", "(no title)"))
+    date     = esc(record.get("date", ""))
+    summary  = esc((record.get("summary") or "").strip())
+    actions  = record.get("action_items") or []
+    decisions = record.get("decisions") or []
+    draft_link = record.get("followup_draft_link") or ""
+
+    header = f"<b>📝 Meeting Summary — {title}</b>"
+    if date:
+        header += f" · {date}"
+    parts = [f"<p>{header}</p>"]
+
+    if summary:
+        parts.append(f"<p>{summary}</p>")
+
+    if decisions:
+        parts.append("<p><b>🎯 Decisions</b></p>")
+        for d in decisions:
+            parts.append(f"<p>• {esc(d)}</p>")
+
+    if actions:
+        parts.append(f"<p><b>✅ Action Items ({len(actions)})</b></p>")
+        for a in actions:
+            if isinstance(a, dict):
+                owner = esc((a.get("owner") or "").strip())
+                task  = esc((a.get("action") or a.get("task") or "").strip())
+                due   = f" <i>(by {esc(a['due_date'])})</i>" if a.get("due_date") else ""
+                line  = f"• <b>{owner}:</b> {task}{due}" if owner else f"• {task}{due}"
+                parts.append(f"<p>{line}</p>")
+            else:
+                parts.append(f"<p>• {esc(a)}</p>")
+
+    if draft_link:
+        parts.append(
+            f'<p><i>📨 Follow-up draft saved — '
+            f'<a href="{esc(draft_link)}">review in Outlook</a></i></p>'
+        )
+
+    return "".join(parts)
+
+
 def _push_action_items_to_todo(record: dict, graph: GraphClient, own_name_hints: list) -> int:
     own_hints = [h.lower() for h in own_name_hints]
     pushed = 0
