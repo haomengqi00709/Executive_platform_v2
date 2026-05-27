@@ -37,6 +37,22 @@ interface BotStatus {
   peer_email?: string; bot_uid?: string;
 }
 
+interface AuthHealthAccount {
+  label: string;
+  user_id: string;
+  dot: 'green' | 'yellow' | 'red';
+  consecutive_failures: number;
+  last_success_at: string | null;
+  last_failure_at: string | null;
+  broken_since: string | null;
+  classification: { message: string; action: 're-login' | 'contact-admin'; code: number | null } | null;
+}
+
+interface AuthHealth {
+  overall: 'green' | 'yellow' | 'red';
+  accounts: AuthHealthAccount[];
+}
+
 interface DeviceCode {
   user_code: string; verification_url: string; bot_uid: string; expires_in?: number;
 }
@@ -61,6 +77,7 @@ export default function App() {
   const [user,  setUser]  = useState<AuthUser | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [profileConfirmed, setProfileConfirmed] = useState<boolean | null>(null);
+  const [authHealth, setAuthHealth] = useState<AuthHealth | null>(null);
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
@@ -84,6 +101,19 @@ export default function App() {
       .catch(() => setUser(null))
       .finally(() => setAuthLoading(false));
   }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    const poll = () => {
+      fetch('/api/auth/health', { credentials: 'include' })
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (d) setAuthHealth(d); })
+        .catch(() => {});
+    };
+    poll();
+    const t = setInterval(poll, 30000);
+    return () => clearInterval(t);
+  }, [user]);
 
   if (authLoading) return <Spinner />;
 
@@ -159,6 +189,7 @@ export default function App() {
             <span className="text-xs text-executive-muted truncate">{user.username?.split('@')[0]}</span>
           </div>
           <div className="flex items-center gap-1">
+            <HealthDot health={authHealth} onFixClick={() => setPage('settings')} />
             <button
               onClick={() => setTheme(t => t === 'light' ? 'dark' : 'light')}
               className="p-1.5 rounded-md text-executive-muted hover:text-executive-text transition-colors"
@@ -624,6 +655,72 @@ function ErrorBanner({ message }: { message: string }) {
   return (
     <div className="flex items-center gap-2 p-3 bg-rose-500/8 border border-rose-500/20 rounded-xl text-rose-500 text-xs font-mono">
       <AlertCircle size={14} className="shrink-0" />{message}
+    </div>
+  );
+}
+
+function HealthDot({ health, onFixClick }: { health: AuthHealth | null; onFixClick: () => void }) {
+  const [open, setOpen] = useState(false);
+  if (!health) {
+    return <span className="w-2 h-2 rounded-full bg-executive-muted/40 mx-2" title="Loading status…" />;
+  }
+  const color = health.overall === 'red'
+    ? 'bg-rose-500'
+    : health.overall === 'yellow'
+      ? 'bg-amber-400'
+      : 'bg-emerald-500';
+  const ring = health.overall === 'red' ? 'ring-2 ring-rose-500/30 animate-pulse' : '';
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        aria-label="AI assistant status"
+        onMouseEnter={() => setOpen(true)}
+        onMouseLeave={() => setOpen(false)}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
+        onClick={() => { if (health.overall === 'red') onFixClick(); }}
+        className={`w-2.5 h-2.5 rounded-full mx-1.5 ${color} ${ring} ${health.overall === 'red' ? 'cursor-pointer' : 'cursor-default'}`}
+      />
+      {open && (
+        <div className="absolute bottom-full right-0 mb-2 w-72 p-3 rounded-lg bg-executive-card border border-executive-border shadow-lg text-xs z-50">
+          <div className="font-mono uppercase tracking-wider text-executive-muted mb-2">AI Assistant Status</div>
+          {health.accounts.map(acc => (
+            <div key={acc.user_id} className="mb-2 last:mb-0">
+              <div className="flex items-center gap-2">
+                <span className={`w-2 h-2 rounded-full ${
+                  acc.dot === 'red' ? 'bg-rose-500'
+                  : acc.dot === 'yellow' ? 'bg-amber-400'
+                  : 'bg-emerald-500'
+                }`} />
+                <span className="font-medium">{acc.label}</span>
+              </div>
+              {acc.dot === 'red' && acc.classification ? (
+                <div className="mt-1 ml-4 text-executive-muted">
+                  <div>{acc.classification.message}</div>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); onFixClick(); }}
+                    className="mt-1.5 text-executive-accent hover:underline font-medium"
+                  >
+                    {acc.classification.action === 're-login' ? 'Reconnect in Settings →' : 'Contact your IT admin →'}
+                  </button>
+                </div>
+              ) : acc.dot === 'yellow' ? (
+                <div className="mt-1 ml-4 text-executive-muted">
+                  Connection unstable, retrying… ({acc.consecutive_failures} failed attempt{acc.consecutive_failures === 1 ? '' : 's'})
+                </div>
+              ) : acc.last_success_at ? (
+                <div className="mt-1 ml-4 text-executive-muted">
+                  Connected · last sync {new Date(acc.last_success_at).toLocaleTimeString()}
+                </div>
+              ) : (
+                <div className="mt-1 ml-4 text-executive-muted">Connected</div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

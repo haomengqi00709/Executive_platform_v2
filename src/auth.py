@@ -161,6 +161,8 @@ def get_valid_access_token(user_id: str) -> str:
     if datetime.now(timezone.utc) < expiry - timedelta(minutes=5):
         return data["access_token"]
 
+    last_msal_error: dict | None = None
+
     # Try web-app refresh (works for OAuth web-login users)
     if data.get("refresh_token"):
         try:
@@ -175,9 +177,12 @@ def get_valid_access_token(user_id: str) -> str:
                     "username":      data.get("username", ""),
                 }
                 save_user_tokens(user_id, new_data)
+                _record_auth_success(user_id, op="refresh")
                 return new_data["access_token"]
-        except Exception:
-            pass
+            else:
+                last_msal_error = result
+        except Exception as e:
+            last_msal_error = {"error": "exception", "error_description": str(e)}
 
     # Fall back to MSAL cache (works for device-flow accounts like the bot)
     username = data.get("username", "")
@@ -186,7 +191,10 @@ def get_valid_access_token(user_id: str) -> str:
         app     = _build_legacy_app(cache)
         matches = [a for a in app.get_accounts() if a.get("username", "").lower() == username.lower()]
         if matches:
-            result = app.acquire_token_silent(SCOPES_LOCAL, account=matches[0])
+            try:
+                result = app.acquire_token_silent_with_error(SCOPES_LOCAL, account=matches[0])
+            except Exception as e:
+                result = {"error": "exception", "error_description": str(e)}
             if result and "access_token" in result:
                 _save_cache(cache)
                 new_data = {
@@ -196,9 +204,112 @@ def get_valid_access_token(user_id: str) -> str:
                     "username":      username,
                 }
                 save_user_tokens(user_id, new_data)
+                _record_auth_success(user_id, op="silent")
                 return new_data["access_token"]
+            if result and "error" in result:
+                last_msal_error = result
 
+    _record_auth_failure(user_id, last_msal_error)
     raise Exception(f"Could not refresh token for {user_id}")
+
+
+# ── Health state + diagnostic logging ─────────────────────
+# Persists per-user auth health so the frontend can show a status indicator
+# and the notifier can detect healthy→broken transitions. Every refresh attempt
+# also writes one line to .data/.auth_diag.log for after-the-fact debugging.
+
+_DIAG_LOG = DATA_DIR / ".auth_diag.log"
+_BROKEN_THRESHOLD = 4  # consecutive failures before status flips to "broken"
+
+def _health_path(user_id: str) -> Path:
+    return user_data_dir(user_id) / ".auth_health.json"
+
+
+def _load_health(user_id: str) -> dict:
+    p = _health_path(user_id)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            pass
+    return {"status": "healthy", "consecutive_failures": 0, "last_success_at": None,
+            "last_failure_at": None, "last_error": None, "broken_since": None}
+
+
+def _save_health(user_id: str, health: dict):
+    p = _health_path(user_id)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(health, indent=2))
+    os.replace(tmp, p)
+
+
+def _append_diag_log(line: str):
+    try:
+        _DIAG_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(_DIAG_LOG, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _record_auth_success(user_id: str, op: str):
+    now = datetime.now(timezone.utc).isoformat()
+    health = _load_health(user_id)
+    was_broken = health.get("status") == "broken"
+    health.update({
+        "status": "healthy",
+        "consecutive_failures": 0,
+        "last_success_at": now,
+        "broken_since": None,
+    })
+    _save_health(user_id, health)
+    _append_diag_log(f"{now}  user={user_id}  op={op}  result=OK")
+    if was_broken:
+        _append_diag_log(f"{now}  user={user_id}  event=RECOVERED")
+
+
+def _record_auth_failure(user_id: str, msal_error: dict | None):
+    from src.auth_errors import extract_aadsts_code
+    now = datetime.now(timezone.utc).isoformat()
+    code, desc = extract_aadsts_code(msal_error)
+    health = _load_health(user_id)
+    health["consecutive_failures"] = health.get("consecutive_failures", 0) + 1
+    health["last_failure_at"] = now
+    health["last_error"] = {
+        "code": code,
+        "msal_error": (msal_error or {}).get("error"),
+        "description": desc[:500],
+        "correlation_id": (msal_error or {}).get("correlation_id"),
+    }
+    just_broke = False
+    if health["consecutive_failures"] >= _BROKEN_THRESHOLD and health.get("status") != "broken":
+        health["status"] = "broken"
+        health["broken_since"] = now
+        just_broke = True
+    _save_health(user_id, health)
+
+    corr = (msal_error or {}).get("correlation_id", "")
+    msg_short = (desc or "").replace("\n", " ")[:200]
+    _append_diag_log(
+        f"{now}  user={user_id}  op=refresh  result=FAIL  "
+        f"aadsts={code}  consecutive={health['consecutive_failures']}  "
+        f"corr={corr}  msg=\"{msg_short}\""
+    )
+    if just_broke:
+        _append_diag_log(f"{now}  user={user_id}  event=BROKEN  aadsts={code}")
+
+    if health.get("status") == "broken":
+        try:
+            from src.auth_notifier import check_and_notify
+            check_and_notify(user_id)
+        except Exception as e:
+            _append_diag_log(f"{now}  user={user_id}  event=NOTIFY_ERROR  err={e!r}")
+
+
+def get_auth_health(user_id: str) -> dict:
+    """Returns the persisted health record for a user_id (or a default if none exists).
+    Frontend / notifier use this to show status and decide whether to alert."""
+    return _load_health(user_id)
 
 
 # ── Legacy Device Code Flow (local dev) ───────────────────

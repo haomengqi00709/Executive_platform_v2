@@ -624,8 +624,10 @@ def get_bot_status(session: dict = Depends(require_session)):
         bp  = _bot_state_path(bot_uid)
         bs  = json.loads(bp.read_text()) if bp.exists() else {}
         bot_email = (auth.load_user_tokens(bot_uid) or {}).get("username", "")
+        bot_health = auth.get_auth_health(bot_uid)
         return {
             "enabled":      True,
+            "connected":    bot_health.get("status") != "broken",
             "peer_email":   bs.get("peer_email", ""),
             "bot_email":    bot_email,
             "chat_id":      chat_id,
@@ -634,6 +636,7 @@ def get_bot_status(session: dict = Depends(require_session)):
 
     return {
         "enabled":      state.get("enabled", False),
+        "connected":    True,
         "peer_email":   state.get("peer_email", ""),
         "bot_email":    "",
         "chat_id":      state.get("chat_id"),
@@ -767,6 +770,58 @@ def disable_bot(session: dict = Depends(require_session)):
     state["enabled"] = False
     _write_json(path, state)
     return {"ok": True}
+
+
+# ── Auth health (for the AI assistant status indicator) ──
+
+def _account_health_dot(user_id: str, label: str) -> dict:
+    from src.auth_errors import classify_aadsts
+    h = auth.get_auth_health(user_id)
+    status_raw = h.get("status", "healthy")
+    consec = h.get("consecutive_failures", 0)
+    if status_raw == "broken":
+        dot = "red"
+    elif consec > 0:
+        dot = "yellow"
+    else:
+        dot = "green"
+
+    classification = None
+    if status_raw == "broken" and h.get("last_error"):
+        err = h["last_error"]
+        c = classify_aadsts(err.get("code"), err.get("description") or "")
+        classification = {
+            "message": c["message"],
+            "action": c["action"],
+            "code": c.get("code"),
+        }
+
+    return {
+        "label":               label,
+        "user_id":             user_id,
+        "dot":                 dot,
+        "consecutive_failures": consec,
+        "last_success_at":     h.get("last_success_at"),
+        "last_failure_at":     h.get("last_failure_at"),
+        "broken_since":        h.get("broken_since"),
+        "classification":      classification,
+    }
+
+
+@app.get("/api/auth/health")
+def get_auth_health_endpoint(session: dict = Depends(require_session)):
+    uid = session["user_id"]
+    accounts = [_account_health_dot(uid, "Your account")]
+
+    bot_uid, _ = _find_bot_for_user(uid)
+    if bot_uid:
+        bot_email = (auth.load_user_tokens(bot_uid) or {}).get("username", "")
+        accounts.append(_account_health_dot(bot_uid, f"AI assistant ({bot_email})" if bot_email else "AI assistant"))
+
+    rank = {"green": 0, "yellow": 1, "red": 2}
+    overall = max((a["dot"] for a in accounts), key=lambda d: rank.get(d, 0))
+
+    return {"overall": overall, "accounts": accounts}
 
 
 # ── Graph test endpoint ───────────────────────────────────
@@ -1889,6 +1944,7 @@ def create_crm_contact(body: dict, session: dict = Depends(require_session)):
         "role":          body.get("role", ""),
         "phone":         body.get("phone", ""),
         "linkedin":      body.get("linkedin", ""),
+        "website":       body.get("website", ""),
         "status":        body.get("status", "other"),
         "priority":      body.get("priority", "medium"),
         "summary":       body.get("summary", ""),
