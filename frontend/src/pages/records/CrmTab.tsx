@@ -223,13 +223,14 @@ export default function CrmTab() {
                   {expandedEmail === c.email ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                 </span>
                 <div className="flex-1 min-w-0 grid grid-cols-12 gap-3 items-center">
-                  <div className="col-span-4 min-w-0">
+                  <div className="col-span-3 min-w-0">
                     <div className="font-medium text-executive-text text-sm truncate">{c.name || '—'}</div>
-                    <div className="text-xs text-executive-muted truncate">
-                      {c.email}{c.company && <> · {c.company}</>}
-                    </div>
+                    <div className="text-xs text-executive-muted/70 truncate">{c.email}</div>
                   </div>
-                  <div className="col-span-2">
+                  <div className="col-span-2 min-w-0 text-xs text-executive-muted truncate">
+                    {c.company || '—'}
+                  </div>
+                  <div className="col-span-1">
                     <span className={`text-xs px-2 py-1 rounded-md ${STATUS_COLOR[c.status || 'other'] ?? STATUS_COLOR.other}`}>
                       {c.status || 'other'}
                     </span>
