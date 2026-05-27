@@ -230,21 +230,28 @@ def _attendees_from_call_records(rec: dict, app_token: str) -> list[dict]:
 
 
 def _attendees_from_calendar(rec: dict, graph: GraphClient) -> list[dict]:
-    name = rec.get("name", "")
-    ts_match = re.search(r"(\d{8})[_\s](\d{6})", name)
+    # OneDrive's createdDateTime is always UTC, which is what we need to query
+    # /me/calendarView. The Teams-generated filename also embeds a timestamp,
+    # but it's the USER'S LOCAL time (e.g. "20260527_071147" for a 10:11 EDT
+    # meeting recorded from a machine reporting time as 07:11 PDT). Parsing
+    # that as UTC threw the calendar search window off by several hours and
+    # missed the actual event — so createdDateTime takes priority and the
+    # filename is only a fallback when OneDrive metadata is missing.
     meeting_dt = None
-    if ts_match:
+    created = rec.get("createdDateTime") or (rec.get("remoteItem") or {}).get("createdDateTime")
+    if created:
         try:
-            meeting_dt = datetime.strptime(
-                ts_match.group(1) + ts_match.group(2), "%Y%m%d%H%M%S"
-            ).replace(tzinfo=timezone.utc)
+            meeting_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
         except ValueError:
             pass
     if not meeting_dt:
-        created = rec.get("createdDateTime") or (rec.get("remoteItem") or {}).get("createdDateTime")
-        if created:
+        name = rec.get("name", "")
+        ts_match = re.search(r"(\d{8})[_\s](\d{6})", name)
+        if ts_match:
             try:
-                meeting_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                meeting_dt = datetime.strptime(
+                    ts_match.group(1) + ts_match.group(2), "%Y%m%d%H%M%S"
+                ).replace(tzinfo=timezone.utc)
             except ValueError:
                 pass
     if not meeting_dt:
@@ -537,14 +544,10 @@ def _extract_audio_and_transcribe(
             return None
         audio_bytes = open(mp3_tmp.name, "rb").read()
         size_mb = len(audio_bytes) / 1024 / 1024
-        _log(f"  [ffmpeg] Audio: {size_mb:.1f} MB — transcribing...")
 
-        if size_mb <= 15:
-            text = ai.transcribe_audio(audio_bytes, filename=filename.replace(".mp4", ".mp3"))
-            return text if text and text.strip() else None
-
-        # Large file: chunk into 10-minute segments
-        _log(f"  [ffmpeg] Large audio — chunking...")
+        # Probe duration up-front: Gemini's output cap (~65K tokens) silently
+        # truncates very long meetings even when the input audio fits, so we
+        # chunk by duration as well as by size.
         probe = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", mp3_tmp.name],
             capture_output=True, text=True, timeout=30,
@@ -553,6 +556,14 @@ def _extract_audio_and_transcribe(
             duration = float(json.loads(probe.stdout)["streams"][0]["duration"])
         except Exception:
             duration = size_mb * 60
+        _log(f"  [ffmpeg] Audio: {size_mb:.1f} MB, {int(duration//60)}m{int(duration%60)}s — transcribing...")
+
+        if size_mb <= 15 and duration <= 1800:  # 30 min cutoff for single-call
+            text = ai.transcribe_audio(audio_bytes, filename=filename.replace(".mp4", ".mp3"))
+            return text if text and text.strip() else None
+
+        # Large file or long meeting: chunk into 10-minute segments
+        _log(f"  [ffmpeg] Chunking ({size_mb:.1f}MB / {int(duration//60)}min — exceeds single-call safe range)...")
 
         chunks = []
         start, idx = 0, 0

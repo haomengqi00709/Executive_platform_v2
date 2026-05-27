@@ -82,9 +82,22 @@ class AIClient:
                         contents=[
                             types.Part.from_uri(file_uri=uploaded.uri, mime_type="audio/mpeg"),
                             "Transcribe all speech in this audio. Label each speaker as 'Speaker 1', 'Speaker 2', etc. Include timestamps. Be complete and accurate.",
-                        ]
+                        ],
+                        # Long meetings can easily exceed Gemini's default ~8K output cap;
+                        # 65535 is the model max. Without this the transcript gets silently
+                        # cut off and only the early portion survives.
+                        config=types.GenerateContentConfig(max_output_tokens=65535),
                     )
                     text = response.text
+                    # If the model hit the output limit we still got partial text — log it
+                    # so we can spot truncated meetings in the operational logs.
+                    try:
+                        fr = (response.candidates or [None])[0]
+                        finish = getattr(fr, "finish_reason", None) if fr else None
+                        if finish and str(finish).upper().endswith("MAX_TOKENS"):
+                            print(f"[ai.transcribe_audio] WARN: hit MAX_TOKENS on {filename} — transcript may be truncated")
+                    except Exception:
+                        pass
                     if text and text.strip():
                         return text
                     if attempt < 2:
