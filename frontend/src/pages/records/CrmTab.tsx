@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   Loader2, Search, ChevronDown, ChevronRight, Plus, EyeOff, Save, X, Star,
-  Phone, Linkedin, Mail, Building2, Briefcase, Archive, GitMerge, RefreshCw, Upload,
+  Phone, Linkedin, Mail, Building2, Briefcase, Archive, GitMerge, RefreshCw, Upload, Globe,
 } from 'lucide-react';
 import { getCrm, patchCrmContact, createCrmContact, relativeTime, archiveRecord, scanCrm } from '../../lib/api';
 import type { CrmContact } from '../../lib/api';
@@ -10,6 +10,14 @@ import BulkUploadModal from './BulkUploadModal';
 
 const STATUS_OPTIONS = ['client', 'prospect', 'partner', 'investor', 'vendor', 'internal', 'other'];
 const PRIORITY_OPTIONS = ['high', 'medium', 'low', 'ignore'];
+
+const SORT_OPTIONS: { value: string; label: string }[] = [
+  { value: 'last_contact_desc', label: 'Last contact ↓' },
+  { value: 'name_asc',          label: 'Name A→Z' },
+  { value: 'threads_desc',      label: 'Threads ↓' },
+  { value: 'company_asc',       label: 'Company A→Z' },
+  { value: 'status_asc',        label: 'Status A→Z' },
+];
 
 const STATUS_COLOR: Record<string, string> = {
   client:   'bg-emerald-400/15 text-emerald-300',
@@ -25,6 +33,7 @@ export default function CrmTab() {
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('all');
+  const [sortBy, setSortBy] = useState<string>('last_contact_desc');
   const [showIgnored, setShowIgnored] = useState(false);
   const [expandedEmail, setExpandedEmail] = useState<string | null>(null);
   const [savingEmail, setSavingEmail] = useState<string | null>(null);
@@ -95,7 +104,7 @@ export default function CrmTab() {
   };
 
   const visible = useMemo(() => {
-    return contacts.filter(c => {
+    const filtered = contacts.filter(c => {
       if (!showIgnored && c.ignore) return false;
       if (statusFilter !== 'all' && (c.status || 'other') !== statusFilter) return false;
       if (search.trim()) {
@@ -108,7 +117,28 @@ export default function CrmTab() {
       }
       return true;
     });
-  }, [contacts, search, statusFilter, showIgnored]);
+    const sorted = [...filtered];
+    const txt = (v: unknown) => (v ?? '').toString().toLowerCase();
+    switch (sortBy) {
+      case 'name_asc':
+        sorted.sort((a, b) => txt(a.name || a.email).localeCompare(txt(b.name || b.email)));
+        break;
+      case 'threads_desc':
+        sorted.sort((a, b) => (b.thread_count ?? 0) - (a.thread_count ?? 0));
+        break;
+      case 'company_asc':
+        sorted.sort((a, b) => txt(a.company).localeCompare(txt(b.company)));
+        break;
+      case 'status_asc':
+        sorted.sort((a, b) => txt(a.status || 'other').localeCompare(txt(b.status || 'other')));
+        break;
+      case 'last_contact_desc':
+      default:
+        sorted.sort((a, b) => txt(b.last_contact).localeCompare(txt(a.last_contact)));
+        break;
+    }
+    return sorted;
+  }, [contacts, search, statusFilter, showIgnored, sortBy]);
 
   return (
     <div className="space-y-4">
@@ -136,6 +166,14 @@ export default function CrmTab() {
           >
             <option value="all">All status</option>
             {STATUS_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+          <select
+            value={sortBy}
+            onChange={e => setSortBy(e.target.value)}
+            title="Sort contacts"
+            className="px-2 py-1.5 text-xs bg-executive-bg border border-executive-border rounded-lg focus:outline-none focus:border-executive-accent/60"
+          >
+            {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
           </select>
           <label className="flex items-center gap-1.5 text-xs text-executive-muted">
             <input
@@ -290,6 +328,7 @@ function ContactDetail({
         <Field label="Role" icon={<Briefcase size={11} />} value={draft.role || ''} onChange={v => setDraft(d => ({ ...d, role: v }))} />
         <Field label="Phone" icon={<Phone size={11} />} value={draft.phone || ''} onChange={v => setDraft(d => ({ ...d, phone: v }))} />
         <Field label="LinkedIn" icon={<Linkedin size={11} />} value={draft.linkedin || ''} onChange={v => setDraft(d => ({ ...d, linkedin: v }))} />
+        <Field label="Website" icon={<Globe size={11} />} value={draft.website || ''} onChange={v => setDraft(d => ({ ...d, website: v }))} />
         <div>
           <Label>Status</Label>
           <select
@@ -436,6 +475,7 @@ function NewContactModal({
           <Field label="Role" value={form.role || ''} onChange={v => setForm(f => ({ ...f, role: v }))} />
           <Field label="Phone" value={form.phone || ''} onChange={v => setForm(f => ({ ...f, phone: v }))} />
           <Field label="LinkedIn" value={form.linkedin || ''} onChange={v => setForm(f => ({ ...f, linkedin: v }))} />
+          <Field label="Website" value={form.website || ''} onChange={v => setForm(f => ({ ...f, website: v }))} />
           <div>
             <Label>Status</Label>
             <select

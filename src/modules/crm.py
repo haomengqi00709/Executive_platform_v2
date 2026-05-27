@@ -73,6 +73,7 @@ def _enrich_contact(
         "role":          "",
         "phone":         "",
         "linkedin":      "",
+        "website":       "",
         "status":        "other",
         "summary":       "",
         "writing_style": "",
@@ -103,12 +104,13 @@ def _enrich_contact(
     prompt = (
         f"Analyze these emails from {base.get('name') or addr} and extract structured info.\n\n"
         f"EMAILS RECEIVED FROM THIS CONTACT:\n{snippets}{sent_block}{seg_block}\n\n"
-        f"Pay close attention to email signatures for name, title, phone, and LinkedIn.\n\n"
+        f"Pay close attention to email signatures for name, title, phone, LinkedIn, and company website.\n\n"
         f"Reply ONLY with a JSON object with exactly these keys:\n"
         f"  company: string (from signature or email domain)\n"
         f"  role: string (job title from signature, or empty string)\n"
         f"  phone: string (phone from signature, or empty string)\n"
         f"  linkedin: string (LinkedIn URL from signature, or empty string)\n"
+        f"  website: string (company website URL from signature, or empty string)\n"
         f"  status: one of: client, prospect, partner, investor, vendor, internal, other\n"
         f"    (investor = stakeholders / capital providers / board members; "
         f"internal = your own company's employees & contractors)\n"
@@ -134,6 +136,7 @@ def _enrich_contact(
                 "role":          parsed.get("role", ""),
                 "phone":         parsed.get("phone", ""),
                 "linkedin":      parsed.get("linkedin", ""),
+                "website":       parsed.get("website", ""),
                 "status":        parsed.get("status", "other"),
                 "summary":       parsed.get("summary", ""),
                 "writing_style": parsed.get("writing_style", ""),
@@ -219,7 +222,7 @@ def add_contacts_bulk(data_dir: Path, raw_contacts: list, source: str,
             if new_note:
                 prior = existing.get("notes", "")
                 existing["notes"] = f"{prior}\n[{today}] {new_note}".strip() if prior else f"[{today}] {new_note}"
-            for f in ("name", "company", "role", "phone", "linkedin"):
+            for f in ("name", "company", "role", "phone", "linkedin", "website"):
                 if raw.get(f) and not existing.get(f):
                     existing[f] = raw[f]
             existing.setdefault("source", existing.get("source") or source)
@@ -235,6 +238,7 @@ def add_contacts_bulk(data_dir: Path, raw_contacts: list, source: str,
                 "role":        (raw.get("role") or "").strip(),
                 "phone":       (raw.get("phone") or "").strip(),
                 "linkedin":    (raw.get("linkedin") or "").strip(),
+                "website":     (raw.get("website") or "").strip(),
                 "notes":       f"[{today}] {note}" if note else "",
                 "source":      source,
                 "tags":        list(tags),
@@ -428,7 +432,7 @@ def build_crm(
 
         # Preserve manually-set fields from previous scan
         old = old_contacts.get(addr, {})
-        for field in ("priority", "writing_style", "phone", "linkedin", "ignore"):
+        for field in ("priority", "writing_style", "phone", "linkedin", "website", "ignore"):
             if old.get(field) and not enriched.get(field):
                 enriched[field] = old[field]
         if old.get("priority"):
@@ -587,7 +591,7 @@ def refresh_crm(
                 "email":        addr,
                 "name":         activity["name"],
                 "company":      _guess_company(addr),
-                "role":         "", "phone": "", "linkedin": "",
+                "role":         "", "phone": "", "linkedin": "", "website": "",
                 "status":       "other", "summary": "", "writing_style": "",
                 "thread_count": activity["count"],
                 "last_contact": activity["last"],

@@ -10,6 +10,7 @@ import {
   SECTIONS, CATEGORY_ORDER, CATEGORY_LABEL, CATEGORY_ACCENT, sectionsByCategory,
 } from '../../lib/sections';
 import type { SectionDef } from '../../lib/sections';
+import { useActivity } from '../../components/ActivityDrawer';
 
 // Sections that have no instruction.md / are not customisable
 const NO_CUSTOMIZE = new Set([
@@ -27,6 +28,7 @@ export default function CustomizeTab({ initialSectionId, onClearInitial }: Props
   const [loading, setLoading] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [running, setRunning] = useState<Record<string, boolean>>({});
+  const activity = useActivity();
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -56,6 +58,7 @@ export default function CustomizeTab({ initialSectionId, onClearInitial }: Props
 
   const handleRun = async (sid: string) => {
     setRunning(r => ({ ...r, [sid]: true }));
+    activity.start(sid);
     try {
       await runSection(sid);
     } finally {

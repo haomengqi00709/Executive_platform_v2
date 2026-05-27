@@ -209,6 +209,7 @@ export interface CrmContact {
   role?: string;
   phone?: string;
   linkedin?: string;
+  website?: string;
   status?: string;          // client / prospect / partner / investor / vendor / internal / other
   priority?: string;        // high / medium / low / ignore
   summary?: string;
