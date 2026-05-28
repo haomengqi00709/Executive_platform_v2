@@ -12,6 +12,7 @@ from src.ai import AIClient
 from src.graph import GraphClient
 from src.modules.validator import validate_output
 from src.modules.profile import load_profile_context
+from src.modules.url_utils import resolve_source_url
 
 _SKILLS_DIR = Path(__file__).parent.parent / "skills" / "company_intelligence"
 _RESULT_ID = "company_intelligence"
@@ -182,6 +183,26 @@ Content:
         return []
 
 
+def _resolve_urls(items: list[dict], log) -> list[dict]:
+    """Replace each item's source_url with the resolved real URL.
+
+    Gemini's grounding output is short-lived and often polluted; resolving here
+    at scan time captures the permanent destination before the redirect dies.
+    """
+    counts = {"resolved": 0, "kept": 0, "fallback": 0, "empty": 0}
+    for item in items:
+        final, status = resolve_source_url(
+            item.get("source_url", ""),
+            headline=item.get("headline", ""),
+            source=item.get("source", ""),
+        )
+        item["source_url"] = final
+        counts[status] = counts.get(status, 0) + 1
+    log(f"URLs: {counts['resolved']} resolved · {counts['kept']} kept · "
+        f"{counts['fallback']} fallback · {counts['empty']} empty")
+    return items
+
+
 def _normalise(items: list[dict]) -> list[dict]:
     valid_signal_types = {"executive_statement", "announcement", "leadership", "funding", "M&A", "other"}
     out = []
@@ -349,6 +370,7 @@ Return ONLY a JSON array — no markdown, no preamble. Skip companies with no so
 
     items = _normalise(all_items)
     _p(f"{len(items)} valid items before dedup")
+    items = _resolve_urls(items, _p)
 
     items, seen = _dedup(items, seen)
     _p(f"{len(items)} new items after 7-day dedup")
