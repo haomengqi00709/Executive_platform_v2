@@ -691,7 +691,8 @@ def reply(
             web_link = result.get("webLink", "")
             nxt = f"\n\nNext draft ready: '{next_draft.get('subject')}'" if next_draft else ""
             if web_link:
-                return f"✅ Draft saved — <a href='{web_link}'>Open in Outlook to review and send</a>{nxt}"
+                from src.modules.links import wrap_draft_link
+                return f"✅ Draft saved — <a href='{wrap_draft_link(web_link)}'>Open in Outlook to review and send</a>{nxt}"
             return f"✅ Draft saved to Outlook Drafts: '{draft.get('subject')}'{nxt}"
         except Exception as e:
             return f"Error saving draft: {e}"
@@ -973,7 +974,8 @@ def reply(
     # Append Outlook draft link if create_reply_draft saved one this turn
     web_link = state.pop("_last_draft_web_link", None)
     if web_link:
-        final_text += f"\n\n<a href='{web_link}'>📬 Open draft in Outlook</a>"
+        from src.modules.links import wrap_draft_link
+        final_text += f"\n\n<a href='{wrap_draft_link(web_link)}'>📬 Open draft in Outlook</a>"
 
     _save_turn(db_path, text, final_text)
     return final_text, state

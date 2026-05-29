@@ -3807,8 +3807,35 @@ def redirect_to_draft(url: str = ""):
   var iframe = document.getElementById("launcher");
   var itemid = {json.dumps(itemid)};
   var webUrl = {json.dumps(url)};
+  // iOS Safari blocks iframe-triggered custom schemes for anti-phishing;
+  // we have to use top-level navigation (window.location) instead, which
+  // limits us to one scheme attempt before falling back to web.
+  var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
 
   function launch(scheme) {{ try {{ iframe.src = scheme; }} catch (e) {{}} }}
+
+  // iOS path: iOS Safari only reliably triggers custom schemes via
+  // top-level navigation, but a top-level nav to an unregistered scheme
+  // shows a "Cannot Open Page" error and destroys our JS context. So we
+  // *probe* with iframe first (silent failure if unsupported — Outlook iOS
+  // might happen to accept it via the iframe path even though Mac doesn't),
+  // then top-level-navigate to the known-good drafts scheme as fallback,
+  // then web.
+  if (isIOS) {{
+    if (itemid) {{
+      launch("ms-outlook://emails/" + encodeURIComponent(itemid));
+    }}
+    setTimeout(function () {{
+      if (document.hidden) return;
+      // Known-good fallback — Outlook iOS always accepts this.
+      window.location.href = "ms-outlook://drafts";
+      setTimeout(function () {{
+        if (document.hidden) return;
+        window.location.replace(webUrl);
+      }}, 1500);
+    }}, 400);
+    /* don't run the desktop iframe sequence below */
+  }} else {{
 
   // Walk through a list of candidate Outlook URL schemes. The first one the
   // OS recognises hands off to the Outlook app and backgrounds this page;
@@ -3823,11 +3850,21 @@ def redirect_to_draft(url: str = ""):
   var candidates = [];
   if (itemid) {{
     var enc = encodeURIComponent(itemid);
-    candidates.push("ms-outlook://emails/"   + enc);
-    candidates.push("ms-outlook://message/"  + enc);
-    candidates.push("ms-outlook://item/"     + enc);
-    candidates.push("ms-outlook://mail/"     + enc);
-    candidates.push("ms-outlook://drafts/"   + enc);
+    // Classic Microsoft Outlook URL handler — pre-Acompli, designed
+    // specifically for "open this item in its own popup window".
+    candidates.push("outlook:"        + enc);
+    candidates.push("outlook://"      + enc);
+    candidates.push("outlook://open/" + enc);
+    // ms-outlook scheme variants — undocumented per-item endpoints.
+    candidates.push("ms-outlook://emails/"  + enc);
+    candidates.push("ms-outlook://email/"   + enc);
+    candidates.push("ms-outlook://message/" + enc);
+    candidates.push("ms-outlook://item/"    + enc);
+    candidates.push("ms-outlook://mail/"    + enc);
+    candidates.push("ms-outlook://drafts/"  + enc);
+    candidates.push("ms-outlook://show?id="    + enc);
+    candidates.push("ms-outlook://open?id="    + enc);
+    candidates.push("ms-outlook://view?id="    + enc);
     candidates.push("ms-outlook://compose?id=" + enc);
   }}
   candidates.push("ms-outlook://drafts");           // safe fallback — opens folder
@@ -3844,6 +3881,7 @@ def redirect_to_draft(url: str = ""):
     setTimeout(next, 300);
   }}
   next();
+  }} /* end !isIOS desktop branch */
 </script>
 </body></html>"""
     from fastapi.responses import HTMLResponse

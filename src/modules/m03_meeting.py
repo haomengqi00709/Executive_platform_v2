@@ -777,9 +777,10 @@ def format_meeting_summary_html(record: dict) -> str:
                 parts.append(f"<p>• {esc(a)}</p>")
 
     if draft_link:
+        from src.modules.links import wrap_draft_link
         parts.append(
             f'<p><i>📨 Follow-up draft saved — '
-            f'<a href="{esc(draft_link)}">review in Outlook</a></i></p>'
+            f'<a href="{esc(wrap_draft_link(draft_link))}">review in Outlook</a></i></p>'
         )
 
     return "".join(parts)
