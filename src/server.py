@@ -963,11 +963,17 @@ def admin_unbind_bot(bot_uid: str, session: dict = Depends(require_session)):
         raise HTTPException(404, "Bot not found")
     bs = json.loads(bp.read_text())
     prev_owner = bs.get("owner_uid")
-    bs.update({"owner_uid": None, "peer_email": None, "chat_id": None, "last_seen_ts": None})
+    bs.update({
+        "enabled":      False,
+        "owner_uid":    None,
+        "peer_email":   None,
+        "chat_id":      None,
+        "last_seen_ts": None,
+    })
     _write_json(bp, bs)
     if prev_owner:
         _user_bot_link_path(prev_owner).unlink(missing_ok=True)
-    return {"ok": True, "bot_uid": bot_uid, "message": "Bot unbound successfully"}
+    return {"ok": True, "bot_uid": bot_uid, "message": "Bot unbound and disabled"}
 
 
 @app.get("/api/test/graph")
