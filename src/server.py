@@ -3798,10 +3798,16 @@ _OUTLOOK_HOST_ALLOWLIST = (
 
 
 @app.get("/r/draft")
-def redirect_to_draft(url: str = ""):
+def redirect_to_draft(url: str = "", request: Request = None):
     """Public mobile-friendly redirector for Outlook draft webLinks.
     Whitelists Outlook hosts so the endpoint can't be abused as an open
     redirect (phishing) — anything else returns 400.
+
+    Mobile gets an HTTP 302 straight to ms-outlook://drafts so there's no
+    HTML page to render — the browser hands the scheme to the OS instantly,
+    Outlook app opens, no "Opening Outlook…" flash. Desktop still gets the
+    iframe-based HTML page since it needs the multi-scheme fallback chain
+    and a graceful web fallback when Outlook desktop isn't installed.
 
     JS strategy on the returned page:
       1. Feed ms-outlook://emails/<itemid> to a hidden iframe (undocumented
@@ -3829,6 +3835,15 @@ def redirect_to_draft(url: str = ""):
     host = (parsed.hostname or "").lower()
     if not any(host == h or host.endswith("." + h) for h in _OUTLOOK_HOST_ALLOWLIST):
         raise HTTPException(400, f"Host '{host}' not in Outlook allowlist")
+
+    # Mobile: 302 straight to the OS-handled scheme. No HTML, no "Opening
+    # Outlook…" flash — the browser hands the scheme off to Outlook the
+    # instant it sees the response header.
+    ua = (request.headers.get("user-agent", "") if request else "").lower()
+    is_mobile = ("iphone" in ua) or ("ipad" in ua) or ("ipod" in ua) or \
+                ("android" in ua and "mobile" in ua)
+    if is_mobile:
+        return RedirectResponse(url="ms-outlook://drafts", status_code=302)
 
     # Try to extract the draft itemid from the webLink for the experimental
     # per-item deep link. webLink format is typically
