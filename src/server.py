@@ -848,6 +848,54 @@ def get_auth_health_endpoint(session: dict = Depends(require_session)):
     return {"overall": overall, "accounts": accounts}
 
 
+def _tail_file(path: Path, lines: int) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        with open(path) as f:
+            all_lines = f.readlines()
+        return [l.rstrip("\n") for l in all_lines[-lines:]]
+    except Exception as e:
+        return [f"(read failed: {e})"]
+
+
+@app.get("/api/admin/diag/{user_id}")
+def admin_user_diag(user_id: str, lines: int = 200, session: dict = Depends(require_session)):
+    """Returns everything we know about a single user's auth state — health
+    record, token expiry summary, last N lines of diag log, last N dead-letter
+    entries. Use when a user reports their AI assistant is offline."""
+    lines = max(1, min(lines, 2000))
+
+    health = auth.get_auth_health(user_id)
+
+    tokens = auth.load_user_tokens(user_id) or {}
+    token_summary = {
+        "username":          tokens.get("username", ""),
+        "has_refresh_token": bool(tokens.get("refresh_token")),
+        "expiry":            tokens.get("expiry"),
+    }
+
+    bot_state_path = auth.DATA_DIR / user_id / "teams_bot.json"
+    bot_state = None
+    if bot_state_path.exists():
+        try:
+            bot_state = json.loads(bot_state_path.read_text())
+        except Exception:
+            pass
+
+    diag_path = auth.DATA_DIR / user_id / ".auth_diag.log"
+    deadletter_path = auth.DATA_DIR / user_id / ".auth_notifier_deadletter.log"
+
+    return {
+        "user_id":          user_id,
+        "health":           health,
+        "token":            token_summary,
+        "bot_state":        bot_state,
+        "diag_log_tail":    _tail_file(diag_path, lines),
+        "deadletter_tail":  _tail_file(deadletter_path, min(lines, 100)),
+    }
+
+
 # ── Graph test endpoint ───────────────────────────────────
 
 @app.get("/api/admin/bot-bindings")

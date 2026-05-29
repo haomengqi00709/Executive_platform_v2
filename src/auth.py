@@ -216,13 +216,18 @@ def get_valid_access_token(user_id: str) -> str:
 # ── Health state + diagnostic logging ─────────────────────
 # Persists per-user auth health so the frontend can show a status indicator
 # and the notifier can detect healthy→broken transitions. Every refresh attempt
-# also writes one line to .data/.auth_diag.log for after-the-fact debugging.
+# also writes one line to .data/{user_id}/.auth_diag.log for after-the-fact
+# debugging. Per-user files (not a global file) so we can pull one customer's
+# history in isolation via /api/admin/diag/{user_id}.
 
-_DIAG_LOG = DATA_DIR / ".auth_diag.log"
 _BROKEN_THRESHOLD = 4  # consecutive failures before status flips to "broken"
 
 def _health_path(user_id: str) -> Path:
     return user_data_dir(user_id) / ".auth_health.json"
+
+
+def _diag_log_path(user_id: str) -> Path:
+    return user_data_dir(user_id) / ".auth_diag.log"
 
 
 def _load_health(user_id: str) -> dict:
@@ -243,10 +248,11 @@ def _save_health(user_id: str, health: dict):
     os.replace(tmp, p)
 
 
-def _append_diag_log(line: str):
+def _append_diag_log(user_id: str, line: str):
     try:
-        _DIAG_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with open(_DIAG_LOG, "a") as f:
+        path = _diag_log_path(user_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
             f.write(line + "\n")
     except Exception:
         pass
@@ -269,9 +275,9 @@ def _record_auth_success(user_id: str, op: str):
     if was_broken:
         health["notifications"] = {}
     _save_health(user_id, health)
-    _append_diag_log(f"{now}  user={user_id}  op={op}  result=OK")
+    _append_diag_log(user_id, f"{now}  op={op}  result=OK")
     if was_broken:
-        _append_diag_log(f"{now}  user={user_id}  event=RECOVERED")
+        _append_diag_log(user_id, f"{now}  event=RECOVERED")
 
 
 def _record_auth_failure(user_id: str, msal_error: dict | None):
@@ -297,19 +303,20 @@ def _record_auth_failure(user_id: str, msal_error: dict | None):
     corr = (msal_error or {}).get("correlation_id", "")
     msg_short = (desc or "").replace("\n", " ")[:200]
     _append_diag_log(
-        f"{now}  user={user_id}  op=refresh  result=FAIL  "
+        user_id,
+        f"{now}  op=refresh  result=FAIL  "
         f"aadsts={code}  consecutive={health['consecutive_failures']}  "
-        f"corr={corr}  msg=\"{msg_short}\""
+        f"corr={corr}  msg=\"{msg_short}\"",
     )
     if just_broke:
-        _append_diag_log(f"{now}  user={user_id}  event=BROKEN  aadsts={code}")
+        _append_diag_log(user_id, f"{now}  event=BROKEN  aadsts={code}")
 
     if health.get("status") == "broken":
         try:
             from src.auth_notifier import check_and_notify
             check_and_notify(user_id)
         except Exception as e:
-            _append_diag_log(f"{now}  user={user_id}  event=NOTIFY_ERROR  err={e!r}")
+            _append_diag_log(user_id, f"{now}  event=NOTIFY_ERROR  err={e!r}")
 
 
 def get_auth_health(user_id: str) -> dict:

@@ -31,13 +31,17 @@ APP_URL = (os.getenv("APP_URL") or os.getenv("REDIRECT_URI", "").rsplit("/auth/"
            or "https://your-app.example.com").rstrip("/")
 RECONNECT_PATH = "/#settings"  # Settings page hosts the AI Assistant reconnect UI
 
-_DEAD_LETTER = auth.DATA_DIR / ".auth_notifier_deadletter.log"
+def _dead_letter_path(broken_uid: str) -> Path:
+    return auth.user_data_dir(broken_uid) / ".auth_notifier_deadletter.log"
 
 
-def _log_dead_letter(line: str):
+def _log_dead_letter(broken_uid: str, line: str):
+    """Records an undeliverable notification for the broken account. Per-user
+    file so we can pull one user's dead-letter history via the admin diag endpoint."""
     try:
-        _DEAD_LETTER.parent.mkdir(parents=True, exist_ok=True)
-        with open(_DEAD_LETTER, "a") as f:
+        path = _dead_letter_path(broken_uid)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
             f.write(f"{datetime.now(timezone.utc).isoformat()}  {line}\n")
     except Exception:
         pass
@@ -204,12 +208,12 @@ def check_and_notify(broken_uid: str):
 
         recipient = _recipient_email(broken_uid)
         if not recipient:
-            _log_dead_letter(f"user={broken_uid}  reason=no_recipient_email")
+            _log_dead_letter(broken_uid, "reason=no_recipient_email")
             return
 
         sender_uid = _pick_sender_uid(broken_uid)
         if not sender_uid:
-            _log_dead_letter(f"user={broken_uid}  reason=no_working_sender_account")
+            _log_dead_letter(broken_uid, "reason=no_working_sender_account")
             return
 
         last_err = health.get("last_error") or {}
@@ -236,4 +240,4 @@ def check_and_notify(broken_uid: str):
               f"about {broken_uid} to {recipient} (via {sender_uid}, aadsts={classification.get('code')})")
 
     except Exception as e:
-        _log_dead_letter(f"user={broken_uid}  reason=exception  err={e!r}  tb={traceback.format_exc()[-300:]}")
+        _log_dead_letter(broken_uid, f"reason=exception  err={e!r}  tb={traceback.format_exc()[-300:]}")
