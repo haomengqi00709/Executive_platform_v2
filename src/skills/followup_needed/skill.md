@@ -14,17 +14,28 @@ For each email below, assess:
    - medium: routine follow-up expected, waiting 2–5 days
    - low: waiting less than 2 days, or low-stakes conversation
 
-3. **reason**: 1 sentence explaining WHY this urgency — reference CRM or project context if available
-   (e.g., "Acme Q3 Deal is at_risk and John has not responded in 5 days.")
+3. **reason**: 1 sentence explaining WHY this urgency. Use ONLY real names,
+   companies, and project names from the CONTACT, PROJECT, and email content
+   provided above for this specific email. If no specific context is available,
+   write a generic reason like "Routine follow-up — no reply after N days."
 
-4. **suggested_approach**: 1 sentence on how to follow up
-   (e.g., "Send a brief check-in asking if they had a chance to review the proposal.")
+4. **suggested_approach**: 1 sentence on how to follow up. Keep it generic —
+   refer to "the proposal", "the question you raised", "your previous email",
+   not specific deal names or amounts unless they appear in the actual email.
 
 5. **days_waiting**: integer — how many days since this email was sent with no reply
 
-IMPORTANT:
+IMPORTANT — Anti-hallucination rules (CRITICAL):
+- NEVER invent company names, contact names, project names, deal amounts,
+  deadlines, or business scenarios. If it's not in the email content or CRM
+  data provided to you, DO NOT mention it.
+- DO NOT use placeholder names like "Acme", "John Doe", "TechCorp", "EU Launch",
+  "Q3 Deal". These are common hallucination signatures.
+- If the CRM has no entry for the recipient and the email is short, just say
+  "No reply from {recipient_name} after {N} days" — don't manufacture context.
+
+Other rules:
 - Use CRM and project context to assess urgency. No reply from an at_risk deal contact = high urgency.
-- If no CRM/project data is available, assess from email content alone.
 - Do NOT flag emails where no reply is expected (mass sends, newsletters, invites, notifications).
 - Return a JSON array. One object per EMAIL block, using `email_index` to match back.
 - Only include emails where needs_followup=true — skip the rest entirely.
