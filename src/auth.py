@@ -262,6 +262,12 @@ def _record_auth_success(user_id: str, op: str):
         "last_success_at": now,
         "broken_since": None,
     })
+    # On recovery, clear the notification history so the NEXT break gets a
+    # fresh "first" email, not a stale "skip" from the previous broken cycle.
+    # Without this, after a break-recover-break sequence the user would never
+    # hear about the second break (sent_count stays at 1, _should_send skips).
+    if was_broken:
+        health["notifications"] = {}
     _save_health(user_id, health)
     _append_diag_log(f"{now}  user={user_id}  op={op}  result=OK")
     if was_broken:
