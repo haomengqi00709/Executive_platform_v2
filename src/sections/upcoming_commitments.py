@@ -83,16 +83,34 @@ def run(
         save_state(data_dir, state)
     all_commitments = [c for c in all_commitments if should_show(c["id"], state, today_str)]
 
-    # ── 2. (Future) Merge meeting_action_items ────────────
+    # ── 2. Merge meeting_action_items where the owner is the user ─────
+    # Match owner (e.g. "Jason") against display_name's first token. We accept
+    # an empty display_name as "owner unknown → include all" so the section
+    # isn't silently empty for users who haven't set their name yet.
     meeting_items_path = data_dir / "results" / "meeting_action_items.json"
     meeting_data = _load_json(meeting_items_path)
+    exec_name = (settings.get("display_name") or "").strip().lower()
+    exec_first = exec_name.split()[0] if exec_name else ""
     for item in meeting_data.get("items", []):
-        if item.get("due_date") and item.get("assignee") == "executive":
-            all_commitments.append({
-                **item,
-                "source": "meeting",
-                "type": "my_commitment",
-            })
+        if not item.get("due_date"):
+            continue
+        owner = (item.get("owner") or "").strip().lower()
+        # If we have an exec name, only include items owned by them.
+        # Otherwise (no name set) include all owned items.
+        if exec_first and owner and exec_first not in owner and owner not in exec_first:
+            continue
+        # Synthesise the commitment-shaped record the rest of the pipeline expects.
+        all_commitments.append({
+            "id":          item.get("id") or item.get("meeting_id", "") + "_" + str(hash(item.get("action","")))[-8:],
+            "type":        "my_commitment",
+            "description": item.get("action", ""),
+            "due_date":    item.get("due_date"),
+            "due_date_confidence": "stated",
+            "contact_name": item.get("meeting_title", ""),
+            "priority":    "medium",
+            "source":      "meeting",
+            "meeting_title": item.get("meeting_title", ""),
+        })
 
     # ── 3. Filter ─────────────────────────────────────────
     items = []

@@ -10,12 +10,40 @@ otherwise reused. A matching freshness check in server._run_briefing_for_user
 ensures a refreshed dep is not run twice in the same briefing.
 """
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from src.graph import GraphClient
 from src.ai import AIClient
 from src.modules.tz import now_local
+
+
+_OVERDUE_CUTOFF_DAYS = 7  # items overdue >7d are dropped from the briefing
+
+
+def _due_tag(due: str | None) -> str:
+    """Inline tag the AI uses to bucket items into Today / Overdue / Coming Up.
+
+    Items overdue more than _OVERDUE_CUTOFF_DAYS are tagged [STALE] — the
+    briefing pipeline drops them in _sort_and_cap. Past a week the user has
+    either consciously moved on or handled it out-of-band; surfacing them is
+    noise.
+    """
+    if not due:
+        return "[NO DATE]"
+    due = str(due)[:10]
+    today_iso = date.today().isoformat()
+    if due < today_iso:
+        try:
+            days_late = (date.today() - date.fromisoformat(due)).days
+            if days_late > _OVERDUE_CUTOFF_DAYS:
+                return f"[STALE {days_late}d]"
+            return f"[OVERDUE {days_late}d]"
+        except Exception:
+            return "[OVERDUE]"
+    if due == today_iso:
+        return "[TODAY]"
+    return "[FUTURE]"
 
 _SKILL_FILE = Path(__file__).parent.parent / "skills" / "ai_summary" / "skill.md"
 
@@ -23,6 +51,7 @@ DEPENDENCIES = [
     "meetings_today",
     "reply_needed",
     "followup_needed",
+    "commitments_extract",
     "due_today",
     "upcoming_commitments",
     "yesterday_recap",
@@ -68,6 +97,17 @@ def _is_fresh(result: dict, window_secs: int) -> bool:
         return False
 
 
+def _is_stale_overdue(due: str | None) -> bool:
+    """True for items overdue more than _OVERDUE_CUTOFF_DAYS — dropped from briefing."""
+    if not due:
+        return False
+    try:
+        days_late = (date.today() - date.fromisoformat(str(due)[:10])).days
+        return days_late > _OVERDUE_CUTOFF_DAYS
+    except Exception:
+        return False
+
+
 def _sort_and_cap(sid: str, items: list) -> list:
     """Per-dep ranking so top-10 are the most relevant when we truncate."""
     if not items:
@@ -77,9 +117,10 @@ def _sort_and_cap(sid: str, items: list) -> list:
     elif sid == "followup_needed":
         items = sorted(items, key=lambda x: (_PRIORITY_RANK.get(x.get("urgency", "medium"), 1), -int(x.get("days_waiting", 0) or 0)))
     elif sid in ("due_today", "upcoming_commitments"):
+        items = [c for c in items if not _is_stale_overdue(c.get("due_date"))]
         items = sorted(items, key=lambda x: (x.get("due_date") or "9999", _PRIORITY_RANK.get(x.get("priority", "medium"), 1)))
     elif sid == "meeting_action_items":
-        items = [a for a in items if not a.get("completed")]
+        items = [a for a in items if not a.get("completed") and not _is_stale_overdue(a.get("due_date"))]
         items = sorted(items, key=lambda x: (x.get("due_date") or "9999"))
     elif sid == "relationship_health":
         items = [h for h in items if h.get("status") in ("at_risk", "cooling", "overdue")]
@@ -119,17 +160,15 @@ def _format_atom(sid: str, idx: int, item: dict) -> str:
         days = item.get("days_waiting", 0)
         return f"  [{idx}] {urg.upper()} — To: {to} | Subject: \"{subj}\" | {days}d waiting"
     if sid in ("due_today", "upcoming_commitments"):
-        due = (item.get("due_date") or "")[:10]
         desc = (item.get("description") or "")[:120]
         person = item.get("contact_name") or item.get("contact_email") or ""
         person_str = f" — {person}" if person else ""
-        return f"  [{idx}] [{due or 'no date'}] {desc}{person_str}"
+        return f"  [{idx}] {_due_tag(item.get('due_date'))} {desc}{person_str}"
     if sid == "meeting_action_items":
-        due = (item.get("due_date") or "")[:10]
         action = (item.get("action") or "")[:120]
         meeting = item.get("meeting_title") or ""
         meeting_str = f" (from: {meeting})" if meeting else ""
-        return f"  [{idx}] [{due or 'no date'}] {action}{meeting_str}"
+        return f"  [{idx}] {_due_tag(item.get('due_date'))} {action}{meeting_str}"
     if sid == "relationship_health":
         name = item.get("contact_name") or item.get("contact_email") or "Unknown"
         status = item.get("status", "")
@@ -139,7 +178,11 @@ def _format_atom(sid: str, idx: int, item: dict) -> str:
         name = item.get("name") or ""
         status = item.get("status", "")
         summary = (item.get("summary") or "")[:100]
-        return f"  [{idx}] {name} — {status} — {summary}"
+        next_action = (item.get("next_action") or "")[:160]
+        base = f"  [{idx}] {name} — {status} — {summary}"
+        if next_action:
+            base += f"\n         NEXT: {next_action}"
+        return base
     if sid == "yesterday_recap":
         kind = item.get("type", "")
         subj = (item.get("subject") or "")[:80]
