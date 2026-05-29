@@ -76,7 +76,13 @@ export default function CrmTab() {
   };
 
   const rescan = async () => {
-    if (!confirm('Re-scan the last 6 months of inbox? This rebuilds the CRM from scratch and may take a few minutes.')) return;
+    if (!confirm(
+      'Re-run AI analysis on every contact using the latest 6 months of email.\n\n' +
+      'Always preserved: priority, ignore, archived, notes, tags, meeting links, draft links, manual flag.\n\n' +
+      'Refreshed by AI: company, role, status, summary, writing style. ' +
+      'phone / LinkedIn / website are also AI-refreshed but kept as-is when AI returns nothing.\n\n' +
+      'May take a few minutes. Continue?'
+    )) return;
     setScanning(true);
     try {
       const before = lastScan;

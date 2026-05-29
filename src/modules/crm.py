@@ -20,6 +20,80 @@ from pathlib import Path
 from src.graph import GraphClient
 from src.ai import AIClient
 
+# Bump when the enrichment prompt changes meaningfully — refresh_crm uses this
+# to re-enrich existing contacts with the new prompt over the next few days.
+PROMPT_VERSION = 2
+
+# Fields AI is allowed to write during enrichment. Everything else (notes, tags,
+# meeting_ids, draft_link, priority, ignore, archived, source, manual, added_at)
+# is owned by some other module (user UI / m03 / bot / bulk_loader) and must NOT
+# be touched by build_crm or refresh_crm.
+AI_OWNED_FIELDS = frozenset({
+    "company", "role", "phone", "linkedin", "website",
+    "status", "summary", "writing_style",
+})
+
+
+# Free / personal email providers — these domains are not company websites,
+# so we don't auto-fill `website` from them. Lowercase, no protocol.
+_FREE_EMAIL_DOMAINS = frozenset({
+    "gmail.com", "googlemail.com",
+    "outlook.com", "hotmail.com", "live.com", "msn.com", "outlook.live.com",
+    "yahoo.com", "yahoo.co.uk", "yahoo.ca", "ymail.com", "rocketmail.com",
+    "icloud.com", "me.com", "mac.com",
+    "aol.com", "aim.com",
+    "qq.com", "163.com", "126.com", "sina.com", "foxmail.com",
+    "protonmail.com", "proton.me", "pm.me",
+    "mail.com", "gmx.com", "gmx.de", "yandex.com", "yandex.ru",
+    "zoho.com", "fastmail.com", "tutanota.com", "hey.com",
+})
+
+
+def _guess_website_from_domain(email_addr: str) -> str:
+    """If the contact's email domain isn't a free-email provider, treat it as
+    the company website. Covers ~80% of business contacts whose signature
+    didn't include an explicit URL."""
+    if "@" not in email_addr:
+        return ""
+    domain = email_addr.rsplit("@", 1)[1].lower().strip()
+    if not domain or domain in _FREE_EMAIL_DOMAINS:
+        return ""
+    return f"https://{domain}"
+
+
+def _merge_ai_enrichment(old: dict, enriched: dict) -> dict:
+    """Merge a fresh AI-enriched dict into the existing contact, only touching
+    AI-owned fields. Preserves notes / tags / meeting_ids / draft_link /
+    priority / ignore / archived / source / manual / added_at — anything that
+    isn't AI's to write.
+
+    Rule: for each AI-owned field, the AI's new value wins IF non-empty.
+    An empty AI value falls back to the old value (so a transient prompt
+    failure doesn't blank out a known-good field)."""
+    merged = dict(old)
+    for field in AI_OWNED_FIELDS:
+        if enriched.get(field):
+            merged[field] = enriched[field]
+        elif field not in merged:
+            merged[field] = ""
+    # AI sets these too — derived/timestamp fields
+    if enriched.get("updated_at"):
+        merged["updated_at"] = enriched["updated_at"]
+    # Stamp the prompt version that produced these fields, so refresh_crm can
+    # decide whether to re-enrich with a newer prompt.
+    merged["prompt_version"] = PROMPT_VERSION
+    # Keep email + name (from base) if present
+    if enriched.get("email") and "email" not in merged:
+        merged["email"] = enriched["email"]
+    if enriched.get("name") and not merged.get("name"):
+        merged["name"] = enriched["name"]
+    # Website fallback: if AI couldn't find one in the signature, derive from
+    # the email domain (unless it's a personal email provider).
+    if not merged.get("website"):
+        merged["website"] = _guess_website_from_domain(merged.get("email", ""))
+    return merged
+
+
 _NOISE_PATTERNS = [
     "noreply", "no-reply", "postmaster", "mailer-daemon",
     "notifications@", "alerts@", "donotreply", "bounce",
@@ -55,9 +129,15 @@ def _enrich_contact(
     graph: GraphClient,
     ai: AIClient,
     market_segments_content: str = "",
+    business_context: str = "",
+    owner_domain: str = "",
     sent_snippets: list[str] | None = None,
 ) -> dict:
-    """Fetch last 5 emails from contact, AI-generate enrichment fields."""
+    """Fetch last 5 emails from contact, AI-generate enrichment fields.
+
+    Passing owner_domain and business_context dramatically improves status
+    classification — the AI can tell same-domain = internal, and can reason
+    about buyer/seller direction from the user's business description."""
     try:
         msgs = graph.get_messages(
             top=5,
@@ -90,9 +170,32 @@ def _enrich_contact(
     )
 
     seg_block = (
-        f"\n\nUse this market segmentation guide to determine the correct status:\n"
-        f"{market_segments_content[:4000]}"
+        f"\n\nMarket segmentation guide:\n{market_segments_content[:4000]}"
     ) if market_segments_content else ""
+
+    profile_block = (
+        f"\n\nABOUT THE USER (whose CRM this is):\n"
+        f"{business_context[:4000]}"
+    ) if business_context else ""
+
+    rules_block = ""
+    if owner_domain:
+        rules_block = (
+            f"\n\nCLASSIFICATION RULES (apply in order):\n"
+            f"1. If the contact's email domain is @{owner_domain} → status = \"internal\"\n"
+            f"2. Otherwise reason about the buyer/seller direction using the user's "
+            f"business description above:\n"
+            f"   - Companies that PAY the user for the user's services/products → \"client\"\n"
+            f"   - Early-stage discussions, not yet paying → \"prospect\"\n"
+            f"   - Companies the user PAYS for goods/services → \"vendor\"\n"
+            f"   - Companies in joint ventures / co-marketing / referral partnerships → \"partner\"\n"
+            f"   - Investors / board members / capital providers → \"investor\"\n"
+            f"   - Cannot determine from emails → \"other\"\n"
+            f"3. An adjacent-industry company is NOT automatically a vendor. Reason from "
+            f"the direction of payment, not industry similarity. Example: if the user is "
+            f"an engineering DESIGN firm, an engineering EXECUTION firm buying design "
+            f"work is a \"client\", not a vendor.\n"
+        )
 
     sent_block = ""
     if sent_snippets:
@@ -102,9 +205,11 @@ def _enrich_contact(
         )
 
     prompt = (
-        f"Analyze these emails from {base.get('name') or addr} and extract structured info.\n\n"
-        f"EMAILS RECEIVED FROM THIS CONTACT:\n{snippets}{sent_block}{seg_block}\n\n"
-        f"Pay close attention to email signatures for name, title, phone, LinkedIn, and company website.\n\n"
+        f"Analyze these emails from {base.get('name') or addr} and extract structured info."
+        f"{profile_block}"
+        f"\n\nEMAILS RECEIVED FROM THIS CONTACT:\n{snippets}{sent_block}{seg_block}"
+        f"{rules_block}"
+        f"\n\nPay close attention to email signatures for name, title, phone, LinkedIn, and company website.\n\n"
         f"Reply ONLY with a JSON object with exactly these keys:\n"
         f"  company: string (from signature or email domain)\n"
         f"  role: string (job title from signature, or empty string)\n"
@@ -112,8 +217,6 @@ def _enrich_contact(
         f"  linkedin: string (LinkedIn URL from signature, or empty string)\n"
         f"  website: string (company website URL from signature, or empty string)\n"
         f"  status: one of: client, prospect, partner, investor, vendor, internal, other\n"
-        f"    (investor = stakeholders / capital providers / board members; "
-        f"internal = your own company's employees & contractors)\n"
         f"  summary: string (1-2 sentences about the relationship and recent topics)\n"
         f"  writing_style: string (from SENT emails — concrete details: "
         f"(1) exact greeting e.g. 'Hi John,'; "
@@ -313,6 +416,7 @@ def build_crm(
     ai: AIClient,
     data_dir: Path,
     market_segments_content: str = "",
+    business_context: str = "",
     months: int = 6,
     progress_cb=None,
 ) -> dict:
@@ -321,7 +425,10 @@ def build_crm(
 
     Returns {"last_scan": ISO-8601, "months_scanned": int, "contacts": {email: {...}}}.
     Does NOT write to disk — caller must call save_crm().
-    Preserves manually-set fields (priority, status override) from existing crm.json.
+
+    Preservation: AI only writes AI-owned fields (see AI_OWNED_FIELDS).
+    User edits, m03 meeting links, bot notes, tags, etc. are kept intact via
+    _merge_ai_enrichment.
     """
     def log(msg: str):
         print(f"[CRM] {msg}")
@@ -406,8 +513,23 @@ def build_crm(
     candidates = candidates[:200]
     log(f"{len(candidates)} contacts after filtering (min 2 threads, top 200 by recency)")
 
+    owner_domain = owner_lower.split("@", 1)[1] if "@" in owner_lower else ""
+
     # ── Phase 6: AI enrich ────────────────────────────────
-    crm: dict = {}
+    # Start from the OLD contacts so dormant entries, manually-created contacts,
+    # m03 meeting links, bot notes etc. survive the rescan. We then overlay
+    # fresh AI enrichment ONLY for contacts seen in the current scan window.
+    crm: dict = {addr: dict(c) for addr, c in old_contacts.items()}
+    # Make sure thread_count + last_contact reflect the current scan for everyone
+    # the scan saw (they're authoritative for those derived fields).
+    for addr, scanned in contacts.items():
+        existing = crm.setdefault(addr, {"email": addr})
+        existing["thread_count"] = scanned["thread_count"]
+        if scanned["last_contact"] > existing.get("last_contact", ""):
+            existing["last_contact"] = scanned["last_contact"]
+        if not existing.get("name") and scanned.get("name"):
+            existing["name"] = scanned["name"]
+
     _SAVE_EVERY = 10  # incremental save every N contacts — if process crashes, progress is preserved
     for i, contact in enumerate(candidates):
         addr  = contact["email"]
@@ -417,12 +539,13 @@ def build_crm(
             enriched = _enrich_contact(
                 addr, contact, graph, ai,
                 market_segments_content=market_segments_content,
+                business_context=business_context,
+                owner_domain=owner_domain,
                 sent_snippets=sent_by_recipient.get(addr, [])[:5],
             )
         except Exception as e:
             log(f"  Failed: {e}")
             enriched = {
-                **contact,
                 "company":    _guess_company(addr),
                 "role":       "",
                 "status":     "other",
@@ -430,15 +553,10 @@ def build_crm(
                 "updated_at": datetime.now().strftime("%Y-%m-%d"),
             }
 
-        # Preserve manually-set fields from previous scan
-        old = old_contacts.get(addr, {})
-        for field in ("priority", "writing_style", "phone", "linkedin", "website", "ignore"):
-            if old.get(field) and not enriched.get(field):
-                enriched[field] = old[field]
-        if old.get("priority"):
-            enriched["priority"] = old["priority"]
-
-        crm[addr] = enriched
+        # Merge AI enrichment into existing contact, preserving notes / tags /
+        # meeting_ids / draft_link / priority / ignore / archived / source /
+        # manual / added_at — every non-AI field is left intact.
+        crm[addr] = _merge_ai_enrichment(crm.get(addr, {}), enriched)
 
         # Incremental save — if the process is killed or hangs later, we don't lose everything
         if (i + 1) % _SAVE_EVERY == 0 or (i + 1) == len(candidates):
@@ -500,14 +618,21 @@ def refresh_crm(
     ai,
     data_dir: Path,
     market_segments_content: str = "",
+    business_context: str = "",
     progress_cb=None,
 ) -> dict:
     """
     Incremental CRM update. Scans emails since last_scan date.
     - All contacts with new activity: update thread_count + last_contact (no AI)
     - Existing contacts with updated_at > 7 days AND recent activity: re-enrich (AI)
+    - Existing contacts with old prompt_version: re-enrich (AI), regardless of activity
+    - Existing contacts missing AI-owned schema fields: re-enrich (AI)
     - New contacts with >= 2 threads in scan window: add + AI-enrich
     Does NOT write to disk — caller must call save_crm().
+
+    Preservation: AI only writes AI-owned fields. Notes / tags / meeting_ids /
+    draft_link / priority / ignore / archived / source / manual / added_at all
+    survive across refresh runs.
     """
     def log(msg: str):
         print(f"[CRM] {msg}")
@@ -575,6 +700,8 @@ def refresh_crm(
 
     log(f"{len(new_activity)} contacts with activity in scan window")
 
+    owner_domain = owner_lower.split("@", 1)[1] if "@" in owner_lower else ""
+
     today           = datetime.now().strftime("%Y-%m-%d")
     stale_threshold = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     needs_enrich: list[str] = []
@@ -600,6 +727,21 @@ def refresh_crm(
             if activity["count"] >= 2:
                 needs_enrich.append(addr)
 
+    # Also catch contacts that need re-enrichment for non-activity reasons:
+    #   (a) the prompt has changed (PROMPT_VERSION bumped)
+    #   (b) we added a new AI-owned field to the schema and this contact is missing it
+    # We add them to needs_enrich even without recent activity. Bounded by the
+    # 30-per-run cap so a one-time prompt change rolls out over ~1 week instead
+    # of slamming the AI in a single run.
+    for addr, contact in contacts.items():
+        if addr in needs_enrich:
+            continue
+        if contact.get("prompt_version", 1) < PROMPT_VERSION:
+            needs_enrich.append(addr)
+            continue
+        if any(f not in contact for f in AI_OWNED_FIELDS):
+            needs_enrich.append(addr)
+
     log(f"{len(needs_enrich)} contacts to re-enrich with AI (capped at 30 per run)")
     for i, addr in enumerate(needs_enrich[:30]):
         label = contacts[addr].get("name") or addr
@@ -608,12 +750,11 @@ def refresh_crm(
             enriched = _enrich_contact(
                 addr, contacts[addr], graph, ai,
                 market_segments_content=market_segments_content,
+                business_context=business_context,
+                owner_domain=owner_domain,
                 sent_snippets=[],
             )
-            for field in ("priority", "ignore"):
-                if contacts[addr].get(field) is not None:
-                    enriched[field] = contacts[addr][field]
-            contacts[addr] = enriched
+            contacts[addr] = _merge_ai_enrichment(contacts[addr], enriched)
         except Exception as e:
             log(f"  Failed: {e}")
             contacts[addr]["updated_at"] = today

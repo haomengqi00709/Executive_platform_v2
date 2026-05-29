@@ -974,9 +974,11 @@ def _build_crm_with_progress(uid: str, progress_cb, months: int = 6) -> None:
         token  = auth.get_valid_access_token(uid)
         graph  = GraphClient(token)
         ai     = AIClient()
+        seg, biz = _get_crm_ai_context(uid)
         result = build_crm(graph, ai, _udir(uid),
                            months=months,
-                           market_segments_content=_get_market_segments(uid),
+                           market_segments_content=seg,
+                           business_context=biz,
                            progress_cb=progress_cb)
         save_crm(_udir(uid), result)
         print(f"[CRM] Initial build done for {uid} — {len(result.get('contacts', {}))} contacts ({months}mo scan)")
@@ -1094,13 +1096,24 @@ def _get_market_segments(uid: str) -> str:
     return load_market_segments(_udir(uid))
 
 
+def _get_crm_ai_context(uid: str) -> tuple[str, str]:
+    """Returns (market_segments_content, business_context) for CRM enrichment.
+    business_context = personal + business profile + market segments combined,
+    which lets the AI reason about same-domain=internal and buyer/seller direction."""
+    from src.modules.profile import load_market_segments, load_profile_context
+    return load_market_segments(_udir(uid)), load_profile_context(_udir(uid))
+
+
 def _build_crm_for_user(uid: str) -> None:
     from src.modules.crm import build_crm, save_crm
     try:
         token  = auth.get_valid_access_token(uid)
         graph  = GraphClient(token)
         ai     = AIClient()
-        result = build_crm(graph, ai, _udir(uid), market_segments_content=_get_market_segments(uid))
+        seg, biz = _get_crm_ai_context(uid)
+        result = build_crm(graph, ai, _udir(uid),
+                           market_segments_content=seg,
+                           business_context=biz)
         save_crm(_udir(uid), result)
         print(f"[CRM] Initial build done for {uid} — {len(result.get('contacts', {}))} contacts")
     except Exception as e:
@@ -1115,7 +1128,10 @@ def _refresh_crm_for_user(uid: str) -> None:
         token  = auth.get_valid_access_token(uid)
         graph  = GraphClient(token)
         ai     = AIClient()
-        result = refresh_crm(graph, ai, _udir(uid), market_segments_content=_get_market_segments(uid))
+        seg, biz = _get_crm_ai_context(uid)
+        result = refresh_crm(graph, ai, _udir(uid),
+                             market_segments_content=seg,
+                             business_context=biz)
         save_crm(_udir(uid), result)
         print(f"[CRM] Daily refresh done for {uid}")
     except Exception as e:
@@ -1998,9 +2014,13 @@ def trigger_crm_scan(background_tasks: BackgroundTasks,
             token = auth.get_valid_access_token(uid)
             graph = GraphClient(token)
             ai    = AIClient()
-            result = build_crm(graph, ai, _udir(uid), months=months)
+            seg, biz = _get_crm_ai_context(uid)
+            result = build_crm(graph, ai, _udir(uid),
+                               months=months,
+                               market_segments_content=seg,
+                               business_context=biz)
             save_crm(_udir(uid), result)
-            print(f"[CRM] Scan complete for {uid}: {result['total']} contacts")
+            print(f"[CRM] Scan complete for {uid}: {len(result.get('contacts', {}))} contacts")
         except Exception as e:
             print(f"[CRM] Scan failed for {uid}: {e}")
 
@@ -3714,6 +3734,120 @@ def put_email_monitor(body: dict, session: dict = Depends(require_session)):
 def put_meeting_config(body: dict, session: dict = Depends(require_session)):
     from src.modules.schedules import update_meeting
     return update_meeting(_udir(session["user_id"]), body)
+
+
+# ── Outlook draft redirector (mobile fallback) ────────────
+# Teams chat is plain HTML — there's no way to ask the client "try the app,
+# else open the web". So we route the click through this endpoint, which
+# returns a tiny HTML page that tries the ms-outlook:// scheme first and
+# falls back to the original webLink after a short delay. On mobile with
+# Outlook installed → app opens; everywhere else → browser opens the draft.
+_OUTLOOK_HOST_ALLOWLIST = (
+    "outlook.office.com",
+    "outlook.office365.com",
+    "outlook.live.com",
+)
+
+
+@app.get("/r/draft")
+def redirect_to_draft(url: str = ""):
+    """Public mobile-friendly redirector for Outlook draft webLinks.
+    Whitelists Outlook hosts so the endpoint can't be abused as an open
+    redirect (phishing) — anything else returns 400.
+
+    JS strategy on the returned page:
+      1. Feed ms-outlook://emails/<itemid> to a hidden iframe (undocumented
+         scheme — Outlook may or may not recognize it; if it does, the app
+         opens directly to that draft).
+      2. After 600ms, feed ms-outlook://drafts to the iframe — if the app
+         is installed but didn't accept #1, it now opens to the drafts
+         folder (the new draft will be at the top by modified time).
+      3. After another 800ms with the page still in foreground, fall back
+         to the original webLink (browser-based).
+
+    Using an iframe instead of window.location lets us silently try custom
+    schemes without browser error pages when no handler is registered."""
+    from urllib.parse import urlparse, parse_qs
+    import html as _html
+
+    if not url:
+        raise HTTPException(400, "Missing url parameter")
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        raise HTTPException(400, "Malformed url")
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(400, "Only http(s) URLs allowed")
+    host = (parsed.hostname or "").lower()
+    if not any(host == h or host.endswith("." + h) for h in _OUTLOOK_HOST_ALLOWLIST):
+        raise HTTPException(400, f"Host '{host}' not in Outlook allowlist")
+
+    # Try to extract the draft itemid from the webLink for the experimental
+    # per-item deep link. webLink format is typically
+    #   .../mail/deeplink/compose?itemid=AAMk...&popoutv2=1
+    qs = parse_qs(parsed.query)
+    itemid = (qs.get("itemid") or qs.get("ItemID") or [""])[0]
+
+    safe_url = _html.escape(url, quote=True)
+    body = f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Opening Outlook…</title>
+<style>
+  body{{font-family:-apple-system,Segoe UI,Roboto,sans-serif;text-align:center;padding:48px 20px;color:#333}}
+  a{{color:#0078d4;text-decoration:none}}
+  iframe{{display:none}}
+</style></head>
+<body>
+<p>Opening Outlook…</p>
+<p><a id="webfallback" href="{safe_url}">If nothing happens, tap here to open in Outlook web.</a></p>
+<iframe id="launcher" src="about:blank"></iframe>
+<script>
+  var iframe = document.getElementById("launcher");
+  var itemid = {json.dumps(itemid)};
+  var webUrl = {json.dumps(url)};
+
+  function launch(scheme) {{ try {{ iframe.src = scheme; }} catch (e) {{}} }}
+
+  // Walk through a list of candidate Outlook URL schemes. The first one the
+  // OS recognises hands off to the Outlook app and backgrounds this page;
+  // the rest never fire (document.hidden short-circuit). If none are
+  // recognised we fall through to ms-outlook://drafts (known-good — lands
+  // on the drafts folder), then finally the browser webLink.
+  //
+  // Microsoft only documents `ms-outlook://compose`, `drafts`, `inbox`,
+  // `search`, etc — there's no public per-item scheme. The first six below
+  // are undocumented guesses based on community reports; harmless if
+  // unsupported.
+  var candidates = [];
+  if (itemid) {{
+    var enc = encodeURIComponent(itemid);
+    candidates.push("ms-outlook://emails/"   + enc);
+    candidates.push("ms-outlook://message/"  + enc);
+    candidates.push("ms-outlook://item/"     + enc);
+    candidates.push("ms-outlook://mail/"     + enc);
+    candidates.push("ms-outlook://drafts/"   + enc);
+    candidates.push("ms-outlook://compose?id=" + enc);
+  }}
+  candidates.push("ms-outlook://drafts");           // safe fallback — opens folder
+
+  var step = 0;
+  function next() {{
+    if (document.hidden) return;            // app took over — stop here
+    if (step >= candidates.length) {{
+      // Nothing accepted; open in browser as last resort.
+      window.location.replace(webUrl);
+      return;
+    }}
+    launch(candidates[step++]);
+    setTimeout(next, 300);
+  }}
+  next();
+</script>
+</body></html>"""
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(content=body, status_code=200)
 
 
 # ── Startup ───────────────────────────────────────────────
