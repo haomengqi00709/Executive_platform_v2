@@ -1098,6 +1098,14 @@ def _run_first_login_init(uid: str, history_months: int | None = None) -> None:
             except Exception as e:
                 update_init_step(_udir(uid), "projects", "failed", f"Project scan failed: {e}")
 
+        # Step 2b — Companies (derived from CRM + Projects, no AI cost).
+        # Runs every time, not just on first build — picks up any new
+        # company names that landed in CRM/Projects during this init.
+        try:
+            _build_companies_for_user(uid)
+        except Exception as e:
+            print(f"[Companies] Init build failed for {uid}: {e}")
+
         # Step 3 — Profile draft
         update_init_step(_udir(uid), "profile", "in_progress", "Reading email signatures and drafting profile...")
         try:
@@ -1232,6 +1240,31 @@ def _refresh_projects_all_users() -> None:
         return
     for f in sessions_dir.glob("*.json"):
         threading.Thread(target=_refresh_projects_for_user, args=(f.stem,), daemon=True).start()
+
+
+# ── Companies lifecycle helpers ───────────────────────────
+# Companies is a derived aggregation of CRM contacts + Projects participants.
+# No AI calls, no Graph API calls — cheap enough that we just rebuild it on
+# every refresh instead of bothering with incremental logic. User-editable
+# fields (monitor_intelligence, ignore, notes, priority, name) are preserved
+# across rebuilds by companies.build_companies itself.
+
+def _build_companies_for_user(uid: str) -> None:
+    from src.modules.companies import build_companies, save_companies
+    try:
+        result = build_companies(_udir(uid))
+        save_companies(_udir(uid), result)
+        print(f"[Companies] Build done for {uid} — {len(result.get('companies', {}))} companies")
+    except Exception as e:
+        print(f"[Companies] Build failed for {uid}: {e}")
+
+
+def _refresh_companies_all_users() -> None:
+    sessions_dir = auth.DATA_DIR / "_sessions"
+    if not sessions_dir.exists():
+        return
+    for f in sessions_dir.glob("*.json"):
+        threading.Thread(target=_build_companies_for_user, args=(f.stem,), daemon=True).start()
 
 
 # ── Section registry ─────────────────────────────────────
@@ -2413,6 +2446,74 @@ def get_projects(session: dict = Depends(require_session)):
         raise HTTPException(500, str(e))
 
 
+# ── Companies ────────────────────────────────────────────
+# Derived view over CRM + Projects, with per-company settings (most
+# importantly monitor_intelligence, consumed by the company_intelligence
+# section). companies.json is the single source of truth for "which
+# companies to monitor" — CRM contact priority/ignore no longer participates
+# in that decision.
+
+@app.get("/api/companies")
+def get_companies(session: dict = Depends(require_session)):
+    uid = session["user_id"]
+    from src.modules.companies import load_companies
+    db = load_companies(_udir(uid))
+    companies = list((db.get("companies") or {}).values())
+    companies.sort(
+        key=lambda c: (c.get("last_activity") or "", (c.get("name") or "").lower()),
+        reverse=True,
+    )
+    return {
+        "last_scan": db.get("last_scan"),
+        "total":     len(companies),
+        "companies": companies,
+    }
+
+
+@app.patch("/api/companies/{key}")
+def patch_company(key: str, body: dict, session: dict = Depends(require_session)):
+    uid = session["user_id"]
+    from src.modules.companies import update_company
+    try:
+        return update_company(_udir(uid), key, body or {})
+    except KeyError:
+        raise HTTPException(404, f"Company not found: {key}")
+
+
+@app.post("/api/companies")
+def create_company(body: dict, session: dict = Depends(require_session)):
+    """Manually add a company that doesn't have to appear in CRM/Projects."""
+    uid = session["user_id"]
+    from src.modules.companies import add_manual_company
+    try:
+        return add_manual_company(
+            _udir(uid),
+            name=body.get("name") or "",
+            notes=body.get("notes") or "",
+            priority=body.get("priority") or "medium",
+            monitor_intelligence=bool(body.get("monitor_intelligence", True)),
+        )
+    except ValueError as e:
+        raise HTTPException(409 if "already exists" in str(e) else 400, str(e))
+
+
+@app.delete("/api/companies/{key}")
+def remove_company(key: str, session: dict = Depends(require_session)):
+    uid = session["user_id"]
+    from src.modules.companies import delete_company
+    if not delete_company(_udir(uid), key):
+        raise HTTPException(404, f"Company not found: {key}")
+    return {"ok": True}
+
+
+@app.post("/api/companies/scan")
+def trigger_companies_scan(background_tasks: BackgroundTasks,
+                           session: dict = Depends(require_session)):
+    uid = session["user_id"]
+    background_tasks.add_task(_build_companies_for_user, uid)
+    return {"ok": True, "message": "Company rebuild started"}
+
+
 @app.post("/api/commitments/{commitment_id}/done")
 def commitment_mark_done(commitment_id: str, session: dict = Depends(require_session)):
     from src.modules.commitments_state import mark_done
@@ -3047,29 +3148,6 @@ def list_contacts(session: dict = Depends(require_session),
 
     items.sort(key=lambda x: x.get("added_at", ""), reverse=True)
     return {"items": items, "count": len(items)}
-
-
-@app.get("/api/watchlist")
-def get_watchlist(session: dict = Depends(require_session)):
-    uid  = session["user_id"]
-    path = _udir(uid) / "market_watchlist.json"
-    if not path.exists():
-        return {"companies": []}
-    try:
-        return {"companies": json.loads(path.read_text())}
-    except Exception:
-        return {"companies": []}
-
-
-@app.post("/api/watchlist")
-async def save_watchlist(request: Request, session: dict = Depends(require_session)):
-    uid  = session["user_id"]
-    body = await request.json()
-    companies = [str(c).strip() for c in body.get("companies", []) if str(c).strip()]
-    path = _udir(uid) / "market_watchlist.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(companies, indent=2, ensure_ascii=False))
-    return {"ok": True, "count": len(companies)}
 
 
 # ── User Profile (business_profile + market_segments) ────
@@ -3986,6 +4064,14 @@ def startup_event():
         max_instances=1,
     )
     _scheduler.add_job(
+        _refresh_companies_all_users,
+        trigger="cron",
+        hour=6, minute=45,
+        id="companies_daily_refresh",
+        replace_existing=True,
+        max_instances=1,
+    )
+    _scheduler.add_job(
         _poll_email_monitor_all_users,
         trigger="interval",
         minutes=1,
@@ -4030,4 +4116,4 @@ def startup_event():
         coalesce=True,
     )
     _load_all_user_schedules_at_startup()
-    print("[Scheduler] Teams bot 10s | Email monitor 1m | Expense scan 1m | Meeting prep 5m | Meeting recordings 20m | CRM refresh daily 06:00 UTC | Projects refresh daily 06:30 UTC | DB cleanup weekly Mon 07:00 UTC")
+    print("[Scheduler] Teams bot 10s | Email monitor 1m | Expense scan 1m | Meeting prep 5m | Meeting recordings 20m | CRM refresh daily 06:00 UTC | Projects refresh daily 06:30 UTC | Companies refresh daily 06:45 UTC | DB cleanup weekly Mon 07:00 UTC")

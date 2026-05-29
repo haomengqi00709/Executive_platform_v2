@@ -170,7 +170,7 @@ export const SECTIONS: SectionDef[] = [
     category: 'intelligence',
     trigger: 'scheduled',
     icon: Building2,
-    description: 'Targeted signals on CRM companies and watchlist.',
+    description: 'Targeted signals on companies you flag for monitoring.',
   },
 
   // INSIGHTS

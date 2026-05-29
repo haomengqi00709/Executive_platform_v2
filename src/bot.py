@@ -24,7 +24,7 @@ HISTORY_LIMIT = 20
 SECTION_IDS = {
     "ai_summary":           "Morning Briefing — daily summary of calendar, emails, priorities, and key relationships",
     "market_intelligence":  "Market Intelligence — current industry news, competitor updates, market trends",
-    "company_intelligence": "Company Intelligence — targeted signals on CRM companies, project participants, watchlist (LinkedIn, X, news)",
+    "company_intelligence": "Company Intelligence — targeted signals on companies you've flagged for monitoring (LinkedIn, X, news)",
     "reply_needed":         "Emails Awaiting Reply — inbox emails where the sender is waiting for your response",
     "followup_needed":      "Sent — No Response — emails YOU sent that the other party hasn't replied to yet",
     "commitments_extract":  "Commitments Extracted — all promises and deadlines found in emails (yours and others')",
@@ -471,7 +471,7 @@ def reply(
         section_id must be one of:
           ai_summary           — Morning Briefing (daily summary of calendar, emails, priorities)
           market_intelligence  — Market Intelligence (industry news, competitor updates)
-          company_intelligence — Company Intelligence (targeted signals on CRM/watchlist companies)
+          company_intelligence — Company Intelligence (targeted signals on monitored companies)
           reply_needed         — Emails Awaiting Reply (inbox emails waiting for your response)
           followup_needed      — Sent — No Response (emails you sent, other party hasn't replied)
           commitments_extract  — Commitments Extracted (promises and deadlines from emails)

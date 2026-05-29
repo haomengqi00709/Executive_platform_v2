@@ -1,7 +1,12 @@
 """
 company_intelligence section — Scheduled
-Targeted intelligence on CRM companies, project participants, and custom watchlist.
+Targeted intelligence on companies the user has marked for monitoring.
 Structured items with company attribution and 7-day dedup.
+
+Companies are read from companies.json (built by src/modules/companies.py
+from CRM + Projects). A company is monitored when monitor_intelligence=True
+and ignore=False — there is no fallback path that scans CRM or projects
+directly here.
 """
 import hashlib
 import json
@@ -12,6 +17,7 @@ from src.ai import AIClient
 from src.graph import GraphClient
 from src.modules.validator import validate_output
 from src.modules.profile import load_profile_context
+from src.modules.companies import load_companies
 from src.modules.url_utils import resolve_source_url
 
 _SKILLS_DIR = Path(__file__).parent.parent / "skills" / "company_intelligence"
@@ -37,10 +43,12 @@ Last 30 days.
 - Old news (>30 days)
 """
 
-_AUTO_CRM_STATUSES = {"client", "prospect", "partner", "investor"}
-_STATUS_PRIORITY   = {"client": 0, "prospect": 1, "partner": 2, "investor": 1}
-_WATCHLIST_PRIORITY = 1  # between prospect and partner — user-defined list is high priority
-_ACTIVE_PROJECT_STATUSES = {"ongoing", "needs_attention", "paused", "early_stage"}
+_COMPANY_CAP = 25  # AI search cost ceiling — must not silently grow
+_PRIORITY_RANK = {"high": 0, "medium": 1, "low": 2}
+_STATUS_RANK   = {
+    "client":   0, "prospect": 1, "partner": 2, "investor": 3,
+    "vendor":   4, "internal": 5, "other":    6,
+}
 
 
 def _load_skill_doc() -> str:
@@ -73,59 +81,26 @@ def _save_seen(data_dir: Path, seen: dict) -> None:
     (data_dir / "company_intel_seen.json").write_text(json.dumps(seen, indent=2))
 
 
-def _build_company_list(data_dir: Path, crm_data: dict, projects_data: dict) -> list[str]:
-    seen_lower: set[str] = set()
-    companies: list[tuple[int, str]] = []  # (priority_rank, name)
+def _build_company_list(data_dir: Path) -> list[str]:
+    """Pull the list of company names to research from companies.json.
 
-    # Custom watchlist — loaded first so CRM dedup preserves watchlist companies
-    watchlist_path = data_dir / "market_watchlist.json"
-    if watchlist_path.exists():
-        try:
-            for name in json.loads(watchlist_path.read_text()):
-                name = str(name).strip()
-                if name and name.lower() not in seen_lower:
-                    seen_lower.add(name.lower())
-                    companies.append((_WATCHLIST_PRIORITY, name))
-        except Exception:
-            pass
-
-    # CRM contacts — only client / prospect / partner, not low priority
-    for contact in crm_data.get("contacts", {}).values():
-        if contact.get("ignore") or contact.get("archived") or contact.get("priority") == "ignore":
+    A company is included when monitor_intelligence=True and ignore=False.
+    Order: per-company priority (high < medium < low), then derived_status
+    (client first, other last), then name. Capped at _COMPANY_CAP.
+    """
+    db = load_companies(data_dir)
+    ranked: list[tuple[int, int, str]] = []
+    for c in (db.get("companies") or {}).values():
+        if not c.get("monitor_intelligence") or c.get("ignore"):
             continue
-        if contact.get("priority") == "low":
+        name = (c.get("name") or "").strip()
+        if not name:
             continue
-        status = contact.get("status", "other")
-        company = (contact.get("company") or "").strip()
-        if not company or status not in _AUTO_CRM_STATUSES:
-            continue
-        key = company.lower()
-        if key not in seen_lower:
-            seen_lower.add(key)
-            companies.append((_STATUS_PRIORITY[status], company))
-
-    # Projects — cross-ref participants with CRM (client/prospect/partner, not low priority)
-    contacts = crm_data.get("contacts", {})
-    for proj in projects_data.get("projects", {}).values():
-        if proj.get("ignore") or proj.get("archived") or proj.get("status") not in _ACTIVE_PROJECT_STATUSES:
-            continue
-        for email in proj.get("participants", []):
-            contact = contacts.get(email.lower(), {})
-            if contact.get("status", "other") not in _AUTO_CRM_STATUSES:
-                continue
-            if contact.get("priority") in ("low", "ignore"):
-                continue
-            company = (contact.get("company") or "").strip()
-            if not company:
-                continue
-            key = company.lower()
-            if key not in seen_lower:
-                seen_lower.add(key)
-                rank = _STATUS_PRIORITY.get(contact.get("status"), 2)
-                companies.append((rank, company))
-
-    companies.sort(key=lambda x: x[0])
-    return [c for _, c in companies[:25]]
+        prio   = _PRIORITY_RANK.get(c.get("priority") or "medium", 1)
+        status = _STATUS_RANK.get(c.get("derived_status") or "other", 6)
+        ranked.append((prio, status, name))
+    ranked.sort(key=lambda x: (x[0], x[1], x[2].lower()))
+    return [name for _, _, name in ranked[:_COMPANY_CAP]]
 
 
 def _chunks(lst: list, n: int):
@@ -250,26 +225,9 @@ def run(
 
     user_instruction = _load_user_instruction(data_dir)
 
-    # Load CRM and projects
-    crm_data = {}
-    try:
-        crm_path = data_dir / "crm.json"
-        if crm_path.exists():
-            crm_data = json.loads(crm_path.read_text())
-    except Exception:
-        pass
-
-    projects_data = {}
-    try:
-        proj_path = data_dir / "projects.json"
-        if proj_path.exists():
-            projects_data = json.loads(proj_path.read_text())
-    except Exception:
-        pass
-
-    companies = _build_company_list(data_dir, crm_data, projects_data)
+    companies = _build_company_list(data_dir)
     if not companies:
-        _p("No companies to track — CRM empty and no watchlist")
+        _p("No companies flagged for monitoring in companies.json")
         return {
             "id": _RESULT_ID, "status": "not_run",
             "items": [], "count": 0, "empty": True,

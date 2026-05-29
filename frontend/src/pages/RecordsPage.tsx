@@ -1,10 +1,11 @@
 import { useState } from 'react';
-import { Users, FolderKanban, Sparkles } from 'lucide-react';
+import { Users, FolderKanban, Building2, Sparkles } from 'lucide-react';
 import CrmTab from './records/CrmTab';
 import ProjectsTab from './records/ProjectsTab';
+import CompanyTab from './records/CompanyTab';
 import CleanupTab from './records/CleanupTab';
 
-type Tab = 'crm' | 'projects' | 'cleanup';
+type Tab = 'crm' | 'projects' | 'companies' | 'cleanup';
 
 export default function RecordsPage() {
   const [tab, setTab] = useState<Tab>('crm');
@@ -27,14 +28,18 @@ export default function RecordsPage() {
         <TabBtn active={tab === 'projects'} onClick={() => setTab('projects')} icon={<FolderKanban size={14} />}>
           Projects
         </TabBtn>
+        <TabBtn active={tab === 'companies'} onClick={() => setTab('companies')} icon={<Building2 size={14} />}>
+          Companies
+        </TabBtn>
         <TabBtn active={tab === 'cleanup'} onClick={() => setTab('cleanup')} icon={<Sparkles size={14} />}>
           Cleanup
         </TabBtn>
       </div>
 
-      {tab === 'crm'      && <CrmTab />}
-      {tab === 'projects' && <ProjectsTab />}
-      {tab === 'cleanup'  && <CleanupTab />}
+      {tab === 'crm'       && <CrmTab />}
+      {tab === 'projects'  && <ProjectsTab />}
+      {tab === 'companies' && <CompanyTab />}
+      {tab === 'cleanup'   && <CleanupTab />}
     </div>
   );
 }

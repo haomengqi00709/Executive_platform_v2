@@ -291,6 +291,86 @@ export function scanProjects(): Promise<{ ok: boolean }> {
   return fetchJson(`/api/projects/scan`, { method: 'POST' });
 }
 
+// ── Companies (aggregated view over CRM + Projects) ───────
+// A company is derived from CRM contact.company and Projects participants.
+// `monitor_intelligence` controls whether the company_intelligence section
+// scans this company — CRM contact priority/ignore no longer participates.
+
+export interface CompanyContactRef {
+  email: string;
+  name?: string;
+  role?: string;
+  status?: string;           // client / prospect / partner / investor / vendor / internal / other
+  last_contact?: string;
+  thread_count?: number;
+}
+
+export interface CompanyProjectRef {
+  id: string;
+  name: string;
+  status?: string;
+  last_activity?: string;
+}
+
+export interface Company {
+  key: string;                       // normalized primary key
+  name: string;                      // display name (user-editable)
+  aliases: string[];                 // all raw spellings seen during build
+  contacts: CompanyContactRef[];
+  contact_count: number;
+  projects: CompanyProjectRef[];
+  project_count: number;
+  derived_status: string;            // most important status across contacts
+  last_activity: string;             // max of contact.last_contact and project.last_activity
+  thread_count_total: number;
+  monitor_intelligence: boolean;     // company_intelligence opt-in
+  ignore: boolean;                   // company-level ignore
+  notes: string;
+  priority: string;                  // high / medium / low (orders intelligence batches)
+  manual: boolean;                   // user-added, not derived from CRM/Projects
+  added_at: string;
+  updated_at: string;
+}
+
+export interface CompaniesResponse {
+  last_scan: string | null;
+  total: number;
+  companies: Company[];
+}
+
+export function getCompanies(): Promise<CompaniesResponse> {
+  return fetchJson<CompaniesResponse>(`/api/companies`);
+}
+
+export function patchCompany(key: string, updates: Partial<Company>): Promise<Company> {
+  return fetchJson<Company>(`/api/companies/${encodeURIComponent(key)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(updates),
+  });
+}
+
+export function createCompany(company: {
+  name: string;
+  notes?: string;
+  priority?: string;
+  monitor_intelligence?: boolean;
+}): Promise<Company> {
+  return fetchJson<Company>(`/api/companies`, {
+    method: 'POST',
+    body: JSON.stringify(company),
+  });
+}
+
+export function deleteCompany(key: string): Promise<{ ok: boolean }> {
+  return fetchJson<{ ok: boolean }>(`/api/companies/${encodeURIComponent(key)}`, {
+    method: 'DELETE',
+  });
+}
+
+export function scanCompanies(): Promise<{ ok: boolean }> {
+  return fetchJson(`/api/companies/scan`, { method: 'POST' });
+}
+
 // ── DB Cleanup (manual direct actions) ────────────────────
 
 export function mergeProjectsDirect(keep_id: string, merge_id: string): Promise<{ ok: boolean }> {
