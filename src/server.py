@@ -438,9 +438,19 @@ def _poll_teams_bot_all_users():
             state = _read_json(path)
             if not state.get("enabled") or not state.get("is_registered_bot"):
                 continue
+            owner_uid = state.get("owner_uid")
+            if not owner_uid:
+                # Orphan bot — registered but unbound. Don't fall back to
+                # treating the bot as its own owner (that silently uses wrong
+                # context). Log once per bot, then skip every poll.
+                if not state.get("_orphan_logged"):
+                    print(f"[TeamsBot] Bot {uid} has no owner_uid — skipping poll. "
+                          f"Use /api/admin/bot/unbind/{uid} to clean up.")
+                    state["_orphan_logged"] = True
+                    _write_json(path, state)
+                continue
             token       = auth.get_valid_access_token(uid)
             graph       = GraphClient(token)
-            owner_uid   = state.get("owner_uid") or uid
             owner_settings = _read_json(_user_settings(owner_uid))
             owner_graph = None
             try:
@@ -480,7 +490,11 @@ def _poll_email_monitor_all_users():
             state = _read_json(path)
             if not state.get("enabled") or not state.get("is_registered_bot"):
                 continue
-            owner_uid = state.get("owner_uid") or uid
+            owner_uid = state.get("owner_uid")
+            if not owner_uid:
+                # Orphan bot — skip silently. The TeamsBot polling loop already
+                # logged the warning once; no need to spam it here.
+                continue
             chat_id   = state.get("chat_id")
             if not chat_id:
                 continue
@@ -767,6 +781,17 @@ def activate_bot(background_tasks: BackgroundTasks, session: dict = Depends(requ
     username = session["username"]
     if not bot_uid:
         raise HTTPException(400, "bot_uid is required")
+    if bot_uid == user_id:
+        # The AI assistant must be a separate Microsoft account. Self-binding
+        # creates a confusing "you chatting with yourself" state and loses the
+        # two-account failure isolation the architecture relies on.
+        raise HTTPException(
+            400,
+            "The AI assistant must be a different Microsoft account than your "
+            "own. When prompted at microsoft.com/devicelogin, sign in as your "
+            "AI assistant account (e.g. Audrey@yourcompany.com), not your "
+            "personal account.",
+        )
     bp = _bot_state_path(bot_uid)
     if not bp.exists():
         raise HTTPException(404, "Bot account not found")
@@ -788,11 +813,16 @@ def activate_bot(background_tasks: BackgroundTasks, session: dict = Depends(requ
 @app.post("/api/teams/bot/disable")
 def disable_bot(session: dict = Depends(require_session)):
     uid = session["user_id"]
-    _unbind_bot_from_user(uid)
-    path  = _bot_state_path(uid)
-    state = json.loads(path.read_text()) if path.exists() else {}
-    state["enabled"] = False
-    _write_json(path, state)
+    bot_uid = _unbind_bot_from_user(uid)
+    # Disable the BOT (its teams_bot.json), not the owner's. Without this the
+    # unbound bot still passes the `enabled && is_registered_bot` check in the
+    # poll loop and would keep running with owner_uid=None.
+    if bot_uid:
+        bp = _bot_state_path(bot_uid)
+        if bp.exists():
+            bs = json.loads(bp.read_text())
+            bs["enabled"] = False
+            _write_json(bp, bs)
     return {"ok": True}
 
 
