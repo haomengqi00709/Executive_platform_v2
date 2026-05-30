@@ -759,9 +759,42 @@ def bot_auth_poll(session: dict = Depends(require_session)):
         bot_email = me.get("mail") or me.get("userPrincipalName", "")
         if bot_uid:
             expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+
+            # Push the raw token response into the MSAL cache so the
+            # device-flow refresh path (Path 2 in get_valid_access_token) can
+            # find it when the access_token expires ~1 hour from now. Without
+            # this, the session would keep a CLIENT_ID-issued refresh_token
+            # that Path 1 (PROD_CLIENT_ID + PROD_SECRET) can't refresh —
+            # Microsoft responds with AADSTS7000215 because the secret
+            # doesn't match the issuing app — and Path 2 has no cache entry
+            # to fall back to. Net result: bot dies after 1h. See
+            # docs/auth-health-review-findings.md and conversation around
+            # commit 2c74f2b for the full root-cause analysis.
+            try:
+                _cache = auth._load_cache()
+                _cache.add({
+                    "client_id":      auth.CLIENT_ID,
+                    "scope":          (result.get("scope") or "").split() or list(auth.SCOPES_LOCAL),
+                    "token_endpoint": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                    "response":       result,
+                    "data":           {},
+                    "grant_type":     "urn:ietf:params:oauth:grant-type:device_code",
+                })
+                auth._save_cache(_cache)
+            except Exception as e:
+                # If injection fails, log loudly. First hour still works on
+                # the access_token we already have; the bot will simply
+                # appear broken after that, same as before this fix.
+                print(f"[BotAuth] MSAL cache injection failed for {bot_uid} ({bot_email}): {e}")
+
+            # Save the session with an EMPTY refresh_token so the next
+            # get_valid_access_token call goes straight to the MSAL silent
+            # path (Path 2). If we left the raw refresh_token in here, Path 1
+            # would try first and fail with AADSTS7000215 on every refresh
+            # — wasted Graph quota and noise in the diag log.
             auth.save_user_tokens(bot_uid, {
                 "access_token":  token,
-                "refresh_token": result.get("refresh_token", ""),
+                "refresh_token": "",
                 "expiry":        expiry,
                 "username":      bot_email,
             })
