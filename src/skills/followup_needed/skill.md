@@ -23,16 +23,18 @@ For each email below, assess:
    refer to "the proposal", "the question you raised", "your previous email",
    not specific deal names or amounts unless they appear in the actual email.
 
-5. **days_waiting**: integer — how many days since this email was sent with no reply
-
 IMPORTANT — Anti-hallucination rules (CRITICAL):
 - NEVER invent company names, contact names, project names, deal amounts,
   deadlines, or business scenarios. If it's not in the email content or CRM
   data provided to you, DO NOT mention it.
 - DO NOT use placeholder names like "Acme", "John Doe", "TechCorp", "EU Launch",
   "Q3 Deal". These are common hallucination signatures.
+- DO NOT invent numbers (days, amounts, counts). The platform computes the
+  exact day count from the email's sentDateTime — never write things like
+  "5 days" or "3 days" in your reason; the system already knows and will show
+  the real number to the user.
 - If the CRM has no entry for the recipient and the email is short, just say
-  "No reply from {recipient_name} after {N} days" — don't manufacture context.
+  "Routine follow-up — no reply from {recipient_name}" — don't manufacture context.
 
 Other rules:
 - Use CRM and project context to assess urgency. No reply from an at_risk deal contact = high urgency.
@@ -42,10 +44,12 @@ Other rules:
 
 Output format per item:
 {
-  "email_index": 1,
+  "email_index": <integer matching the [N] in the EMAIL block header>,
   "needs_followup": true,
-  "urgency": "high",
-  "reason": "...",
-  "suggested_approach": "...",
-  "days_waiting": 5
+  "urgency": "high" | "medium" | "low",
+  "reason": "<one sentence — see rules above>",
+  "suggested_approach": "<one sentence — see rules above>"
 }
+
+Do NOT include `days_waiting` or any other numeric time field — the platform
+computes those deterministically and any value you provide will be ignored.

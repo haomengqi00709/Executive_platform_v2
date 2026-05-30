@@ -309,7 +309,12 @@ def run(
             continue
 
         to_email, to_name = _get_primary_recipient(msg)
-        days = assessment.get("days_waiting") or _days_since(msg.get("sentDateTime") or "")
+        # Compute days waiting from the real sentDateTime — never trust an
+        # AI-supplied value. Earlier the code used `assessment.get(...) or _days_since(...)`
+        # which (a) silently took whatever number the AI hallucinated and (b)
+        # treated a legitimate 0 as falsy. Now the AI prompt explicitly does not
+        # return this field; we ignore any stray value it might still emit.
+        days = _days_since(msg.get("sentDateTime") or "")
 
         contact = crm_contacts.get(to_email)
         contact_summary = None

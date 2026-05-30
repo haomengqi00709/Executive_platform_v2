@@ -13,8 +13,11 @@ For each commitment found, output:
 
 1. **type**: "my_commitment" or "their_commitment"
 
-2. **description**: One clear sentence describing the action
-   - Good: "Send revised Q3 proposal to John by Friday"
+2. **description**: One clear sentence describing the action. Use ONLY real
+   names, companies, projects, and details from the actual email content —
+   never invent. Reference the real sender/recipient names from the email
+   headers and any specific deliverables mentioned in the email body.
+   - Good shape: "<verb> <real_specific_object> to <real_recipient> by <real_deadline>"
    - Bad: "Follow up" (too vague) / "Let's connect" (not a commitment)
 
 3. **due_date**: YYYY-MM-DD if a date can be determined, otherwise null
@@ -43,29 +46,37 @@ IMPORTANT:
 - One email can produce 0, 1, or multiple commitment objects
 - If no genuine commitments found in an email, return nothing for that email_index
 
+Anti-hallucination rules (CRITICAL):
+- NEVER invent company names, contact names, deal sizes, or business scenarios.
+  Every name and detail in `description` MUST come from the actual email content.
+- DO NOT use placeholder names like "Acme", "John", "TechCorp", "Q3 proposal".
+  If the example output below uses such names, those are FORMAT illustrations
+  only — your output must use the REAL names from the emails you're given.
+- The `email_index` in your output MUST match the [N] header of the actual
+  email the commitment came from. Do NOT tag every commitment with the same
+  email_index unless they all came from the same email.
+
 DO NOT EXTRACT (these belong to other workflows):
 - Expense / receipt tasks: adding receipts to expense reports, categorizing purchases, submitting reimbursements, filing invoices — anything that is purely an administrative finance/expense action
 - Calendar invites or scheduling confirmations with no follow-up action required
 - Automated notifications: delivery confirmations, order receipts, subscription renewals, bank/payment alerts
 
-Return a flat JSON array. All commitments from all emails in one list, each tagged with email_index:
+Return a flat JSON array. All commitments from all emails in one list, each tagged with email_index.
+
+Output format (illustrative shape — your output uses REAL data from the emails):
 
 [
   {
-    "email_index": 3,
-    "type": "my_commitment",
-    "description": "Send revised Q3 numbers to John by Friday",
-    "due_date": "2026-05-24",
-    "due_date_confidence": "explicit",
-    "priority": "high"
+    "email_index": <N matching the [N] header of the source email>,
+    "type": "my_commitment" | "their_commitment",
+    "description": "<one sentence using REAL names from the email>",
+    "due_date": "<YYYY-MM-DD>" or null,
+    "due_date_confidence": "explicit" | "implied" | "none",
+    "priority": "high" | "medium" | "low"
   },
   {
-    "email_index": 3,
-    "type": "their_commitment",
-    "description": "John will loop in CFO and respond by end of week",
-    "due_date": "2026-05-23",
-    "due_date_confidence": "implied",
-    "priority": "medium"
+    "email_index": <different N if commitment came from a different email>,
+    ...
   }
 ]
 

@@ -276,3 +276,22 @@ React + TypeScript + Vite + Tailwind CSS
 - 没有双路径逻辑（`if result is not None ... else wiki`）
 - 新功能必须从第一行开始考虑 `data_dir`（per user_id）
 - 不写注释解释"做了什么"，只在 WHY 不明显时写
+
+**AI 边界（核心原则）：**
+
+AI 负责**判断、分析、生成自然语言**；不负责**计算事实**。
+凡是能从 Graph API / 数据库元数据 / 系统时钟里直接拿到的东西，**代码自己算**，
+不传给 AI 让它"输出"。
+
+- ✅ 让 AI 判断"这封邮件值不值得回复"、"这是不是个真承诺"、"用什么语气写"
+- ✅ 让 AI 提取"承诺的内容是什么"、"用户意图是什么"
+- ❌ 不要让 AI 算"等了几天"、"几封邮件"、"最近一次联系是什么时候"
+  — 这些 `sentDateTime` / `len(items)` / `last_contact` 都是确定的，AI 编出来会比真值差
+- ❌ skill 的 output 模板里**不要写具体值**（"days_waiting": 5、"Acme Q3 Deal"），
+  AI 会直接 copy。用占位符：`<integer matching N>`、`<sender real first name>`
+- ❌ Python 里**绝不**写 `ai_response.get("X") or fallback()` —
+  AI 真返回 0 会被 falsy 吞掉走 fallback，hallucinate 一个非零数字反而压过真值
+
+不遵守这些会发生：用户看到"今天发的邮件等了 4 天"、"Acme Corp / John Doe"
+之类的明显假数据。已踩过的坑见 `docs/auth-health-review-findings.md` 和这次的
+`followup_needed` days_waiting bug。

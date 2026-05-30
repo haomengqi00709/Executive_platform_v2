@@ -49,10 +49,10 @@ Other rules:
 
 Output format per item:
 {
-  "email_index": 1,
+  "email_index": <integer matching the [N] in the EMAIL block header>,
   "needs_reply": true,
-  "priority": "high",
-  "reason": "...",
-  "reply_tone": "formal",
-  "suggested_opening": "..."
+  "priority": "high" | "medium" | "low",
+  "reason": "<one sentence — see rules above>",
+  "reply_tone": "formal" | "casual" | "brief",
+  "suggested_opening": "<one sentence starting with the sender's real first name>"
 }
