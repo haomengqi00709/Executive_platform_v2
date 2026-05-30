@@ -339,9 +339,38 @@ function SettingsPage({ user }: { user: AuthUser }) {
         const r = await fetch('/api/teams/bot/auth-poll', { method: 'POST', credentials: 'include' });
         const d = await r.json();
         if (d.status === 'success') {
-          await fetch(`/api/teams/bot/activate?bot_uid=${d.bot_uid}`, { method: 'POST', credentials: 'include' });
-          setBotSuccess('AI assistant connected! Open Microsoft Teams to start chatting.');
+          // The token is now in our session, but the bot isn't yet bound to
+          // this user — activate does the binding. Without checking the
+          // activate response, a 409 ("already claimed") or 400 ("can't bind
+          // your own account as the bot") would silently look like success
+          // to the user, then bite them hours later when nothing works.
+          const activateRes = await fetch(`/api/teams/bot/activate?bot_uid=${d.bot_uid}`, {
+            method: 'POST', credentials: 'include',
+          });
           setBotPolling(false); setBotConnecting(false); setDeviceCode(null);
+
+          if (!activateRes.ok) {
+            const err = await activateRes.json().catch(() => ({} as any));
+            const detail: string = err?.detail || err?.message || '';
+            let msg: string;
+            if (activateRes.status === 409) {
+              msg = 'This AI assistant account is already claimed by another user. '
+                  + 'Ask that user to disconnect first, or contact your admin to unbind.';
+            } else if (activateRes.status === 400) {
+              msg = detail || 'Cannot bind: the AI assistant must be a different '
+                  + 'Microsoft account than your own. When prompted at '
+                  + 'microsoft.com/devicelogin, sign in as the AI assistant '
+                  + 'account, not your personal account.';
+            } else if (activateRes.status === 404) {
+              msg = 'Bot account not found after device flow. Please retry.';
+            } else {
+              msg = `Activation failed (HTTP ${activateRes.status})${detail ? ': ' + detail : ''}`;
+            }
+            setBotError(msg);
+            return;
+          }
+
+          setBotSuccess('AI assistant connected! Open Microsoft Teams to start chatting.');
           const bs = await fetch('/api/teams/bot', { credentials: 'include' });
           if (bs.ok) setBotStatus(await bs.json());
         } else if (d.status === 'pending' || d.status === 'authorization_pending') {
