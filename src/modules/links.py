@@ -9,15 +9,20 @@ from urllib.parse import quote, urlparse
 
 
 def _app_base_url() -> str:
-    """Public base URL for redirector links. Same pattern as auth_notifier.APP_URL:
-    explicit APP_URL wins, otherwise strip /auth/* off REDIRECT_URI, finally
-    fall back to localhost for dev."""
-    url = (
-        os.getenv("APP_URL")
-        or os.getenv("REDIRECT_URI", "").rsplit("/auth/", 1)[0]
-        or "http://localhost:8000"
-    )
-    return url.rstrip("/")
+    """Public base URL for redirector links.
+
+    Resolution order: APP_URL → REDIRECT_URI (with /auth/* stripped).
+    Returns "" when neither yields a deployed URL (i.e. localhost or unset).
+    Callers must handle the empty case by not wrapping the URL with a redirect,
+    so users in Teams always get a clickable link instead of a dead localhost."""
+    url = os.getenv("APP_URL") or os.getenv("REDIRECT_URI", "").rsplit("/auth/", 1)[0]
+    if not url:
+        return ""
+    url = url.rstrip("/")
+    # localhost links would be dead for any Teams user — treat as "no base URL"
+    if url.startswith("http://localhost") or url.startswith("http://127."):
+        return ""
+    return url
 
 
 _OUTLOOK_HOSTS = (
@@ -42,4 +47,9 @@ def wrap_draft_link(web_link: str) -> str:
         return web_link
     if not any(host == h or host.endswith("." + h) for h in _OUTLOOK_HOSTS):
         return web_link
-    return f"{_app_base_url()}/r/draft?url={quote(web_link, safe='')}"
+    base = _app_base_url()
+    if not base:
+        # No deployed base URL — pass the Outlook web_link through unchanged
+        # rather than emit a dead-end localhost or example.com link.
+        return web_link
+    return f"{base}/r/draft?url={quote(web_link, safe='')}"

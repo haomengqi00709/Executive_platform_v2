@@ -37,15 +37,22 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
 app = FastAPI(title="CEO AI Platform v2")
 
+# CORS restricted to deployed origin(s). FRONTEND_URL may be a single URL
+# or a comma-separated list (handy for dev with multiple local ports).
+_allowed_origins = [o.strip() for o in FRONTEND_URL.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_allowed_origins,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Timezone"],
     allow_credentials=True,
 )
 
-Path(".data/_sessions").mkdir(parents=True, exist_ok=True)
+# Session cookies use Secure flag when serving over HTTPS.
+# Auto-detect from REDIRECT_URI so local dev (http://localhost) still works.
+_SECURE_COOKIE = os.getenv("REDIRECT_URI", "").startswith("https://")
+
+(auth.DATA_DIR / "_sessions").mkdir(parents=True, exist_ok=True)
 
 _device_flow: dict = {}
 _device_flow_lock = threading.Lock()
@@ -148,7 +155,7 @@ def auth_callback(code: str = None, state: str = None, error: str = None,
 
     jwt_token = auth.create_jwt(user_id, username)
     resp = RedirectResponse(f"{FRONTEND_URL}/")
-    resp.set_cookie("session_token", jwt_token, httponly=True, secure=False, max_age=60*60*24*7, samesite="lax")
+    resp.set_cookie("session_token", jwt_token, httponly=True, secure=_SECURE_COOKIE, max_age=60*60*24*7, samesite="lax")
     resp.delete_cookie("oauth_state")
     resp.delete_cookie("oauth_redirect")
     _ensure_onedrive_folders(user_id)
@@ -238,7 +245,7 @@ def auth_poll(response: Response):
                 })
                 jwt_token = auth.create_jwt(user_id, username)
                 response.set_cookie("session_token", jwt_token, httponly=True,
-                                    secure=False, max_age=60*60*24*7, samesite="lax")
+                                    secure=_SECURE_COOKIE, max_age=60*60*24*7, samesite="lax")
                 _ensure_onedrive_folders(user_id)
                 from src.modules.profile import is_profile_confirmed, init_has_started, save_init_status
                 if not is_profile_confirmed(_udir(user_id)) and not init_has_started(_udir(user_id)):
@@ -1920,11 +1927,12 @@ def _log_outbound_to_history(uid: str, content: str) -> None:
     to .data/{uid}/bot_history.db so the web chat panel can see it too."""
     if not content:
         return
-    import sqlite3, time
+    import time
+    from src.modules.db_helpers import open_sqlite
     db_path = _udir(uid) / "bot_history.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        con = sqlite3.connect(str(db_path))
+        con = open_sqlite(db_path)
         con.execute(
             "CREATE TABLE IF NOT EXISTS history "
             "(id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, content TEXT, ts REAL)"
@@ -3886,14 +3894,14 @@ def bot_chat(body: dict, session: dict = Depends(require_session)):
 @app.get("/api/bot/history")
 def bot_history(limit: int = 20, session: dict = Depends(require_session)):
     """Return the most recent N turns of the bot conversation (shared with Teams)."""
-    import sqlite3
+    from src.modules.db_helpers import open_sqlite
     uid = session["user_id"]
     db_path = _udir(uid) / "bot_history.db"
     if not db_path.exists():
         return {"turns": []}
     limit = max(1, min(int(limit or 20), 100))
     try:
-        con = sqlite3.connect(str(db_path))
+        con = open_sqlite(db_path)
         rows = con.execute(
             "SELECT role, content, ts FROM history ORDER BY ts DESC LIMIT ?",
             (limit,),

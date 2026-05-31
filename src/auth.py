@@ -18,13 +18,43 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────
-CLIENT_ID          = os.getenv("CLIENT_ID",          "e6e14f41-4c7b-4c0d-b181-6710bd1c6444")
-TENANT_ID          = os.getenv("TENANT_ID",          "08d3a3f1-0366-451e-98ce-74626f1bf75f")
-PROD_CLIENT_ID     = os.getenv("PROD_CLIENT_ID",     "6e538eee-e90b-4432-bb14-329d5d70d623")
-PROD_CLIENT_SECRET = os.getenv("PROD_CLIENT_SECRET", "")
-REDIRECT_URI       = os.getenv("REDIRECT_URI",       "http://localhost:8000/auth/callback")
-SESSION_SECRET     = os.getenv("SESSION_SECRET",     "dev-secret-change-in-prod")
-DATA_DIR           = Path(os.getenv("DATA_DIR",      str(Path(__file__).parent.parent / ".data")))
+# Fail-fast pattern: production-critical env vars must be explicitly set.
+# Defaults only kept for things that have a safe local-dev meaning.
+
+def _required_env(name: str) -> str:
+    """Return env var value or raise with a clear message."""
+    v = os.getenv(name)
+    if not v:
+        raise RuntimeError(
+            f"{name} env var must be set. "
+            f"See .env.example for the full list of required variables."
+        )
+    return v
+
+PROD_CLIENT_ID     = _required_env("PROD_CLIENT_ID")
+PROD_CLIENT_SECRET = _required_env("PROD_CLIENT_SECRET")
+TENANT_ID          = _required_env("TENANT_ID")
+
+SESSION_SECRET = os.getenv("SESSION_SECRET")
+if not SESSION_SECRET or SESSION_SECRET == "dev-secret-change-in-prod":
+    raise RuntimeError(
+        "SESSION_SECRET must be set to a random secret (not the dev default). "
+        "Generate one: python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+    )
+
+# CLIENT_ID is used for device-flow (local dev / bot registration).
+# Keep a default for convenience but warn loudly so prod deploys notice.
+CLIENT_ID = os.getenv("CLIENT_ID")
+if not CLIENT_ID:
+    CLIENT_ID = "e6e14f41-4c7b-4c0d-b181-6710bd1c6444"
+    print("[Auth WARNING] CLIENT_ID not set — using dev default. Set explicitly in production.")
+
+# REDIRECT_URI defaults to localhost so local dev "just works".
+# Web OAuth derives the callback URL from request headers at runtime
+# (src/server.py:_detect_redirect_uri), so this default rarely matters in deployed environments.
+REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8000/auth/callback")
+
+DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).parent.parent / ".data")))
 
 AUTHORITY_COMMON = "https://login.microsoftonline.com/common"
 AUTHORITY_LEGACY = f"https://login.microsoftonline.com/{TENANT_ID}"
@@ -52,21 +82,6 @@ SCOPES_LOCAL = [
 CACHE_FILE = DATA_DIR / ".token_cache.json"
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_DAYS = 7
-
-# On startup: if AUDREY_TOKEN_CACHE env var is set and file doesn't exist, write it
-def _seed_token_cache():
-    import base64
-    encoded = os.getenv("AUDREY_TOKEN_CACHE", "")
-    if encoded and not CACHE_FILE.exists():
-        try:
-            CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            CACHE_FILE.write_text(base64.b64decode(encoded).decode())
-            print(f"[Auth] Seeded Audrey token cache from env var → {CACHE_FILE}")
-        except Exception as e:
-            print(f"[Auth] Failed to seed token cache: {e}")
-
-_seed_token_cache()
-
 
 # ── User data paths ───────────────────────────────────────
 

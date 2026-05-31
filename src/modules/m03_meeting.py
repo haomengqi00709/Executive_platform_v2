@@ -24,10 +24,21 @@ Post-processing per meeting:
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+# Fail-fast: m03 uses ffmpeg + ffprobe for audio extraction and duration probe
+# (see calls at lines ~538, 552, 573 below). The Dockerfile installs them via
+# apt-get; if base image drifts or someone reverts the Dockerfile, fail loudly
+# at startup instead of silently dropping every meeting recording.
+if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+    raise RuntimeError(
+        "m03_meeting requires ffmpeg + ffprobe in PATH. "
+        "Install: apt-get install -y ffmpeg (Debian/Ubuntu) or brew install ffmpeg (macOS)."
+    )
 
 from src.graph import GraphClient
 from src.ai import AIClient

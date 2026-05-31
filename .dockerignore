@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# User data — NEVER bake into image; mounted at runtime from Azure Files
+.data/
+
+# Node — Stage 1 build emits frontend/dist; node_modules not needed in final image
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Tests (integration tests need real credentials; don't ship to prod image)
+test_*.py
+test_scripts/
+test_all_graph_apis.py
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Railway artifacts (Azure ignores)
+Procfile
+
+# Local dev / admin scripts
+scripts/
+
+# Documentation (note: do NOT exclude *.md — src/skills/*/skill.md is read at runtime
+# as AI prompts. Keep .md files. Only exclude the standalone docs folder.)
+docs/

@@ -295,3 +295,82 @@ AI 负责**判断、分析、生成自然语言**；不负责**计算事实**。
 不遵守这些会发生：用户看到"今天发的邮件等了 4 天"、"Acme Corp / John Doe"
 之类的明显假数据。已踩过的坑见 `docs/auth-health-review-findings.md` 和这次的
 `followup_needed` days_waiting bug。
+
+---
+
+## 部署：Railway + Azure 双轨 (同一代码，不同 infra)
+
+### 核心模型
+
+**ONE 代码库（main 分支），TWO 部署目标，差异在 deploy 配置而非代码。**
+
+```
+GitHub main 分支
+    │
+    ├──► Railway (内部测试 / 自动 rebuild on push)
+    └──► Azure App Service (客户演示 / 手动 az acr build)
+```
+
+代码改动**默认推 main**，两边都收益。
+
+### 两个平台的差异（**只在配置层，不在代码层**）
+
+| 项 | Railway | Azure |
+|---|---|---|
+| `DATA_DIR` env | 默认 `.data` (相对路径) | `/mnt/data` |
+| `.data/` 持久化 | Railway volume mount | Azure Files (`ceodata` mount) |
+| Container image 来源 | Railway 自建 | `ceoplatformv2acr.azurecr.io/ceo-platform:vN` |
+| 启动端口 | `$PORT` (Railway 注入) | `WEBSITES_PORT=8080` (Azure 注入) |
+| OAuth App Registration | 共享同一个 (`PROD_CLIENT_ID=6e538eee-...`)，redirect URI 列表两个 URL 都在 |
+
+代码用 env vars 适配两边——`src/auth.py:27` `DATA_DIR = os.getenv("DATA_DIR", ...)` 是范式。
+
+### 什么时候用 branch（罕见）
+
+**默认不用 branch**。只在**真正实验性、可能搞坏另一边**时用 feature branch：
+
+| 场景 | 用 branch? |
+|---|---|
+| 加 ffmpeg / 改 Dockerfile / 加前端 page | ❌ 直接进 main |
+| 给 Azure 加 Application Insights / Key Vault SDK | ❌ Railway 也能跑（向后兼容） |
+| 实验 Azure OpenAI 替代 Gemini（大改 ai.py） | ✅ feature branch，验证后 merge |
+| 重写 m03 用别的库 | ✅ feature branch |
+| Per-customer 定制（不该有，用 env / settings 走） | ❌ 一定走配置 |
+
+**原则**：除非改动**只对一个平台有意义**或**可能炸另一个**，否则进 main。
+
+### 想控制 Railway rebuild 时机
+
+不用 branch。用：
+1. Railway dashboard → 关 auto-deploy → 手动 trigger
+2. Push 前本地 Docker build 测试
+3. Push 后立刻盯 Railway 日志，有问题 rollback
+
+### Azure 部署的手动操作
+
+每次想让 Azure 拉新代码：
+```bash
+# 在 main 分支
+az acr build --registry ceoplatformv2acr --image ceo-platform:vN \
+  --image ceo-platform:latest --platform linux/amd64 .
+az webapp config container set --name ceo-platform-v2 --resource-group ceo-platform \
+  --docker-custom-image-name ceoplatformv2acr.azurecr.io/ceo-platform:vN
+az webapp restart --name ceo-platform-v2 --resource-group ceo-platform
+```
+
+**每次 build 用新 tag (`v2`, `v3`, ...)** ——`v1` 等老 tag 保留作回滚目标。
+
+### Azure-specific 资源（不在代码里）
+
+- ACR: `ceoplatformv2acr` (image registry)
+- Storage Account: `ceoplatformv2data` (StorageV2 + GPv2, file share `data`)
+  - 老的 `ceoplatformv2storage` 是 FileStorage kind，App Service 不能挂，保留待删
+- App Service: `ceo-platform-v2` (B1 Linux Container, Always On)
+- URL: `https://ceo-platform-v2-g7fuddhnhreqdeax.canadacentral-01.azurewebsites.net`
+
+### 常见踩坑（不要重复）
+
+- **Azure mount path 不能含 `.`** —— 挂 `/mnt/data` 不挂 `/app/.data`，配合 `DATA_DIR=/mnt/data` env
+- **Storage account kind 必须 `StorageV2`** —— `FileStorage` 的 ProvisionedV2 SMB App Service 不支持
+- **Mac M 系列 build 必须 `--platform linux/amd64`** —— 用 `az acr build` 自动正确；本地 Docker 必须显式加
+- **不要用 sitecontainers API** —— 跟老版 `linuxFxVersion=DOCKER\|...` 冲突；用老版 `DOCKER_CUSTOM_IMAGE_NAME` + `az webapp config storage-account add`

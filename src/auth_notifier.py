@@ -27,8 +27,14 @@ from src.graph import GraphClient
 REMINDER_AFTER_DAYS = 7
 MAX_EMAILS = 2
 
-APP_URL = (os.getenv("APP_URL") or os.getenv("REDIRECT_URI", "").rsplit("/auth/", 1)[0]
-           or "https://your-app.example.com").rstrip("/")
+_app_url = os.getenv("APP_URL") or os.getenv("REDIRECT_URI", "").rsplit("/auth/", 1)[0]
+if not _app_url:
+    raise RuntimeError(
+        "auth_notifier requires APP_URL or REDIRECT_URI env var "
+        "(emails to users about broken sign-in need a real reconnect link, "
+        "not a placeholder)."
+    )
+APP_URL = _app_url.rstrip("/")
 RECONNECT_PATH = "/#settings"  # Settings page hosts the AI Assistant reconnect UI
 
 def _dead_letter_path(broken_uid: str) -> Path:

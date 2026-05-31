@@ -6,7 +6,6 @@ Returns: (reply_text, updated_state)
 """
 import json
 import os
-import sqlite3
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -15,6 +14,7 @@ from pathlib import Path
 from google import genai
 from google.genai import types
 
+from src.modules.db_helpers import open_sqlite
 from src.modules.profile import load_profile_context
 
 MODEL        = "gemini-3.5-flash"
@@ -52,7 +52,7 @@ def _client() -> genai.Client:
 
 def _load_history(db_path: Path, limit: int = HISTORY_LIMIT) -> list:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(db_path))
+    con = open_sqlite(db_path)
     con.execute(
         "CREATE TABLE IF NOT EXISTS history "
         "(id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, content TEXT, ts REAL)"
@@ -70,7 +70,7 @@ def _load_history(db_path: Path, limit: int = HISTORY_LIMIT) -> list:
 
 
 def _save_turn(db_path: Path, user_text: str, assistant_text: str):
-    con = sqlite3.connect(str(db_path))
+    con = open_sqlite(db_path)
     ts = time.time()
     con.execute("INSERT INTO history (role, content, ts) VALUES (?, ?, ?)", ("user",  user_text,       ts))
     con.execute("INSERT INTO history (role, content, ts) VALUES (?, ?, ?)", ("model", assistant_text,  ts + 0.001))
