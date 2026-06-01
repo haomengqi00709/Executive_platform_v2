@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   Loader2, Search, EyeOff, ChevronDown, ChevronRight, Save,
-  Users, MessageSquare, CalendarClock, Tag, Activity, Archive, GitMerge, RefreshCw, Upload,
+  Users, MessageSquare, CalendarClock, Tag, Activity, Archive, GitMerge, RefreshCw, Upload, Download,
 } from 'lucide-react';
-import { getProjects, patchProject, relativeTime, archiveRecord, scanProjects } from '../../lib/api';
+import { getProjects, patchProject, relativeTime, archiveRecord, scanProjects, projectsExportXlsxUrl } from '../../lib/api';
 import type { ProjectRecord } from '../../lib/api';
 import MergePicker from './MergePicker';
 import BulkUploadModal from './BulkUploadModal';
@@ -152,6 +152,14 @@ export default function ProjectsTab() {
             />
             Show ignored
           </label>
+          <a
+            href={projectsExportXlsxUrl}
+            download
+            className="flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg border border-executive-border text-executive-muted hover:text-executive-text hover:bg-executive-border/40"
+            title="Download all projects as Excel"
+          >
+            <Download size={12} /> Excel
+          </a>
           <button
             onClick={rescan}
             disabled={scanning}

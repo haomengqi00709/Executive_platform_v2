@@ -371,6 +371,14 @@ export function scanCompanies(): Promise<{ ok: boolean }> {
   return fetchJson(`/api/companies/scan`, { method: 'POST' });
 }
 
+// ── Excel exports (full dataset; backend builds xlsx) ─────
+// Hand these to an <a download href={...}> — the session cookie is sent
+// automatically and the browser triggers a download via Content-Disposition.
+
+export const crmExportXlsxUrl       = '/api/crm/export.xlsx';
+export const projectsExportXlsxUrl  = '/api/projects/export.xlsx';
+export const companiesExportXlsxUrl = '/api/companies/export.xlsx';
+
 // ── DB Cleanup (manual direct actions) ────────────────────
 
 export function mergeProjectsDirect(keep_id: string, merge_id: string): Promise<{ ok: boolean }> {

@@ -16,10 +16,20 @@ from google.genai import types
 
 from src.modules.db_helpers import open_sqlite
 from src.modules.profile import load_profile_context
+from src.modules.subject_match import normalize_subject
+from src.modules.wiki import load_index, load_meeting
 
 MODEL        = "gemini-3.5-flash"
 MAX_ROUNDS   = 8
 HISTORY_LIMIT = 20
+
+
+def _with_indices(items: list[dict]) -> list[dict]:
+    """Prefix each item with a 1-based `index` field. Single source of truth
+    for the [#N] convention all list-returning tools share — the AI displays
+    items as `[#N] …` and resolves user's later `#N` references against the
+    canonical IDs (email_id / event_id / draft_id / …) on each item."""
+    return [{"index": i + 1, **(it or {})} for i, it in enumerate(items or [])]
 
 SECTION_IDS = {
     "ai_summary":           "Morning Briefing — daily summary of calendar, emails, priorities, and key relationships",
@@ -225,12 +235,30 @@ def reply(
         f"Today: {now_str}. Timezone: {timezone_str}.\n"
         f"Be concise, professional, action-oriented. Use bullet points for lists.\n"
         f"Never invent data. Respond in the same language the user writes in.\n\n"
+        f"LIST FORMATTING (important):\n"
+        f"  When a tool returns a list (emails, meetings, contacts, drafts, action items, etc.),\n"
+        f"  display each item prefixed with [#N] starting at 1, e.g.:\n"
+        f"    [#1] Sarah Chen — \"Q3 budget question\" (2 days ago)\n"
+        f"    [#2] Bob Smith — \"Renewal notice\"\n"
+        f"  Tool outputs already include an `index` field and a canonical ID\n"
+        f"  (email_id / event_id / draft_id / id / etc.) on each item.\n\n"
+        f"  When the user later says \"#N\", \"number N\", or just \"N\" referring to a list,\n"
+        f"  look up item N in the MOST RECENT list-returning tool output above in this\n"
+        f"  conversation. Read its canonical ID from the JSON and pass that ID (or the\n"
+        f"  to/subject/etc fields off that item) into the action tool. NEVER retype\n"
+        f"  subjects, recipients, or names from memory — copy them from the JSON output.\n\n"
+        f"  If the user says #N but no recent list is visible in this conversation,\n"
+        f"  ask which list they mean (or re-run the appropriate read tool first).\n\n"
         f"TOOL ROUTING:\n"
         f"  get_recent_emails          → 'show my emails', 'what did X send', 'unread messages'\n"
         f"  get_upcoming_meetings      → 'what meetings do I have', 'who is in my next call'\n"
         f"  get_contact_history        → 'history with X', 'last email from John'\n"
         f"  get_email_frequency_report → 'who do I email most', 'most active contacts'\n"
         f"  read_module_result         → 'what did the briefing say', 'show last email analysis'\n"
+        f"  check_email_handling       → 'did I reply to Sarah?', 'what happened with the Acme email?', 'has the X thread been handled?'\n"
+        f"                               Reports whether the email is still open or already handled (replied / drafted / subject_match / meeting).\n"
+        f"  get_meeting_summary        → 'what did we decide in the Q3 meeting?', 'summarize my meeting with John', 'recap last week's sync'\n"
+        f"                               After check_email_handling returns kind=meeting, call this with the target_id or target_subject to fetch the recap.\n"
         f"  search_web                 → 'news about X', 'industry trends' (NOT own inbox/calendar)\n"
         f"  read_settings              → 'what are my settings', 'show my ignore list'\n"
         f"  update_setting             → 'ignore emails from X', 'add rule Y'\n"
@@ -273,7 +301,9 @@ def reply(
     # --- Query tools ---
 
     def get_recent_emails(hours_back: int = 48, top: int = 15) -> str:
-        """Get emails received in the last N hours. Returns subject, sender, received time, preview, is_read, importance."""
+        """Get emails received in the last N hours. Each item carries `index` (1-based)
+        and `email_id` (canonical Graph id) so the user can later refer to emails by
+        #N and you can call action tools with the resolved email_id."""
         if owner_graph is None:
             return "Owner account not available."
         try:
@@ -289,6 +319,7 @@ def reply(
                 except Exception:
                     pass
                 result.append({
+                    "email_id":   m.get("id", ""),
                     "subject":    m.get("subject", ""),
                     "from":       m.get("from", {}).get("emailAddress", {}).get("address", ""),
                     "received":   recv[:16],
@@ -296,13 +327,16 @@ def reply(
                     "is_read":    m.get("isRead", True),
                     "importance": m.get("importance", "normal"),
                 })
+            result = _with_indices(result)
             print(f"[Bot] get_recent_emails({hours_back}h) → {len(result)}")
             return json.dumps(result, ensure_ascii=False)
         except Exception as e:
             return f"Error: {e}"
 
     def get_upcoming_meetings(hours_ahead: int = 24) -> str:
-        """Get calendar meetings in the next N hours. Returns title, start time, end time, attendee emails, location."""
+        """Get calendar meetings in the next N hours. Each item carries `index` and
+        `event_id` (canonical Graph calendar event id) so the user can refer to a
+        meeting by #N and you can call get_meeting_summary with the event_id."""
         if owner_graph is None:
             return "Owner account not available."
         try:
@@ -320,12 +354,14 @@ def reply(
                     for a in (e.get("attendees") or [])
                 ]
                 result.append({
+                    "event_id":  e.get("id", ""),
                     "title":     e.get("subject", ""),
                     "start":     (e.get("start") or {}).get("dateTime", "")[:16],
                     "end":       (e.get("end") or {}).get("dateTime", "")[:16],
                     "attendees": attendees,
                     "location":  e.get("location", {}).get("displayName", ""),
                 })
+            result = _with_indices(result)
             print(f"[Bot] get_upcoming_meetings({hours_ahead}h) → {len(result)}")
             return json.dumps(result, ensure_ascii=False)
         except Exception as e:
@@ -361,6 +397,10 @@ def reply(
                         result["writing_style_note"] = ws
                 except Exception:
                     pass
+            # Independent 1-based index on each sub-list so the user can say
+            # "tell me about meeting #2" or "draft for email #3".
+            result["emails"]   = _with_indices(result["emails"])
+            result["meetings"] = _with_indices(result["meetings"])
             print(f"[Bot] get_contact_history({email})")
             return json.dumps(result, ensure_ascii=False)
         except Exception as e:
@@ -385,17 +425,21 @@ def reply(
                 sender = m.get("from", {}).get("emailAddress", {}).get("address", "")
                 if sender:
                     counts[sender] += 1
-            result = [
+            result = _with_indices([
                 {"email": email, "email_count": count}
                 for email, count in counts.most_common(top_n)
-            ]
+            ])
             print(f"[Bot] get_email_frequency_report({days_back}d) → {len(result)} contacts")
             return json.dumps(result, ensure_ascii=False)
         except Exception as e:
             return f"Error: {e}"
 
     def read_module_result(section_id: str) -> str:
-        """Read the latest cached result for a section.
+        """Read the latest cached result for a section. If the result contains an
+        `items` list, each item gets a 1-based `index` field added so the user can
+        refer to items by #N. Canonical IDs (email_id / id / project_id …) stay on
+        each item so you can call action tools with them.
+
         section_id must be one of: ai_summary, market_intelligence, company_intelligence,
         reply_needed, followup_needed, commitments_extract, upcoming_commitments,
         recent_meetings, meeting_action_items, relationship_health, business_insights, expenses"""
@@ -406,6 +450,13 @@ def reply(
             return f"No results for '{section_id}' yet. Run the section first with run_skill()."
         try:
             data = json.loads(result_path.read_text())
+            # Decorate items[] in place with index. Sidecar lists like handled[]
+            # also get indexed so `check_email_handling` and follow-up references
+            # stay consistent.
+            if isinstance(data.get("items"), list):
+                data["items"] = _with_indices(data["items"])
+            if isinstance(data.get("handled"), list):
+                data["handled"] = _with_indices(data["handled"])
             print(f"[Bot] read_module_result({section_id})")
             return json.dumps(data, ensure_ascii=False)
         except Exception as e:
@@ -657,18 +708,30 @@ def reply(
             return f"Error saving draft: {e}"
 
     def list_pending_drafts() -> str:
-        """List all pending email drafts waiting for approval."""
+        """List all pending email drafts waiting for approval. Returns JSON with
+        `index` per item — index 1 is the CURRENT draft (the one approve_draft /
+        skip_draft will act on), indices 2+ are the queued drafts behind it.
+        Each item carries `to`, `subject`, `body` (truncated)."""
         nonlocal state
         queue   = list(state.get("pending_queue") or [])
         current = state.get("pending_draft")
         if not current and not queue:
-            return "No pending drafts."
-        items = []
+            return json.dumps({"pending": [], "note": "No pending drafts."}, ensure_ascii=False)
+
+        def _shape(d: dict, is_current: bool) -> dict:
+            return {
+                "to":         d.get("to", ""),
+                "subject":    d.get("subject", ""),
+                "body":       (d.get("body") or "")[:400],
+                "is_current": is_current,
+            }
+
+        items: list[dict] = []
         if current:
-            items.append(f"Current: To: {current.get('to','?')} — Subject: {current.get('subject','?')}")
-        for i, d in enumerate(queue):
-            items.append(f"Queue {i+1}: To: {d.get('to','?')} — Subject: {d.get('subject','?')}")
-        return "\n".join(items)
+            items.append(_shape(current, True))
+        for d in queue:
+            items.append(_shape(d, False))
+        return json.dumps({"pending": _with_indices(items)}, ensure_ascii=False)
 
     def approve_draft() -> str:
         """Approve and save the current pending email draft to the user's Outlook Drafts folder."""
@@ -889,6 +952,190 @@ def reply(
         except Exception as e:
             return f"Error: {e}"
 
+    def check_email_handling(query: str) -> str:
+        """Check whether a recent email (in reply_needed / followup_needed) has been handled,
+        and if so HOW (replied / drafted / subject_match / meeting).
+
+        query: free-text hint matching sender/recipient name, email address, or any subject keyword.
+        Use when the user asks 'did I reply to X?', 'what happened with X's email?',
+        'has the X thread been handled?'. Returns up to 8 matches in JSON.
+
+        Each result contains: section, email_id, subject, who (sender or recipient),
+        status='open' (still in items[]) or 'handled' (in handled[] sidecar) with handled_by detail."""
+        if not data_dir:
+            return "No data directory available."
+        q = (query or "").strip()
+        if not q:
+            return "Please provide a query (sender name, subject keyword, etc.)."
+        q_low = q.lower()
+        q_norm = normalize_subject(q)
+
+        def _scan(section_id: str, who_key: str) -> list[dict]:
+            path = data_dir / "results" / f"{section_id}.json"
+            if not path.exists():
+                return []
+            try:
+                data = json.loads(path.read_text())
+            except Exception:
+                return []
+            out = []
+            who_name_key = "from_name" if who_key == "from_email" else "to_name"
+            # Open items (still need attention)
+            for it in (data.get("items") or []):
+                subj = it.get("subject") or ""
+                who_email = (it.get(who_key) or "")
+                who_name = (it.get(who_name_key) or "")
+                hay = f"{subj} {who_name} {who_email}".lower()
+                hay_norm = normalize_subject(subj)
+                if q_low in hay or (q_norm and q_norm in hay_norm):
+                    out.append({
+                        "section":  section_id,
+                        "email_id": it.get("email_id"),
+                        "subject":  subj,
+                        "who":      who_email,
+                        "status":   "open",
+                    })
+            # Handled sidecar (auto-detected as resolved)
+            for h in (data.get("handled") or []):
+                hay = f"{h.get('email_subject','')} {h.get('email_from','')} {h.get('email_to','')}".lower()
+                hay_norm = normalize_subject(h.get("email_subject", ""))
+                if q_low in hay or (q_norm and q_norm in hay_norm):
+                    out.append({
+                        "section":    section_id,
+                        "email_id":   h.get("email_id"),
+                        "subject":    h.get("email_subject"),
+                        "who":        h.get("email_from") or h.get("email_to"),
+                        "status":     "handled",
+                        "handled_by": h.get("handled_by"),
+                    })
+            return out
+
+        matches = _scan("reply_needed", "from_email") + _scan("followup_needed", "to_email")
+
+        # Dedup by (section, email_id)
+        seen = set()
+        unique = []
+        for m in matches:
+            key = (m["section"], m["email_id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(m)
+
+        print(f"[Bot] check_email_handling({query!r}) → {len(unique)} matches")
+        if not unique:
+            return json.dumps({
+                "matches": [],
+                "note": f"No recent email matches '{query}' in reply_needed or followup_needed. "
+                        f"The system only tracks emails from the last 14 days.",
+            }, ensure_ascii=False)
+        return json.dumps({"matches": _with_indices(unique[:8])}, ensure_ascii=False)
+
+    def get_meeting_summary(event_id_or_subject: str) -> str:
+        """Look up a meeting summary. Tries (a) wiki by exact meeting_id or title substring;
+        falls back to (b) live calendar event for unrecorded scheduled meetings (no summary).
+
+        Use when the user asks 'what was discussed in the Q3 meeting?',
+        'summarize my meeting with John', 'recap last week's sync'.
+
+        event_id_or_subject: Graph calendar event id (long), wiki meeting_id (ondrive_*/mock_*),
+                             or any substring of the meeting title."""
+        if not data_dir:
+            return "No data directory available."
+        q = (event_id_or_subject or "").strip()
+        if not q:
+            return "Please provide an event id or subject keyword."
+        q_low = q.lower()
+        q_norm = normalize_subject(q)
+
+        # (1) Wiki search — exact meeting_id or title substring
+        if wiki_dir and wiki_dir.exists():
+            try:
+                idx = load_index(wiki_dir)
+                meetings = idx.get("meetings", {}) or {}
+                # Exact meeting_id match
+                if q in meetings:
+                    full = load_meeting(wiki_dir, q)
+                    if full:
+                        print(f"[Bot] get_meeting_summary({q}) → wiki exact id")
+                        return json.dumps({
+                            "source":      "wiki",
+                            "meeting_id":  q,
+                            "title":       full.get("title", ""),
+                            "date":        full.get("date", ""),
+                            "summary":     full.get("summary", ""),
+                            "decisions":   full.get("decisions", []),
+                            "action_items": full.get("action_items", []),
+                            "attendee_emails": full.get("attendee_emails", []),
+                        }, ensure_ascii=False)
+                # Title substring match
+                for mid, meta in meetings.items():
+                    title = (meta.get("title") or "")
+                    title_low = title.lower()
+                    if q_low in title_low or (q_norm and q_norm in normalize_subject(title)):
+                        full = load_meeting(wiki_dir, mid)
+                        if full:
+                            print(f"[Bot] get_meeting_summary({q}) → wiki title match {mid}")
+                            return json.dumps({
+                                "source":      "wiki",
+                                "meeting_id":  mid,
+                                "title":       full.get("title", ""),
+                                "date":        full.get("date", ""),
+                                "summary":     full.get("summary", ""),
+                                "decisions":   full.get("decisions", []),
+                                "action_items": full.get("action_items", []),
+                                "attendee_emails": full.get("attendee_emails", []),
+                            }, ensure_ascii=False)
+            except Exception as e:
+                print(f"[Bot] wiki lookup failed: {e}")
+
+        # (2) Calendar fallback — scheduled but unrecorded
+        if owner_graph is None:
+            return json.dumps({
+                "source":  "none",
+                "message": f"No wiki meeting matches '{q}', and calendar is not available.",
+            }, ensure_ascii=False)
+        try:
+            now = datetime.now(timezone.utc)
+            start = (now - timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            end = (now + timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            events = owner_graph.get_calendar_view(start, end, top=100)
+            # Exact event.id match
+            evt = next((e for e in events if e.get("id") == q), None)
+            if evt is None:
+                # Subject substring match — most recent first
+                events_sorted = sorted(
+                    events,
+                    key=lambda e: (e.get("start") or {}).get("dateTime", ""),
+                    reverse=True,
+                )
+                for e in events_sorted:
+                    subj = (e.get("subject") or "")
+                    if q_low in subj.lower() or (q_norm and q_norm in normalize_subject(subj)):
+                        evt = e
+                        break
+            if evt:
+                print(f"[Bot] get_meeting_summary({q}) → calendar match")
+                return json.dumps({
+                    "source":   "calendar",
+                    "event_id": evt.get("id", ""),
+                    "subject":  evt.get("subject", ""),
+                    "start":    (evt.get("start") or {}).get("dateTime", ""),
+                    "end":      (evt.get("end") or {}).get("dateTime", ""),
+                    "attendees": [
+                        ((a.get("emailAddress") or {}).get("address") or "")
+                        for a in (evt.get("attendees") or [])
+                    ],
+                    "note": "Meeting has no summary yet — scheduled but not recorded.",
+                }, ensure_ascii=False)
+        except Exception as e:
+            print(f"[Bot] calendar fallback failed: {e}")
+
+        return json.dumps({
+            "source":  "none",
+            "message": f"No wiki record or calendar event matches '{q}'.",
+        }, ensure_ascii=False)
+
     all_tools = [
         # Query
         get_recent_emails,
@@ -896,6 +1143,8 @@ def reply(
         get_contact_history,
         get_email_frequency_report,
         read_module_result,
+        check_email_handling,
+        get_meeting_summary,
         search_web,
         # Config
         read_settings,

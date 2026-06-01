@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   Loader2, Search, ChevronDown, ChevronRight, Plus, Save, X,
-  Eye, EyeOff, Building2, Trash2, RefreshCw, Users, FolderKanban,
+  Eye, EyeOff, Building2, Trash2, RefreshCw, Users, FolderKanban, Download,
 } from 'lucide-react';
 import {
   getCompanies, patchCompany, createCompany, deleteCompany, scanCompanies, relativeTime,
+  companiesExportXlsxUrl,
 } from '../../lib/api';
 import type { Company } from '../../lib/api';
 
@@ -192,6 +193,14 @@ export default function CompanyTab() {
             />
             Show ignored
           </label>
+          <a
+            href={companiesExportXlsxUrl}
+            download
+            className="flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg border border-executive-border text-executive-muted hover:text-executive-text hover:bg-executive-border/40"
+            title="Download all companies as Excel"
+          >
+            <Download size={12} /> Excel
+          </a>
           <button
             onClick={rescan}
             disabled={scanning}

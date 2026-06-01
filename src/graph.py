@@ -248,7 +248,7 @@ class GraphClient:
             "$top":     250,
             "$orderby": "sentDateTime desc",
             "$filter":  f"sentDateTime ge {since}",
-            "$select":  "id,subject,conversationId,sentDateTime,toRecipients,bodyPreview",
+            "$select":  "id,subject,conversationId,sentDateTime,toRecipients,bodyPreview,webLink",
         }
         results = []
         endpoint = f"{BASE}/me/mailFolders/SentItems/messages"
@@ -270,7 +270,7 @@ class GraphClient:
             "$top":     250,
             "$orderby": "lastModifiedDateTime desc",
             "$filter":  f"lastModifiedDateTime ge {since}",
-            "$select":  "id,subject,conversationId,lastModifiedDateTime",
+            "$select":  "id,subject,conversationId,lastModifiedDateTime,toRecipients,webLink",
         }
         results = []
         endpoint = f"{BASE}/me/mailFolders/Drafts/messages"
@@ -487,7 +487,7 @@ class GraphClient:
             "endDateTime":   end_dt,
             "$top":          top,
             "$orderby":      "start/dateTime asc",
-            "$select":       "id,subject,start,end,location,attendees,bodyPreview,isAllDay",
+            "$select":       "id,subject,start,end,location,attendees,bodyPreview,isAllDay,createdDateTime,webLink,organizer",
         }
         return self.get("/me/calendarView", params=params).get("value", [])
 

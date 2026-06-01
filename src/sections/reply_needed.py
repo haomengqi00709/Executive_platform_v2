@@ -4,12 +4,15 @@ reply_needed section — emails awaiting a reply from the executive.
 Four-layer input:
   1. src/skills/reply_needed.md        — system skill description
   2. data_dir/instructions/reply_needed.md — user instructions (optional)
-  3. Screened inbox (last 7 days), with sent-folder already-replied filter
+  3. Screened inbox (last 14 days), with handled-elsewhere filter
   4. CRM + Projects DB context injected per email
+
+"Handled elsewhere" is decided across 5 channels — see the Phase-1 block
+in run() (~line 240). The matching utilities live in src/modules/subject_match.py.
 """
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.graph import GraphClient
@@ -17,6 +20,11 @@ from src.ai import AIClient
 from src.modules.screener import screen_emails
 from src.modules.crm import load_crm
 from src.modules.projects import load_projects
+from src.modules.subject_match import (
+    find_meeting_match,
+    find_subject_match,
+    make_handling_link,
+)
 from src.modules.validator import validate_output
 from src.modules.tz import now_local, today_local_str
 from src.modules.profile import load_profile_context
@@ -237,29 +245,134 @@ def run(
 
     log(f"{len(visible)} emails passed screening")
 
-    # ── 5. Already-replied filter ─────────────────────────
-    log("Checking sent folder for already-replied threads...")
+    # ── 5. Already-handled detection (5 channels) ─────────
+    # Channels checked in order; first match wins. The matched HandlingLink
+    # is recorded in handled_sidecar so chat / audit can explain *why* an
+    # email isn't being surfaced.
+    #
+    #   1. conversationId → Sent       (user clicked Reply in Outlook & sent)
+    #   2. conversationId → Drafts     (user clicked Reply in Outlook, draft)
+    #   3. subject+sender → Sent       (AI draft saved as standalone new email)
+    #   4. subject+sender → Drafts     (AI draft sitting in Drafts)
+    #   5. attendees+createdDateTime   (user scheduled a meeting to resolve)
+    log("Checking sent / drafts / calendar for handled threads...")
     try:
-        sent_msgs = graph.get_sent_messages_since(days=14, max_results=100)
-        sent_conv_ids = {m.get("conversationId") for m in sent_msgs if m.get("conversationId")}
+        sent_msgs = graph.get_sent_messages_since(days=14, max_results=200)
     except Exception as e:
         log(f"Sent folder fetch failed: {e}")
-        sent_conv_ids = set()
-
-    log("Checking drafts folder (user-started but unsent replies)...")
+        sent_msgs = []
     try:
         draft_msgs = graph.get_drafts_since(days=14, max_results=100)
-        draft_conv_ids = {m.get("conversationId") for m in draft_msgs if m.get("conversationId")}
     except Exception as e:
         log(f"Drafts folder fetch failed: {e}")
-        draft_conv_ids = set()
+        draft_msgs = []
 
-    # Already-handled filter: replied (SentItems) OR drafted (Drafts)
-    handled_conv_ids = sent_conv_ids | draft_conv_ids
-    not_replied = [
-        m for m in visible
-        if m.get("conversationId") not in handled_conv_ids
-    ]
+    # Calendar: cover the 14d email-lookback + 60d future for meetings the
+    # user scheduled to resolve a recent email.
+    now_utc = datetime.now(timezone.utc)
+    cal_start = (now_utc - timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cal_end   = (now_utc + timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        events = graph.get_calendar_view(cal_start, cal_end, top=200)
+    except Exception as e:
+        log(f"Calendar fetch failed: {e}")
+        events = []
+
+    sent_conv_ids  = {m.get("conversationId") for m in sent_msgs  if m.get("conversationId")}
+    draft_conv_ids = {m.get("conversationId") for m in draft_msgs if m.get("conversationId")}
+    sent_by_conv  = {m.get("conversationId"): m for m in sent_msgs  if m.get("conversationId")}
+    draft_by_conv = {m.get("conversationId"): m for m in draft_msgs if m.get("conversationId")}
+
+    handled_sidecar: list[dict] = []
+    not_replied: list[dict] = []
+
+    for m in visible:
+        cid          = m.get("conversationId")
+        subj         = m.get("subject") or ""
+        from_email   = ((m.get("from") or {}).get("emailAddress") or {}).get("address", "").lower()
+        received     = m.get("receivedDateTime") or ""
+        email_id     = m.get("id", "")
+        handling: dict | None = None
+
+        # Channel 1: same conversationId in Sent
+        if cid in sent_conv_ids:
+            t = sent_by_conv.get(cid, {})
+            handling = make_handling_link(
+                email_id=email_id, email_subject=subj, email_from=from_email,
+                kind="replied",
+                target_id=t.get("id", ""),
+                target_subject=t.get("subject", ""),
+                target_when=t.get("sentDateTime", ""),
+                target_link=t.get("webLink", ""),
+            )
+
+        # Channel 2: same conversationId in Drafts
+        elif cid in draft_conv_ids:
+            t = draft_by_conv.get(cid, {})
+            handling = make_handling_link(
+                email_id=email_id, email_subject=subj, email_from=from_email,
+                kind="drafted",
+                target_id=t.get("id", ""),
+                target_subject=t.get("subject", ""),
+                target_when=t.get("lastModifiedDateTime", ""),
+                target_link=t.get("webLink", ""),
+            )
+
+        # Channels 3 & 4: subject + recipient-is-original-sender match
+        if handling is None and from_email:
+            recipient_match = lambda c, _from=from_email: any(
+                ((r.get("emailAddress") or {}).get("address") or "").lower() == _from
+                for r in (c.get("toRecipients") or [])
+            )
+            t = find_subject_match(subj, received, sent_msgs, "sentDateTime", recipient_match)
+            if t:
+                handling = make_handling_link(
+                    email_id=email_id, email_subject=subj, email_from=from_email,
+                    kind="subject_match_sent",
+                    target_id=t.get("id", ""),
+                    target_subject=t.get("subject", ""),
+                    target_when=t.get("sentDateTime", ""),
+                    target_link=t.get("webLink", ""),
+                )
+            else:
+                t = find_subject_match(subj, received, draft_msgs, "lastModifiedDateTime", recipient_match)
+                if t:
+                    handling = make_handling_link(
+                        email_id=email_id, email_subject=subj, email_from=from_email,
+                        kind="subject_match_draft",
+                        target_id=t.get("id", ""),
+                        target_subject=t.get("subject", ""),
+                        target_when=t.get("lastModifiedDateTime", ""),
+                        target_link=t.get("webLink", ""),
+                    )
+
+        # Channel 5: calendar meeting with the sender, created after the email
+        if handling is None and from_email:
+            evt = find_meeting_match(
+                email_ts=received, contact_email=from_email, events=events,
+            )
+            if evt:
+                start_dt = (evt.get("start") or {}).get("dateTime", "")
+                handling = make_handling_link(
+                    email_id=email_id, email_subject=subj, email_from=from_email,
+                    kind="meeting",
+                    target_id=evt.get("id", ""),
+                    target_subject=evt.get("subject", ""),
+                    target_when=start_dt or evt.get("createdDateTime", ""),
+                    target_link=evt.get("webLink", ""),
+                )
+
+        if handling is None:
+            not_replied.append(m)
+        else:
+            handled_sidecar.append(handling)
+
+    n_replied  = sum(1 for h in handled_sidecar if h["handled_by"]["kind"] == "replied")
+    n_drafted  = sum(1 for h in handled_sidecar if h["handled_by"]["kind"] == "drafted")
+    n_subject  = sum(1 for h in handled_sidecar if h["handled_by"]["kind"].startswith("subject_match"))
+    n_meeting  = sum(1 for h in handled_sidecar if h["handled_by"]["kind"] == "meeting")
+    log(f"{len(not_replied)} unhandled / {len(handled_sidecar)} handled "
+        f"(replied={n_replied}, drafted={n_drafted}, subject={n_subject}, meeting={n_meeting})")
 
     # Skip emails the user sent to themselves
     own_email = (settings.get("report_email") or settings.get("username") or "").lower()
@@ -296,6 +409,7 @@ def run(
             "status": "fresh",
             "last_run": datetime.now(timezone.utc).isoformat(),
             "items": [],
+            "handled": handled_sidecar,
             "count": 0,
             "empty": True,
         }
@@ -417,6 +531,7 @@ def run(
         "status":   "fresh",
         "last_run": datetime.now(timezone.utc).isoformat(),
         "items":    items,
+        "handled":  handled_sidecar,
         "count":    len(items),
         "empty":    len(items) == 0,
     }

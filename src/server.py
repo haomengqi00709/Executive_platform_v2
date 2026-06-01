@@ -2440,6 +2440,133 @@ async def projects_bulk_commit(request: Request, session: dict = Depends(require
     return {"added": added, "skipped_existing": skipped_existing, "skipped_invalid": skipped_invalid}
 
 
+# ── Excel exports (CRM / Projects / Companies) ────────────
+# Full-dataset xlsx downloads. Filename includes today's date so multiple
+# downloads in a row stack cleanly in the user's Downloads folder.
+
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _xlsx_response(
+    sheet_title: str,
+    headers: list[str],
+    rows: list[list],
+    filename_stem: str,
+) -> Response:
+    """Build a single-sheet xlsx in memory and return it as a FastAPI
+    attachment Response. Shared by all three export endpoints below so
+    column behaviour stays consistent."""
+    import io
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet_title
+    ws.append(headers)
+    for r in rows:
+        # openpyxl rejects bare lists/dicts in cells — pre-stringify any
+        # collection-shaped value the caller didn't flatten itself.
+        ws.append([
+            (", ".join(str(x) for x in v) if isinstance(v, (list, tuple, set))
+             else json.dumps(v, ensure_ascii=False) if isinstance(v, dict)
+             else v)
+            for v in r
+        ])
+    buf = io.BytesIO()
+    wb.save(buf)
+    today = datetime.now().strftime("%Y-%m-%d")
+    fname = f"{filename_stem}-{today}.xlsx"
+    return Response(
+        content=buf.getvalue(),
+        media_type=_XLSX_MIME,
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@app.get("/api/crm/export.xlsx")
+def export_crm_xlsx(session: dict = Depends(require_session)):
+    uid = session["user_id"]
+    from src.modules.crm import load_crm
+    contacts = (load_crm(_udir(uid)).get("contacts") or {}).values()
+    headers = [
+        "Email", "Name", "Company", "Role", "Phone", "LinkedIn", "Website",
+        "Status", "Priority", "Last Contact", "Thread Count",
+        "Summary", "Writing Style", "Notes", "Tags", "Source",
+        "Ignore", "Archived", "Updated At", "Added At",
+    ]
+    rows = []
+    for c in contacts:
+        rows.append([
+            c.get("email", ""), c.get("name", ""), c.get("company", ""),
+            c.get("role", ""), c.get("phone", ""), c.get("linkedin", ""),
+            c.get("website", ""), c.get("status", ""), c.get("priority", ""),
+            c.get("last_contact", ""), c.get("thread_count", 0),
+            c.get("summary", ""), c.get("writing_style", ""), c.get("notes", ""),
+            c.get("tags") or [], c.get("source", ""),
+            bool(c.get("ignore", False)), bool(c.get("archived", False)),
+            c.get("updated_at", ""), c.get("added_at", ""),
+        ])
+    rows.sort(key=lambda r: (r[8] or "", r[1] or ""))  # status, name
+    return _xlsx_response("Contacts", headers, rows, "crm-contacts")
+
+
+@app.get("/api/projects/export.xlsx")
+def export_projects_xlsx(session: dict = Depends(require_session)):
+    uid = session["user_id"]
+    from src.modules.projects import load_projects
+    projects = (load_projects(_udir(uid)).get("projects") or {}).values()
+    headers = [
+        "ID", "Name", "Category", "Status", "Momentum",
+        "Summary", "Next Action", "Deadline", "Last Activity", "Thread Count",
+        "Participants", "Key Topics", "Ignore", "Archived",
+        "Updated At",
+    ]
+    rows = []
+    for p in projects:
+        rows.append([
+            p.get("id", ""), p.get("name", ""), p.get("category", ""),
+            p.get("status", ""), p.get("momentum", ""),
+            p.get("summary", ""), p.get("next_action", ""),
+            p.get("deadline", ""), p.get("last_activity", ""),
+            p.get("thread_count", 0),
+            p.get("participants") or [], p.get("key_topics") or [],
+            bool(p.get("ignore", False)), bool(p.get("archived", False)),
+            p.get("updated_at", ""),
+        ])
+    rows.sort(key=lambda r: (r[8] or ""), reverse=True)  # last_activity desc
+    return _xlsx_response("Projects", headers, rows, "projects")
+
+
+@app.get("/api/companies/export.xlsx")
+def export_companies_xlsx(session: dict = Depends(require_session)):
+    uid = session["user_id"]
+    from src.modules.companies import load_companies
+    companies = (load_companies(_udir(uid)).get("companies") or {}).values()
+    headers = [
+        "Name", "Key", "Aliases", "Derived Status", "Priority",
+        "Monitor Intelligence", "Ignore", "Manual",
+        "Contact Count", "Project Count", "Total Threads", "Last Activity",
+        "Contact Emails", "Project Names", "Notes",
+        "Added At", "Updated At",
+    ]
+    rows = []
+    for c in companies:
+        contact_emails = [ct.get("email", "") for ct in (c.get("contacts") or [])]
+        project_names  = [p.get("name", "")  for p in (c.get("projects") or [])]
+        rows.append([
+            c.get("name", ""), c.get("key", ""),
+            c.get("aliases") or [], c.get("derived_status", ""),
+            c.get("priority", ""),
+            bool(c.get("monitor_intelligence", True)),
+            bool(c.get("ignore", False)), bool(c.get("manual", False)),
+            c.get("contact_count", 0), c.get("project_count", 0),
+            c.get("thread_count_total", 0), c.get("last_activity", ""),
+            contact_emails, project_names, c.get("notes", ""),
+            c.get("added_at", ""), c.get("updated_at", ""),
+        ])
+    rows.sort(key=lambda r: (r[11] or ""), reverse=True)  # last_activity desc
+    return _xlsx_response("Companies", headers, rows, "companies")
+
+
 # ── M03 Meeting scan ──────────────────────────────────────
 
 @app.post("/api/m03/scan")

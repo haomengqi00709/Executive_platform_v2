@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   Loader2, Search, ChevronDown, ChevronRight, Plus, EyeOff, Save, X, Star,
-  Phone, Linkedin, Mail, Building2, Briefcase, Archive, GitMerge, RefreshCw, Upload, Globe,
+  Phone, Linkedin, Mail, Building2, Briefcase, Archive, GitMerge, RefreshCw, Upload, Globe, Download,
 } from 'lucide-react';
-import { getCrm, patchCrmContact, createCrmContact, relativeTime, archiveRecord, scanCrm } from '../../lib/api';
+import { getCrm, patchCrmContact, createCrmContact, relativeTime, archiveRecord, scanCrm, crmExportXlsxUrl } from '../../lib/api';
 import type { CrmContact } from '../../lib/api';
 import MergePicker from './MergePicker';
 import BulkUploadModal from './BulkUploadModal';
@@ -190,6 +190,14 @@ export default function CrmTab() {
             />
             Show ignored
           </label>
+          <a
+            href={crmExportXlsxUrl}
+            download
+            className="flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg border border-executive-border text-executive-muted hover:text-executive-text hover:bg-executive-border/40"
+            title="Download all contacts as Excel"
+          >
+            <Download size={12} /> Excel
+          </a>
           <button
             onClick={rescan}
             disabled={scanning}

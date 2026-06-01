@@ -4,18 +4,26 @@ followup_needed section — sent emails with no reply yet.
 Four-layer input:
   1. src/skills/followup_needed/skill.md   — system skill description
   2. data_dir/instructions/followup_needed.md — user instructions (optional)
-  3. Sent folder (last 14 days), filtered against inbox conversationIds
+  3. Sent folder (last 14 days), filtered against the recipient's reply path
   4. CRM + Projects DB context injected per email (keyed on recipient, not sender)
+
+"Has a reply" is decided across 4 channels — see the Phase-1 block in
+run() (~line 200). Matching utilities live in src/modules/subject_match.py.
 """
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.graph import GraphClient
 from src.ai import AIClient
 from src.modules.crm import load_crm
 from src.modules.projects import load_projects
+from src.modules.subject_match import (
+    find_meeting_match,
+    find_subject_match,
+    make_handling_link,
+)
 from src.modules.validator import validate_output
 from src.modules.profile import load_profile_context
 
@@ -218,19 +226,130 @@ def run(
         log(f"Sent fetch failed: {e}")
         sent_msgs = []
 
-    # ── 5. No-reply filter ────────────────────────────────
-    # A sent email has "no reply" only if there's no inbox message received AFTER the sent time.
-    # Can't just check conversationId existence — the original received email shares the same
-    # conversationId and may still be sitting in the inbox.
-    def _has_reply_after(sent_msg: dict) -> bool:
-        cid = sent_msg.get("conversationId")
-        sent_dt = sent_msg.get("sentDateTime") or ""
-        if not cid or not sent_dt:
-            return False
-        latest_received = inbox_conv_latest.get(cid, "")
-        return latest_received > sent_dt
+    # Drafts of further follow-up nudges in the same thread — if user
+    # already started one, don't nag.
+    log("Fetching drafts (in-progress follow-ups)...")
+    try:
+        draft_msgs = graph.get_drafts_since(days=14, max_results=100)
+    except Exception as e:
+        log(f"Drafts fetch failed: {e}")
+        draft_msgs = []
 
-    no_reply = [m for m in sent_msgs if not _has_reply_after(m)]
+    # Calendar: events that may have superseded the email thread.
+    now_utc = datetime.now(timezone.utc)
+    cal_start = (now_utc - timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cal_end   = (now_utc + timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        events = graph.get_calendar_view(cal_start, cal_end, top=200)
+    except Exception as e:
+        log(f"Calendar fetch failed: {e}")
+        events = []
+
+    draft_by_conv = {d.get("conversationId"): d for d in draft_msgs if d.get("conversationId")}
+
+    # Pre-compute inbox messages by conversationId for "what was the reply?"
+    # lookups in Channel 1.
+    inbox_by_conv: dict[str, list[dict]] = {}
+    for m in inbox_meta:
+        cid = m.get("conversationId")
+        if cid:
+            inbox_by_conv.setdefault(cid, []).append(m)
+
+    # ── 5. Has-reply detection (4 channels) ───────────────
+    # Channels checked in order; first match wins. The matched HandlingLink
+    # is recorded in handled_sidecar so chat / audit can show how the
+    # thread closed itself.
+    #
+    #   1. inbox conversationId reply received after we sent
+    #   2. user has a draft in same conversation (follow-up in progress)
+    #   3. inbox subject+sender match (recipient came back with a new email
+    #      whose subject normalizes to ours, e.g. "Re: X" without keeping cid)
+    #   4. calendar meeting created after we sent, with recipient attending
+    handled_sidecar: list[dict] = []
+    no_reply: list[dict] = []
+
+    for sm in sent_msgs:
+        cid          = sm.get("conversationId")
+        sent_dt      = sm.get("sentDateTime") or ""
+        subj         = sm.get("subject") or ""
+        to_email, _  = _get_primary_recipient(sm)
+        email_id     = sm.get("id", "")
+        handling: dict | None = None
+
+        # Channel 1: inbox reply (same conversationId, received > sent)
+        if cid and sent_dt:
+            replies = [
+                im for im in inbox_by_conv.get(cid, [])
+                if (im.get("receivedDateTime") or "") > sent_dt
+            ]
+            if replies:
+                replies.sort(key=lambda x: x.get("receivedDateTime") or "")
+                t = replies[-1]
+                handling = make_handling_link(
+                    email_id=email_id, email_subject=subj, email_to=to_email,
+                    kind="replied",
+                    target_id=t.get("id", ""),
+                    target_subject=t.get("subject", ""),
+                    target_when=t.get("receivedDateTime", ""),
+                    target_link="",   # inbox_meta doesn't carry webLink
+                )
+
+        # Channel 2: draft of further nudge in same conversation
+        if handling is None and cid in draft_by_conv:
+            t = draft_by_conv[cid]
+            handling = make_handling_link(
+                email_id=email_id, email_subject=subj, email_to=to_email,
+                kind="drafted",
+                target_id=t.get("id", ""),
+                target_subject=t.get("subject", ""),
+                target_when=t.get("lastModifiedDateTime", ""),
+                target_link=t.get("webLink", ""),
+            )
+
+        # Channel 3: inbox subject+sender match (their new email, normalized
+        # subject equals ours, received after we sent)
+        if handling is None and to_email:
+            sender_match = lambda c, _from=to_email: (
+                ((c.get("from") or {}).get("emailAddress") or {}).get("address", "").lower() == _from
+            )
+            t = find_subject_match(subj, sent_dt, inbox_meta, "receivedDateTime", sender_match)
+            if t:
+                handling = make_handling_link(
+                    email_id=email_id, email_subject=subj, email_to=to_email,
+                    kind="subject_match_sent",
+                    target_id=t.get("id", ""),
+                    target_subject=t.get("subject", ""),
+                    target_when=t.get("receivedDateTime", ""),
+                    target_link="",
+                )
+
+        # Channel 4: meeting scheduled with recipient after we sent
+        if handling is None and to_email:
+            evt = find_meeting_match(
+                email_ts=sent_dt, contact_email=to_email, events=events,
+            )
+            if evt:
+                start_dt = (evt.get("start") or {}).get("dateTime", "")
+                handling = make_handling_link(
+                    email_id=email_id, email_subject=subj, email_to=to_email,
+                    kind="meeting",
+                    target_id=evt.get("id", ""),
+                    target_subject=evt.get("subject", ""),
+                    target_when=start_dt or evt.get("createdDateTime", ""),
+                    target_link=evt.get("webLink", ""),
+                )
+
+        if handling is None:
+            no_reply.append(sm)
+        else:
+            handled_sidecar.append(handling)
+
+    n_replied  = sum(1 for h in handled_sidecar if h["handled_by"]["kind"] == "replied")
+    n_drafted  = sum(1 for h in handled_sidecar if h["handled_by"]["kind"] == "drafted")
+    n_subject  = sum(1 for h in handled_sidecar if h["handled_by"]["kind"].startswith("subject_match"))
+    n_meeting  = sum(1 for h in handled_sidecar if h["handled_by"]["kind"] == "meeting")
+    log(f"{len(no_reply)} unhandled / {len(handled_sidecar)} handled "
+        f"(replied={n_replied}, drafted={n_drafted}, subject={n_subject}, meeting={n_meeting})")
 
     # Skip emails sent to yourself
     if own_email:
@@ -278,7 +397,8 @@ def run(
         result = {
             "id": "followup_needed", "status": "fresh",
             "last_run": datetime.now(timezone.utc).isoformat(),
-            "items": [], "count": 0, "empty": True,
+            "items": [], "handled": handled_sidecar,
+            "count": 0, "empty": True,
         }
         _save_result(data_dir, result)
         return result
@@ -377,6 +497,7 @@ def run(
         "status":   "fresh",
         "last_run": datetime.now(timezone.utc).isoformat(),
         "items":    items,
+        "handled":  handled_sidecar,
         "count":    len(items),
         "empty":    len(items) == 0,
     }
