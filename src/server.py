@@ -122,34 +122,6 @@ def _detect_redirect_uri(request: Request) -> str:
     return f"{proto}://{host}/auth/callback"
 
 
-@app.post("/admin/_resend_meeting_card")
-def admin_resend_meeting_card(body: dict, request: Request):
-    """One-off operator endpoint: re-send a meeting summary card whose Teams push
-    failed (e.g. transient Audrey-token corruption). Requires X-Admin-Secret matching
-    SESSION_SECRET. Body: {"user_id": "...", "meeting_id": "ondrive_..."}."""
-    expected = os.getenv("SESSION_SECRET") or ""
-    given    = request.headers.get("x-admin-secret") or ""
-    if not expected or not secrets.compare_digest(given, expected):
-        raise HTTPException(status_code=403, detail="forbidden")
-    uid        = body.get("user_id")
-    meeting_id = body.get("meeting_id")
-    if not uid or not meeting_id:
-        raise HTTPException(status_code=400, detail="user_id and meeting_id required")
-    wiki_file = _udir(uid) / "wiki" / f"{meeting_id}.json"
-    if not wiki_file.exists():
-        raise HTTPException(status_code=404, detail=f"wiki entry not found: {wiki_file}")
-    bot_uid, chat_id = _find_bot_for_user(uid)
-    if not (bot_uid and chat_id):
-        raise HTTPException(status_code=409, detail="no bot bound for user")
-    from src.modules.m03_meeting import format_meeting_summary_html
-    rec       = json.loads(wiki_file.read_text())
-    bot_token = auth.get_valid_access_token(bot_uid)
-    bot_graph = GraphClient(bot_token)
-    html      = format_meeting_summary_html(rec)
-    bot_graph.send_html_message(chat_id, html)
-    return {"sent": True, "meeting_id": meeting_id, "title": rec.get("title", "")}
-
-
 # ── Web OAuth endpoints ───────────────────────────────────
 
 @app.get("/auth/login")
