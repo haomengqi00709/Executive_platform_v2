@@ -1,0 +1,79 @@
+name: Deploy to Azure App Service
+
+# Mirror of the manual `az acr build` + `az webapp config container set` +
+# `az webapp restart` flow documented in CLAUDE.md. Runs on every push to
+# main, plus on-demand via the GitHub Actions UI.
+#
+# Railway picks up the same push independently via its own auto-deploy.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}   # manual trigger from GitHub UI
+
+# Image tag: <YYYYMMDD-HHMM>-<short-sha>. Sortable for rollback, unique per
+# push, replaces the manual v1/v2/v3 scheme. `:latest` is also moved so the
+# default-tag fallback still works.
+env:
+  ACR_NAME:    ceoplatformv2acr
+  IMAGE_NAME:  ceo-platform
+  WEBAPP_NAME: ceo-platform-v2
+  RG_NAME:     ceo-platform
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: azure-deploy
+      cancel-in-progress: false   # let in-flight deploys finish; don't stack
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          STAMP="$(date -u +%Y%m%d-%H%M)"
+          echo "tag=${STAMP}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Build tag: ${STAMP}-${SHORT_SHA}"
+
+      - name: Build image in ACR
+        run: |
+          az acr build \
+            --registry "$ACR_NAME" \
+            --image "$IMAGE_NAME:${{ steps.tag.outputs.tag }}" \
+            --image "$IMAGE_NAME:latest" \
+            --platform linux/amd64 \
+            .
+
+      - name: Point App Service at new image
+        run: |
+          az webapp config container set \
+            --name "$WEBAPP_NAME" \
+            --resource-group "$RG_NAME" \
+            --docker-custom-image-name "${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${{ steps.tag.outputs.tag }}"
+
+      - name: Restart App Service
+        run: |
+          az webapp restart \
+            --name "$WEBAPP_NAME" \
+            --resource-group "$RG_NAME"
+
+      - name: Smoke check (5x retry, 10s apart)
+        run: |
+          URL="https://${WEBAPP_NAME}-g7fuddhnhreqdeax.canadacentral-01.azurewebsites.net/health"
+          for i in 1 2 3 4 5; do
+            if curl -fsS --max-time 10 "$URL"; then
+              echo "✅ /health OK on attempt $i"
+              exit 0
+            fi
+            echo "Attempt $i failed, waiting 10s..."
+            sleep 10
+          done
+          echo "❌ /health never came up — check Azure logs"
+          exit 1
