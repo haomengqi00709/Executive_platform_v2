@@ -104,7 +104,11 @@ def _save_user_model(path: Path, model: dict):
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     model["updated_at"] = datetime.now(timezone.utc).isoformat()
-    path.write_text(json.dumps(model, indent=2, ensure_ascii=False))
+    # Atomic write — see src/server.py:_write_json for context
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(model, indent=2, ensure_ascii=False))
+    import os
+    os.replace(tmp, path)
 
 
 def _build_session_context(data_dir: Path) -> str:

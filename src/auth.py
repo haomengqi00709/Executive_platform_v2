@@ -102,7 +102,15 @@ def _token_file(user_id: str) -> Path:
 # ── Token storage (MS access/refresh tokens) ─────────────
 
 def save_user_tokens(user_id: str, token_data: dict):
-    _token_file(user_id).write_text(json.dumps(token_data, default=str))
+    # Atomic write: temp + rename. Plain write_text() over Azure Files SMB can
+    # leave stale trailing bytes on partial writes (seen in production:
+    # 4929-byte file = 4928 valid JSON + 1 stray "}" -> json.loads raises
+    # "Extra data" -> get_valid_access_token thinks token is missing -> all
+    # background pollers fail with "No token found for user").
+    p   = _token_file(user_id)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(token_data, default=str))
+    os.replace(tmp, p)
 
 def load_user_tokens(user_id: str) -> dict | None:
     f = _token_file(user_id)

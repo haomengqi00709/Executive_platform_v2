@@ -71,8 +71,14 @@ def _read_json(path: Path) -> dict:
         return {}
 
 def _write_json(path: Path, data: dict):
+    """Atomic JSON write: temp + os.replace. Required because the deployment
+    target (Azure Files SMB) can leave stale trailing bytes on plain write_text
+    under concurrent writes — observed as "Extra data" json.loads errors."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    import os as _os
+    _os.replace(tmp, path)
 
 def _within(iso_ts: str | None, secs: int) -> bool:
     if not iso_ts:
