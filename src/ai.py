@@ -9,6 +9,13 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 
+# Single source of truth for the Gemini model across the whole app.
+# Sections read it via AIClient.model; the Teams bot imports this constant directly.
+# Change the model in ONE place: this default, or the GEMINI_MODEL env var
+# (lets you switch models on Railway/Azure without a redeploy).
+DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+
+
 # Per-call timeout for Gemini text generation. If the API hangs (rare but happens),
 # we abandon the call and let the retry logic try again instead of blocking forever.
 _GEMINI_TIMEOUT_SECS = 60
@@ -29,7 +36,7 @@ def _call_with_timeout(fn, timeout_secs: int):
 class AIClient:
     def __init__(self):
         self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        self.model = "gemini-2.5-flash"
+        self.model = DEFAULT_GEMINI_MODEL
 
     def generate(self, prompt: str) -> str:
         for attempt in range(4):

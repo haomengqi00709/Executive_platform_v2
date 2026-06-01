@@ -56,3 +56,9 @@ Output format per item:
   "reply_tone": "formal" | "casual" | "brief",
   "suggested_opening": "<one sentence starting with the sender's real first name>"
 }
+
+User instruction: {user_instruction}
+
+--- EMAILS ---
+
+{emails_with_context}

@@ -14,12 +14,13 @@ from pathlib import Path
 from google import genai
 from google.genai import types
 
+from src.ai import DEFAULT_GEMINI_MODEL
 from src.modules.db_helpers import open_sqlite
 from src.modules.profile import load_profile_context
 from src.modules.subject_match import normalize_subject
 from src.modules.wiki import load_index, load_meeting
 
-MODEL        = "gemini-3.5-flash"
+MODEL        = DEFAULT_GEMINI_MODEL
 MAX_ROUNDS   = 8
 HISTORY_LIMIT = 20
 

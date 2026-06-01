@@ -53,3 +53,9 @@ Output format per item:
 
 Do NOT include `days_waiting` or any other numeric time field — the platform
 computes those deterministically and any value you provide will be ignored.
+
+User instruction: {user_instruction}
+
+--- EMAILS ---
+
+{emails_with_context}
