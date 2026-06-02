@@ -117,8 +117,18 @@ def _strip_html(text: str) -> str:
 
 
 def _guess_company(addr: str) -> str:
-    domain = addr.split("@")[-1] if "@" in addr else ""
-    if not domain:
+    """Derive a company name from the email's domain. Returns "" for
+    free-email / personal providers (gmail.com, outlook.com, qq.com, etc.) —
+    those addresses identify a person, not a company, and auto-generating
+    "Gmail" / "Outlook" / "Qq" as CRM company entries was the dominant
+    source of noise in downstream company_intelligence.
+
+    Reuses the same _FREE_EMAIL_DOMAINS allowlist used for website-domain
+    derivation (line 39) so the two paths stay in sync."""
+    if "@" not in addr:
+        return ""
+    domain = addr.split("@", 1)[1].lower().strip()
+    if not domain or domain in _FREE_EMAIL_DOMAINS:
         return ""
     return domain.split(".")[0].title()
 

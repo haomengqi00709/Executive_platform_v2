@@ -3,9 +3,8 @@ market_intelligence section — Scheduled
 Macro market signals via Gemini Google Search grounding.
 Structured items: headline (point-form) + summary + source_url + 7-day dedup.
 """
-import hashlib
 import json
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.ai import AIClient
@@ -13,6 +12,11 @@ from src.graph import GraphClient
 from src.modules.validator import validate_output
 from src.modules.profile import load_profile_context
 from src.modules.url_utils import resolve_source_url
+from src.modules.intel_dedup import (
+    load_history, save_history,
+    filter_exact_duplicates, assign_ids,
+    format_history_for_validator,
+)
 
 _SKILLS_DIR = Path(__file__).parent.parent / "skills" / "market_intelligence"
 _RESULT_ID = "market_intelligence"
@@ -73,37 +77,6 @@ def _load_user_instruction(data_dir: Path) -> str:
         path.write_text(_DEFAULT_INSTRUCTION)
         return _DEFAULT_INSTRUCTION.strip()
     return path.read_text().strip()
-
-
-def _load_seen(data_dir: Path) -> dict:
-    path = data_dir / "market_intel_seen.json"
-    if not path.exists():
-        return {}
-    try:
-        seen = json.loads(path.read_text())
-        cutoff = (date.today() - timedelta(days=7)).isoformat()
-        return {k: v for k, v in seen.items() if v >= cutoff}
-    except Exception:
-        return {}
-
-
-def _save_seen(data_dir: Path, seen: dict) -> None:
-    (data_dir / "market_intel_seen.json").write_text(json.dumps(seen, indent=2))
-
-
-def _dedup(items: list[dict], seen: dict) -> tuple[list[dict], dict]:
-    today_str = date.today().isoformat()
-    new_items = []
-    for item in items:
-        key = hashlib.md5(item.get("headline", "").lower().strip().encode()).hexdigest()[:12]
-        if key not in seen:
-            new_items.append(item)
-            seen[key] = today_str
-    return new_items, seen
-
-
-def _assign_ids(items: list[dict]) -> list[dict]:
-    return [{**item, "id": hashlib.sha1(item.get("headline", "").encode()).hexdigest()[:16]} for item in items]
 
 
 def _parse_raw(raw: str, ai: AIClient) -> list[dict]:
@@ -202,7 +175,7 @@ def run(
         return {"id": _RESULT_ID, "status": "not_run", "items": [], "count": 0, "empty": True}
 
     user_instruction = _load_user_instruction(data_dir)
-    seen = _load_seen(data_dir)
+    history = load_history(data_dir, "market_intel")
 
     skill_filled = (
         skill_doc
@@ -253,20 +226,35 @@ Search Google for current market signals. Return ONLY a JSON array — no markdo
         }
 
     _p(f"{len(items)} items before dedup")
-    items, seen = _dedup(items, seen)
-    _p(f"{len(items)} new items after 7-day dedup")
 
-    items = _assign_ids(items)
+    # Layer 2 context: snapshot the PRIOR history (from previous runs)
+    # BEFORE we add today's items. If we formatted after the md5 step,
+    # the validator would see today's own candidates listed as
+    # "previously surfaced" and reject all of them as duplicates.
+    history_context = format_history_for_validator(history)
 
+    # Layer 1: md5-exact dedup (cheap, lossless) — drops items whose
+    # headline exactly matches one we've already surfaced in the last 7 days.
+    # Mutates `history` in place to record today's new items.
+    items, history = filter_exact_duplicates(items, history)
+    _p(f"{len(items)} new items after md5 dedup")
+
+    items = assign_ids(items)
+
+    # Layer 2: AI semantic dedup at validator stage — sees previously-
+    # surfaced headlines (from prior runs only) and drops items describing
+    # the same news event even if wording / source differs. Empty
+    # history_context falls back to the validator's pre-fix behavior.
     items = validate_output(
         items, ai,
         section_id=_RESULT_ID,
         user_instruction=user_instruction,
         display_name=display_name,
         date_str=date_str,
+        extra_context=history_context,
     )
 
-    _save_seen(data_dir, seen)
+    save_history(data_dir, "market_intel", history)
 
     result = {
         "id": _RESULT_ID,

@@ -8,9 +8,8 @@ from CRM + Projects). A company is monitored when monitor_intelligence=True
 and ignore=False — there is no fallback path that scans CRM or projects
 directly here.
 """
-import hashlib
 import json
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.ai import AIClient
@@ -19,12 +18,44 @@ from src.modules.validator import validate_output
 from src.modules.profile import load_profile_context
 from src.modules.companies import load_companies
 from src.modules.url_utils import resolve_source_url
+from src.modules.intel_dedup import (
+    load_history, save_history,
+    filter_exact_duplicates, assign_ids,
+    format_history_for_validator,
+)
 
 _SKILLS_DIR = Path(__file__).parent.parent / "skills" / "company_intelligence"
 _RESULT_ID = "company_intelligence"
 
 _DEFAULT_INSTRUCTION = """\
 # Company Intelligence — Search Instruction
+
+This file controls **how the AI researches** the companies you've chosen
+to monitor. It does NOT decide which companies to research — that's
+controlled by toggles in the Records → Companies tab.
+
+## What this file CAN control
+- AI tone and depth (deep-dive vs. summary)
+- Signal types to emphasize (executive moves, M&A, partnerships, etc.)
+- Time window
+- Specific topic exclusions ("skip earnings call coverage")
+- Dedup hints across runs
+
+## What this file CANNOT control (use the Records → Companies tab instead)
+- Which companies get researched. By default we research only companies whose
+  `derived_status` ∈ {client, prospect, partner, investor}. Vendor / internal /
+  other are skipped automatically — usually they're email-domain noise (Gmail,
+  Outlook, Microsoft, HubSpot, etc.) rather than relationships you actively
+  cultivate. **Exception**: any company you manually added via the "Add Company"
+  button is always researched regardless of status.
+- To force monitoring of a vendor / internal / other auto-derived company:
+  change that contact's CRM status to "prospect" (Records → CRM), or
+  delete-then-re-add the company manually
+- To skip a specific company you don't want researched:
+  toggle `ignore = True` on it in Records → Companies
+- To re-order monitoring priority: set `priority = high` on it
+
+---
 
 Monitor specific companies I work with for recent signals.
 Focus on: executive announcements on LinkedIn or X, new contracts or partnerships,
@@ -50,6 +81,14 @@ _STATUS_RANK   = {
     "vendor":   4, "internal": 5, "other":    6,
 }
 
+# Only research companies the user actively cultivates. vendor / internal /
+# other are typically email-domain noise (free-mail providers auto-becoming
+# "Gmail" / "Outlook" / "Qq" companies, SaaS notification senders becoming
+# "HubSpot" / "Brevo" / "Microsoft", etc.) — never the executive's strategic
+# focus. If a user has a genuine vendor they want monitored, they change
+# that contact's CRM status to "prospect" / "partner" (already supported).
+_MONITORED_STATUSES = frozenset({"client", "prospect", "partner", "investor"})
+
 
 def _load_skill_doc() -> str:
     path = _SKILLS_DIR / "skill.md"
@@ -65,40 +104,41 @@ def _load_user_instruction(data_dir: Path) -> str:
     return path.read_text().strip()
 
 
-def _load_seen(data_dir: Path) -> dict:
-    path = data_dir / "company_intel_seen.json"
-    if not path.exists():
-        return {}
-    try:
-        seen = json.loads(path.read_text())
-        cutoff = (date.today() - timedelta(days=7)).isoformat()
-        return {k: v for k, v in seen.items() if v >= cutoff}
-    except Exception:
-        return {}
-
-
-def _save_seen(data_dir: Path, seen: dict) -> None:
-    (data_dir / "company_intel_seen.json").write_text(json.dumps(seen, indent=2))
-
-
 def _build_company_list(data_dir: Path) -> list[str]:
     """Pull the list of company names to research from companies.json.
 
-    A company is included when monitor_intelligence=True and ignore=False.
+    A company is included when:
+      - monitor_intelligence=True AND ignore=False, AND
+      - EITHER derived_status ∈ _MONITORED_STATUSES (client/prospect/partner/investor)
+        OR  manual=True (user explicitly added via UI / migrated from watchlist)
+
+    The status filter is the load-bearing line for noise reduction: it drops
+    auto-generated junk like "Gmail" / "Outlook" / "HubSpot" / "Microsoft"
+    that gets created when free-email or SaaS notification senders enter CRM.
+    The manual-bypass clause protects user-curated watchlist entries
+    (e.g. Arup, WSP, GHD) which typically have status="other" because they
+    have no CRM contacts yet — but the user explicitly wants them tracked.
+
+    For a vendor user genuinely cares about, change that contact's CRM
+    status to "prospect" / "partner" via Records → CRM.
+
     Order: per-company priority (high < medium < low), then derived_status
-    (client first, other last), then name. Capped at _COMPANY_CAP.
+    (client first, investor last), then name. Capped at _COMPANY_CAP.
     """
     db = load_companies(data_dir)
     ranked: list[tuple[int, int, str]] = []
     for c in (db.get("companies") or {}).values():
         if not c.get("monitor_intelligence") or c.get("ignore"):
             continue
+        status = c.get("derived_status") or "other"
+        if status not in _MONITORED_STATUSES and not c.get("manual"):
+            continue
         name = (c.get("name") or "").strip()
         if not name:
             continue
-        prio   = _PRIORITY_RANK.get(c.get("priority") or "medium", 1)
-        status = _STATUS_RANK.get(c.get("derived_status") or "other", 6)
-        ranked.append((prio, status, name))
+        prio     = _PRIORITY_RANK.get(c.get("priority") or "medium", 1)
+        status_r = _STATUS_RANK.get(status, 6)
+        ranked.append((prio, status_r, name))
     ranked.sort(key=lambda x: (x[0], x[1], x[2].lower()))
     return [name for _, _, name in ranked[:_COMPANY_CAP]]
 
@@ -106,21 +146,6 @@ def _build_company_list(data_dir: Path) -> list[str]:
 def _chunks(lst: list, n: int):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
-
-
-def _dedup(items: list[dict], seen: dict) -> tuple[list[dict], dict]:
-    today_str = date.today().isoformat()
-    new_items = []
-    for item in items:
-        key = hashlib.md5(item.get("headline", "").lower().strip().encode()).hexdigest()[:12]
-        if key not in seen:
-            new_items.append(item)
-            seen[key] = today_str
-    return new_items, seen
-
-
-def _assign_ids(items: list[dict]) -> list[dict]:
-    return [{**item, "id": hashlib.sha1(item.get("headline", "").encode()).hexdigest()[:16]} for item in items]
 
 
 def _parse_raw(raw: str, ai: AIClient) -> list[dict]:
@@ -236,7 +261,7 @@ def run(
 
     _p(f"Tracking {len(companies)} companies: {', '.join(companies[:8])}{'...' if len(companies) > 8 else ''}")
 
-    seen = _load_seen(data_dir)
+    history = load_history(data_dir, "company_intel")
 
     skill_filled = (
         skill_doc
@@ -330,20 +355,34 @@ Return ONLY a JSON array — no markdown, no preamble. Skip companies with no so
     _p(f"{len(items)} valid items before dedup")
     items = _resolve_urls(items, _p)
 
-    items, seen = _dedup(items, seen)
-    _p(f"{len(items)} new items after 7-day dedup")
+    # Layer 2 context: snapshot the PRIOR history (from previous runs)
+    # BEFORE we add today's items. If we formatted after the md5 step,
+    # the validator would see today's own candidates listed as
+    # "previously surfaced" and reject all of them as duplicates.
+    history_context = format_history_for_validator(history)
 
-    items = _assign_ids(items)
+    # Layer 1: md5-exact dedup (cheap, lossless) — drops items whose
+    # headline exactly matches one we've already surfaced in the last 7 days.
+    # Mutates `history` in place to record today's new items.
+    items, history = filter_exact_duplicates(items, history)
+    _p(f"{len(items)} new items after md5 dedup")
 
+    items = assign_ids(items)
+
+    # Layer 2: AI semantic dedup at validator stage — sees previously-
+    # surfaced headlines (from prior runs only) and drops items describing
+    # the same news event even if wording / source differs. Empty
+    # history_context falls back to the validator's pre-fix behavior.
     items = validate_output(
         items, ai,
         section_id=_RESULT_ID,
         user_instruction=user_instruction,
         display_name=display_name,
         date_str=date_str,
+        extra_context=history_context,
     )
 
-    _save_seen(data_dir, seen)
+    save_history(data_dir, "company_intel", history)
 
     result = {
         "id": _RESULT_ID,

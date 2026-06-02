@@ -1349,6 +1349,62 @@ def _refresh_companies_all_users() -> None:
         threading.Thread(target=_build_companies_for_user, args=(f.stem,), daemon=True).start()
 
 
+# ── Startup cleanup: stuck "running" sections ────────────
+# A BackgroundTasks job that's mid-execution when the container is killed
+# (Railway redeploy, OOM, etc.) dies without writing a final status, leaving
+# the result file pinned at status="running" forever — visible to the user as
+# a hung run with no clean recovery path. Daniel hit this on 2026-06-01 when
+# a redeploy interrupted his company_intelligence run.
+#
+# Fix: at startup, scan results/*.json for any file still in "running" and
+# flip it to "error". The new process has no in-flight tasks yet, so any
+# "running" marker is by definition from a dead previous process.
+
+def _reset_stuck_running_results() -> int:
+    """Reset result files left in status='running' by a previous process.
+    Returns count of files reset.
+
+    Scope: only `.data/{uid}/results/*.json`. Does not touch init_status,
+    email_monitor state, bot state, or anything outside results/."""
+    reset_count = 0
+    try:
+        for results_dir in auth.DATA_DIR.glob("*/results"):
+            if not results_dir.is_dir():
+                continue
+            for f in results_dir.glob("*.json"):
+                try:
+                    data = json.loads(f.read_text())
+                except Exception:
+                    continue
+                if not isinstance(data, dict) or data.get("status") != "running":
+                    continue
+                section_id = data.get("id") or f.stem
+                started_at = data.get("started_at") or ""
+                logs       = data.get("logs") or []
+                _write_json(f, {
+                    "id":         section_id,
+                    "status":     "error",
+                    "error":      ("Previous run was interrupted by service "
+                                   "restart or crash. Trigger again to retry."),
+                    "started_at": started_at,
+                    "last_run":   datetime.now(timezone.utc).isoformat(),
+                    "logs":       logs,
+                    "items":      [],
+                    "count":      0,
+                    "empty":      True,
+                })
+                reset_count += 1
+                try:
+                    print(f"[Startup] Reset stuck running: {f.relative_to(auth.DATA_DIR)}", flush=True)
+                except ValueError:
+                    print(f"[Startup] Reset stuck running: {f}", flush=True)
+    except Exception as e:
+        print(f"[Startup] Reset stuck running failed: {e}", flush=True)
+    if reset_count:
+        print(f"[Startup] Reset {reset_count} stuck 'running' result file(s)", flush=True)
+    return reset_count
+
+
 # ── Section registry ─────────────────────────────────────
 # Add entries here as sections are implemented.
 
@@ -4248,6 +4304,10 @@ if _frontend_dist.exists():
 
 @app.on_event("startup")
 def startup_event():
+    # Clean up any sections left "running" by the previous (killed) process
+    # — must run before scheduler starts so a fresh scheduled fire sees a
+    # clean state.
+    _reset_stuck_running_results()
     _scheduler.start()
     _scheduler.add_job(
         _poll_teams_bot_all_users,

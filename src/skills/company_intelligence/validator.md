@@ -36,3 +36,28 @@ Your job is to catch fabricated, irrelevant, or low-quality items the first AI m
 - The item is a routine quarterly earnings mention with no strategic signal
 - The content is a general "company is doing well" statement with no specific insight
 - The source is a minor trade publication with limited reach
+
+## REMOVE if duplicate of prior briefing
+
+When the prompt contains an "ADDITIONAL CONTEXT" block headed
+"Previously surfaced items", it lists news already shown to the user in
+recent briefings. REMOVE any candidate item that refers to the SAME news
+event as one of those — even if the wording, source, or URL differs.
+
+Identify the SAME event by:
+- Same company AND same announcement (e.g. both about "Acme's $200M AI
+  investment", even if one source calls it "AI push" and another
+  "AI initiative")
+- Same person AND same statement (re-shared across LinkedIn, news, etc.)
+- Same M&A / funding / contract / leadership change reported by multiple
+  outlets
+
+NOT the same event (keep these):
+- Different announcements from the same company days/weeks apart
+- A follow-up analysis with NEW information (e.g. exec interview
+  expanding on the original announcement adds depth)
+- Same company, different sub-event ("Acme Q1 earnings" vs "Acme Q1
+  product launch")
+
+When in doubt, KEEP — it's better to occasionally repeat than to drop
+genuine follow-up coverage.
