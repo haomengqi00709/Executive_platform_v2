@@ -546,15 +546,15 @@ def _maybe_send_expiry_warning(graph, chat_id: str, data_dir: Path,
         monitor_state["last_expiry_warning_date"] = today_key
         return
 
-    lines = ["<p><b>⚠️ 以下邮件明天将自动从待回复列表移除：</b></p>"]
+    lines = ["<p><b>⚠️ The following emails will drop off your reply-needed list tomorrow:</b></p>"]
     for it in expiring[:10]:
         name = it.get("from_name") or it.get("from_email") or "Unknown"
         subj = (it.get("subject") or "(no subject)")[:120]
         received_short = (it.get("received") or "")[:10]
         lines.append(f"<p>• <b>{name}</b> — \"{subj}\" ({received_short})</p>")
     if len(expiring) > 10:
-        lines.append(f"<p><i>... 还有 {len(expiring) - 10} 封</i></p>")
-    lines.append("<p><i>如需保留，请回复这些邮件、把它们存入 Outlook 草稿，或告诉我哪封要继续跟进。</i></p>")
+        lines.append(f"<p><i>... and {len(expiring) - 10} more</i></p>")
+    lines.append("<p><i>To keep any of these, reply to them, save a draft in Outlook, or tell me which ones to keep following up on.</i></p>")
     html = "".join(lines)
 
     try:
