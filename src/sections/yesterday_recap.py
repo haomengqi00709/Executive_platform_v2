@@ -2,13 +2,13 @@
 yesterday_recap section — Scheduled (morning push).
 
 Lightweight snapshot of yesterday's activity:
-  - Yesterday's inbound emails (top by priority from reply_needed if available,
-    else from raw Graph inbox metadata)
+  - Yesterday's inbound emails (Graph inbox metadata → screen_emails, Principle 5)
   - Yesterday's outbound emails (from Graph sent items)
   - Yesterday's meetings (from Graph calendarView)
   - Yesterday's new commitments (from commitments_extract.json)
 
-No AI. Just aggregation + counts + a few top items per category.
+Inbound mail is screened (screen_emails) and the assembled list gets a final
+user-preference pass (validate_output); sent/meetings/commitments are aggregation.
 """
 import json
 from datetime import datetime, timedelta, timezone
@@ -18,6 +18,9 @@ from zoneinfo import ZoneInfo
 from src.ai import AIClient
 from src.graph import GraphClient
 from src.modules.validator import validate_output
+from src.modules.screener import screen_emails
+from src.modules.crm import load_crm
+from src.modules.profile import load_profile_context
 from src.modules.tz import (
     get_user_tz, now_local, local_day_window_utc, format_local_time,
 )
@@ -80,7 +83,7 @@ def run(
     def _in_yesterday_window(iso: str) -> bool:
         return bool(iso) and start_utc_iso <= iso < end_utc_iso
 
-    # ── Inbound emails ──────────────────────────────────────
+    # ── Inbound emails (screened — Principle 5) ─────────────
     _p("Fetching yesterday's inbox metadata...")
     try:
         inbox = graph.get_inbox_metadata_since(days=2, max_results=500)
@@ -88,6 +91,25 @@ def run(
         _p(f"Inbox fetch failed: {e}")
         inbox = []
     inbound_yesterday = [m for m in inbox if _in_yesterday_window(m.get("receivedDateTime") or "")]
+
+    # Principle 5: anything we surface to the user must pass the screener first.
+    # Filter to yesterday before screening so we only screen that day's mail.
+    if inbound_yesterday:
+        crm_contacts = load_crm(data_dir).get("contacts", {})
+        ignored_emails = {
+            e for e, c in crm_contacts.items()
+            if c.get("ignore") or c.get("archived") or c.get("priority") == "ignore"
+        }
+        _p(f"Screening {len(inbound_yesterday)} inbound email(s)...")
+        screened = screen_emails(
+            messages=inbound_yesterday,
+            ai=ai,
+            ignored_emails=ignored_emails,
+            business_context=load_profile_context(data_dir),
+            display_name=(settings or {}).get("display_name", "the executive"),
+            progress=progress,
+        )
+        inbound_yesterday = [m for m in screened if not m.get("screened_out")]
 
     # ── Outbound emails ─────────────────────────────────────
     _p("Fetching yesterday's sent items...")

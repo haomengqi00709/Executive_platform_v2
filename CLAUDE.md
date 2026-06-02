@@ -76,7 +76,7 @@ Wiki = meeting_action_items 的 project knowledge base（会议→项目 mapping
 
 ### 原则 5：所有邮件处理必须先经过 screener（不可跳过）
 
-任何涉及邮件的模块，在处理任何一封邮件之前，必须先调用 `src/modules/screener.screen_emails()`。
+凡是把邮件**呈现给用户**（列表 / 摘要 / digest / recap）的模块，在呈现任何一封邮件之前，必须先调用 `src/modules/screener.screen_emails()`，只展示 `screened_out=False` 的。
 
 ```python
 from src.modules.screener import screen_emails
@@ -92,10 +92,13 @@ messages = screen_emails(
 visible = [m for m in messages if not m.get("screened_out")]
 ```
 
-**例外：`expenses` section 不使用 screener。**
-Screener 回答"CEO 需要亲自读/处理这封邮件吗？"
-Expenses 回答"这个附件是收据吗？"— 只能由 Gemini 看文件内容回答。
-`expenses` 直接用 `hasAttachments eq true` 独立 fetch，不调用 `screen_emails()`。
+Screener 回答的是"CEO 需要亲自读/处理这封邮件吗？"，所以只有"把 inbound 邮件呈现给用户"的模块才需要它。
+
+**呈现邮件、必须过 screener 的模块：** `reply_needed`、`followup_needed`(呈现部分)、`commitments_extract`、`email_monitor`、`ai_summary`、`yesterday_recap`。
+
+**豁免（不调用 `screen_emails()`）—— 因为它们不呈现 inbound 邮件，而是另一种处理：**
+- **`expenses`** — 回答的是"这个附件是收据吗？"（只能 Gemini 看文件内容），直接用 `hasAttachments eq true` 独立 fetch。
+- **只读元数据做聚合 / 匹配的模块**：`crm`（把发件人聚合成联系人库）、`relationship_health`（按发件人统计联系频率）、`profile_init`（首次扫件箱建档案）、`followup_needed` 的回复检测（只取 `conversationId` 判断"发出去的有没有被回"，呈现给用户的是你自己发的邮件，不是 inbound）。
 
 ---
 
