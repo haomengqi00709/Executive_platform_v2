@@ -31,7 +31,7 @@ def _to_teams_html(text: str) -> str:
       **text**            → <b>text</b>
       • / - / * item      → <ul><li>…</li></ul>  (consecutive items grouped)
         · item (indented) → <ul><li>…</li></ul>
-      N. item             → <ol><li>…</li></ol>  (consecutive items grouped)
+      N. item             → N. item<br/>  (literal number preserved)
       blank line          → <br/>
       regular line        → line<br/>
     """
@@ -48,17 +48,14 @@ def _to_teams_html(text: str) -> str:
             i += 1
             continue
 
-        # numbered list: "1. text"
-        if _re.match(r'^\d{1,2}\.\s+\S', stripped):
-            items = []
-            while i < len(lines):
-                m = _re.match(r'^\d{1,2}\.\s+(.+)$', lines[i].strip())
-                if m:
-                    items.append(_fmt_inline(m.group(1)))
-                    i += 1
-                else:
-                    break
-            out.append('<ol>' + ''.join(f'<li>{it}</li>' for it in items) + '</ol>')
+        # numbered list: "1. text" — keep the literal number the section
+        # builder already computed. Teams' <ol> auto-numbering restarts at 1
+        # whenever a blank line or indented continuation splits the run, which
+        # turned a 12-item "Reply Needed" list into twelve "1." entries.
+        m = _re.match(r'^(\d{1,2})\.\s+(.+)$', stripped)
+        if m:
+            out.append(f'{m.group(1)}. {_fmt_inline(m.group(2))}<br/>')
+            i += 1
             continue
 
         # bullet list: "• text", "- text", "* text", or indented "  · text"
