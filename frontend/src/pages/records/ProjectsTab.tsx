@@ -11,6 +11,18 @@ import BulkUploadModal from './BulkUploadModal';
 const STATUS_OPTIONS = ['ongoing', 'needs_attention', 'paused', 'early_stage', 'completed'];
 const MOMENTUM_OPTIONS = ['accelerating', 'steady', 'slowing', 'stalled'];
 const CATEGORY_OPTIONS = ['client_deal', 'internal', 'vendor', 'partnership', 'other'];
+const STAGE_OPTIONS = ['lead', 'deal', 'project'];
+
+const STAGE_COLOR: Record<string, string> = {
+  lead:    'bg-violet-400/15 text-violet-300',
+  deal:    'bg-amber-400/15 text-amber-300',
+  project: 'bg-emerald-400/15 text-emerald-300',
+};
+
+// Stage is a client-only marker — no backend; remembered in localStorage per project id.
+const stageKey = (id: string) => `project_stage_${id}`;
+const getStage = (id: string): string => localStorage.getItem(stageKey(id)) || 'lead';
+const setStageLS = (id: string, v: string): void => localStorage.setItem(stageKey(id), v);
 
 const STATUS_COLOR: Record<string, string> = {
   ongoing:         'bg-emerald-400/15 text-emerald-300',
@@ -39,6 +51,19 @@ export default function ProjectsTab() {
   const [mergeSource, setMergeSource] = useState<ProjectRecord | null>(null);
   const [scanning, setScanning] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
+  const [stages, setStages] = useState<Record<string, string>>({});
+
+  // Hydrate the client-only stage marker from localStorage whenever projects load.
+  useEffect(() => {
+    const m: Record<string, string> = {};
+    for (const p of projects) m[p.id] = getStage(p.id);
+    setStages(m);
+  }, [projects]);
+
+  const changeStage = (id: string, v: string) => {
+    setStageLS(id, v);
+    setStages(s => ({ ...s, [id]: v }));
+  };
 
   const refresh = () => {
     setLoading(true);
@@ -209,6 +234,9 @@ export default function ProjectsTab() {
                   </div>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
+                  <span className={`text-xs px-2 py-1 rounded-md ${STAGE_COLOR[stages[p.id] ?? 'lead']}`}>
+                    {stages[p.id] ?? 'lead'}
+                  </span>
                   <span className={`text-xs px-2 py-1 rounded-md ${STATUS_COLOR[p.status] ?? STATUS_COLOR.completed}`}>
                     {p.status.replace('_', ' ')}
                   </span>
@@ -225,6 +253,8 @@ export default function ProjectsTab() {
                 <ProjectDetail
                   project={p}
                   saving={savingId === p.id}
+                  stage={stages[p.id] ?? 'lead'}
+                  onStageChange={v => changeStage(p.id, v)}
                   onSave={patch => update(p.id, patch)}
                   onArchive={() => archive(p.id, p.name || p.id)}
                   onMerge={() => setMergeSource(p)}
@@ -261,10 +291,12 @@ export default function ProjectsTab() {
 // ───────────────────────────────────────────────────────────
 
 function ProjectDetail({
-  project, saving, onSave, onArchive, onMerge,
+  project, saving, stage, onStageChange, onSave, onArchive, onMerge,
 }: {
   project: ProjectRecord;
   saving: boolean;
+  stage: string;
+  onStageChange: (v: string) => void;
   onSave: (patch: Partial<ProjectRecord>) => Promise<void>;
   onArchive: () => void;
   onMerge: () => void;
@@ -298,7 +330,16 @@ function ProjectDetail({
   return (
     <div className="bg-executive-bg/40 px-5 py-4 border-t border-executive-border/40 space-y-4">
       {/* Metadata strip */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-xs">
+        <Stat icon={<Tag size={12} />} label="Stage">
+          <select
+            value={stage}
+            onChange={e => onStageChange(e.target.value)}
+            className="text-xs bg-executive-bg border border-executive-border rounded-md px-2 py-1 w-full"
+          >
+            {STAGE_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </Stat>
         <Stat icon={<Activity size={12} />} label="Status">
           <select
             value={draft.status}
