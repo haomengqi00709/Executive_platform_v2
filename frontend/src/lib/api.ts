@@ -154,9 +154,23 @@ export type BriefingsPreset = 'recommended' | 'minimal' | 'none' | 'custom';
 export type MonitorPreset   = 'recommended' | 'quiet' | 'off' | 'custom';
 
 export interface OnboardingPreferences {
-  history_months:   number;            // 3..24
-  briefings_preset: BriefingsPreset;
-  monitor_preset:   MonitorPreset;
+  /** Step 3 — confirmed company info (pre-filled in Step 1 via enrichCompanyWebsite). */
+  company_website_url?:     string;
+  company_name?:            string;
+  /** Legacy alias of company_what_they_do — backend still reads it as fallback. */
+  company_description?:     string;
+  company_what_they_do?:    string;
+  company_headquarters?:    string;
+  company_business_lines?:  string[];
+  company_products?:        string[];
+  company_market_segments?: string[];
+  company_role_emails?:     string[];
+  /** Step 2 — optional, user pastes LinkedIn About. */
+  linkedin_bio?: string;
+  /** Legacy/optional — UI no longer exposes these but they're accepted server-side. */
+  history_months?:   number;           // 3..24, default 12
+  briefings_preset?: BriefingsPreset;  // default 'recommended'
+  monitor_preset?:   MonitorPreset;    // default 'recommended'
   personal_profile?: string;
 }
 
@@ -166,6 +180,28 @@ export function submitOnboardingPreferences(
   return fetchJson(`/api/onboarding/preferences`, {
     method: 'POST',
     body: JSON.stringify(prefs),
+  });
+}
+
+export interface WebsiteEnrichment {
+  company_name:   string;
+  headquarters:   string;
+  what_they_do:   string;
+  business_lines: string[];
+  products:       string[];
+  segments:       string[];
+  role_emails:    string[];
+  /** Backwards-compat alias for what_they_do — populated server-side. */
+  description:    string;
+  source:         'ai' | 'ai_partial' | 'fallback';
+  error?:         string;
+}
+
+/** Step 1 helper. Always resolves (returns fallback fields on error). */
+export function enrichCompanyWebsite(url: string): Promise<WebsiteEnrichment> {
+  return fetchJson<WebsiteEnrichment>(`/api/onboarding/enrich-website`, {
+    method: 'POST',
+    body: JSON.stringify({ url }),
   });
 }
 

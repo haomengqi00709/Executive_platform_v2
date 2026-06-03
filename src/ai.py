@@ -1,7 +1,7 @@
 import os
 import time
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
+import threading
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -16,21 +16,45 @@ load_dotenv(override=True)
 DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
 
-# Per-call timeout for Gemini text generation. If the API hangs (rare but happens),
-# we abandon the call and let the retry logic try again instead of blocking forever.
+# Default per-call timeouts. Text generation should always return quickly;
+# video/audio transcription is heavier so callers pass a larger value.
 _GEMINI_TIMEOUT_SECS = 60
 
 
 def _call_with_timeout(fn, timeout_secs: int):
-    """Run fn() in a worker thread, raise TimeoutError if it doesn't finish in time.
-    Note: cannot truly kill the worker thread — it'll keep running in background until
-    the underlying network call finally returns or errors out. But the caller is unblocked."""
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        future = ex.submit(fn)
+    """Run fn() in a daemon thread, raise TimeoutError if it doesn't finish in time.
+
+    The naive implementation `with ThreadPoolExecutor() as ex` does NOT work for
+    this purpose: the executor's __exit__ calls shutdown(wait=True) which blocks
+    on the worker thread even after future.result(timeout=...) raises. When the
+    underlying network call is stuck (Gemini occasionally hangs without erroring),
+    the worker never returns, so the `with` block never exits and the caller is
+    pinned indefinitely — defeating the entire point of the timeout. We hit this
+    in production: a single hung crm.py contact enrichment held the init chain
+    silent for ~10 minutes before being noticed.
+
+    Daemon thread fix: spawn fn() on its own daemon thread, join with a timeout,
+    and on expiry just walk away. The thread is leaked (Python can't kill a
+    blocked C-extension call from the outside) but daemon=True means it won't
+    block process exit, and the underlying call will eventually hit its own TCP
+    timeout. Memory leak per stuck call is acceptable since timeouts should be
+    rare.
+    """
+    result: dict = {}
+    def runner():
         try:
-            return future.result(timeout=timeout_secs)
-        except _FutureTimeout:
-            raise TimeoutError(f"Gemini call exceeded {timeout_secs}s")
+            result["value"] = fn()
+        except BaseException as e:
+            result["error"] = e
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    t.join(timeout=timeout_secs)
+    if t.is_alive():
+        raise TimeoutError(f"Gemini call exceeded {timeout_secs}s")
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
 
 
 class AIClient:
@@ -84,16 +108,22 @@ class AIClient:
                 uploaded = self.client.files.get(name=uploaded.name)
             for attempt in range(3):
                 try:
-                    response = self.client.models.generate_content(
-                        model=self.model,
-                        contents=[
-                            types.Part.from_uri(file_uri=uploaded.uri, mime_type="audio/mpeg"),
-                            "Transcribe all speech in this audio. Label each speaker as 'Speaker 1', 'Speaker 2', etc. Include timestamps. Be complete and accurate.",
-                        ],
-                        # Long meetings can easily exceed Gemini's default ~8K output cap;
-                        # 65535 is the model max. Without this the transcript gets silently
-                        # cut off and only the early portion survives.
-                        config=types.GenerateContentConfig(max_output_tokens=65535),
+                    # Audio transcription can legitimately take a few minutes for
+                    # long meetings — 5 min ceiling per attempt is enough room
+                    # while still bounding catastrophic hangs.
+                    response = _call_with_timeout(
+                        lambda: self.client.models.generate_content(
+                            model=self.model,
+                            contents=[
+                                types.Part.from_uri(file_uri=uploaded.uri, mime_type="audio/mpeg"),
+                                "Transcribe all speech in this audio. Label each speaker as 'Speaker 1', 'Speaker 2', etc. Include timestamps. Be complete and accurate.",
+                            ],
+                            # Long meetings can easily exceed Gemini's default ~8K output cap;
+                            # 65535 is the model max. Without this the transcript gets silently
+                            # cut off and only the early portion survives.
+                            config=types.GenerateContentConfig(max_output_tokens=65535),
+                        ),
+                        timeout_secs=300,
                     )
                     text = response.text
                     # If the model hit the output limit we still got partial text — log it
@@ -133,15 +163,19 @@ class AIClient:
                 uploaded = self.client.files.get(name=uploaded.name)
             for attempt in range(3):
                 try:
-                    response = self.client.models.generate_content(
-                        model=self.model,
-                        contents=[
-                            types.Part.from_uri(file_uri=uploaded.uri, mime_type="video/mp4"),
-                            "Transcribe all speech in this video. Label each speaker by name if visible, otherwise 'Speaker 1', 'Speaker 2', etc. Include timestamps. Be complete and accurate.",
-                        ],
-                        # Same fix as transcribe_audio — without this Gemini truncates
-                        # long meetings at the ~8K default output cap.
-                        config=types.GenerateContentConfig(max_output_tokens=65535),
+                    # See transcribe_audio re. 5 min ceiling.
+                    response = _call_with_timeout(
+                        lambda: self.client.models.generate_content(
+                            model=self.model,
+                            contents=[
+                                types.Part.from_uri(file_uri=uploaded.uri, mime_type="video/mp4"),
+                                "Transcribe all speech in this video. Label each speaker by name if visible, otherwise 'Speaker 1', 'Speaker 2', etc. Include timestamps. Be complete and accurate.",
+                            ],
+                            # Same fix as transcribe_audio — without this Gemini truncates
+                            # long meetings at the ~8K default output cap.
+                            config=types.GenerateContentConfig(max_output_tokens=65535),
+                        ),
+                        timeout_secs=300,
                     )
                     text = response.text
                     try:
@@ -167,15 +201,20 @@ class AIClient:
             os.unlink(tmp_path)
 
     def generate_with_search(self, prompt: str) -> str:
-        """Generate content with Google Search grounding (real-time web search)."""
+        """Generate content with Google Search grounding (real-time web search).
+        Search-grounded calls can be slower than plain generate; use the same
+        60s budget as generate() with one retry on timeout."""
         for attempt in range(4):
             try:
-                response = self.client.models.generate_content(
-                    model=self.model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        tools=[types.Tool(google_search=types.GoogleSearch())],
+                response = _call_with_timeout(
+                    lambda: self.client.models.generate_content(
+                        model=self.model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            tools=[types.Tool(google_search=types.GoogleSearch())],
+                        ),
                     ),
+                    _GEMINI_TIMEOUT_SECS,
                 )
                 text = response.text
                 if not text or not text.strip():
@@ -185,6 +224,13 @@ class AIClient:
                     raise ValueError("Gemini returned empty response")
                 return text
             except Exception as e:
+                if isinstance(e, TimeoutError):
+                    if attempt < 1:
+                        print(f"  Gemini search timeout after {_GEMINI_TIMEOUT_SECS}s, retrying once...")
+                        time.sleep(3)
+                        continue
+                    print(f"  Gemini search timeout twice — giving up.")
+                    raise
                 if "429" in str(e) and attempt < 3:
                     wait = 10 * (2 ** attempt)
                     print(f"  Rate limited, retrying in {wait}s...")

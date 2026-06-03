@@ -1,535 +1,708 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
 import {
-  ArrowLeft, ArrowRight, CheckCircle2, Loader2,
-  Clock, Calendar, Mail, User, Sliders, ChevronLeft,
-  Briefcase, Inbox, Settings as SettingsIcon,
+  ArrowLeft, ArrowRight, CheckCircle2, Loader2, Copy, ExternalLink,
+  Globe, Shield, Bot, AlertCircle, Sparkles, ChevronRight,
 } from 'lucide-react';
-import type { LucideIcon } from 'lucide-react';
-import { submitOnboardingPreferences } from '../lib/api';
-import type {
-  BriefingsPreset, MonitorPreset, OnboardingPreferences,
+import {
+  submitOnboardingPreferences, enrichCompanyWebsite,
 } from '../lib/api';
+import type { WebsiteEnrichment } from '../lib/api';
 
 interface Props {
+  /** Called once Step 3 (bot) completes (or is skipped) and the backend has
+   *  begun the init chain. Parent (App.tsx) re-polls /api/profile/status and
+   *  transitions to the reveal page. */
   onSubmitted: () => void;
+  /** Display name from OAuth (Microsoft Graph /me). Shown on the confirm
+   *  page as the friendly "Setting up for X" header. Falls back to "you"
+   *  if empty. */
+  displayName?: string;
 }
 
-// ── Persona presets bundle everything ─────────────────────
+type StepNum = 1 | 2 | 3;
 
-const PERSONAS: {
-  id: 'standard' | 'highvolume';
-  icon: LucideIcon;
-  title: string;
-  tagline: string;
-  features: string[];
-  recommended?: boolean;
-  prefs: Omit<OnboardingPreferences, 'personal_profile'>;
-}[] = [
-  {
-    id: 'standard',
-    icon: Briefcase,
-    title: 'Standard Executive',
-    tagline: 'Most executives — balanced briefings, moderate alerts',
-    recommended: true,
-    prefs: {
-      history_months:   12,
-      briefings_preset: 'recommended',
-      monitor_preset:   'recommended',
-    },
-    features: [
-      '1 year of email history scanned',
-      '3 scheduled briefings — daily 7 AM + weekly Mon 8 AM + market intel every 3 days',
-      'Email checks every 15 minutes (8 AM–8 PM)',
-      'Immediate Teams push for high-priority emails',
-    ],
-  },
-  {
-    id: 'highvolume',
-    icon: Inbox,
-    title: 'High-volume Inbox',
-    tagline: '100+ emails/day — quieter pings, focused brief',
-    prefs: {
-      history_months:   6,
-      briefings_preset: 'minimal',
-      monitor_preset:   'quiet',
-    },
-    features: [
-      '6 months of email history (faster initial setup)',
-      'One daily 7 AM morning brief — no weekly or intel noise',
-      'Email batches every 60 minutes (9 AM–6 PM)',
-      'No immediate pushes — strictly batched',
-    ],
-  },
+const STEPS: { n: StepNum; label: string }[] = [
+  { n: 1, label: 'Website' },
+  { n: 2, label: 'Confirm' },
+  { n: 3, label: 'AI assistant' },
 ];
 
-// ── Main wizard ───────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+//                        WIZARD CONTAINER
+// ═══════════════════════════════════════════════════════════════════
 
-export default function OnboardingWizard({ onSubmitted }: Props) {
-  const [view, setView] = useState<'cards' | 'customize'>('cards');
-  const [submittingPersona, setSubmittingPersona] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+export default function OnboardingWizard({ onSubmitted, displayName = '' }: Props) {
+  const [step, setStep] = useState<StepNum>(1);
 
-  const pickPersona = async (personaId: string) => {
-    const persona = PERSONAS.find(p => p.id === personaId);
-    if (!persona) return;
-    setSubmittingPersona(personaId);
-    setError(null);
-    try {
-      await submitOnboardingPreferences({ ...persona.prefs });
-      onSubmitted();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      setSubmittingPersona(null);
-    }
-  };
+  // Step 1 data
+  const [websiteUrl, setWebsiteUrl] = useState('');
+  const [enrichment, setEnrichment] = useState<WebsiteEnrichment | null>(null);
+  const [enriching, setEnriching] = useState(false);
 
-  if (view === 'customize') {
-    return (
-      <CustomizeFlow
-        onBack={() => setView('cards')}
-        onSubmitted={onSubmitted}
-      />
-    );
-  }
+  // Step 2 data — editable company name + optional freeform context
+  // (legacy field name `linkedin_bio` kept to avoid backend churn; UX no
+  // longer mentions LinkedIn — see profile_init.py for how it's used).
+  const [companyName, setCompanyName] = useState('');
+  const [extraContext, setExtraContext] = useState('');
 
-  return (
-    <div className="min-h-screen w-full bg-executive-bg executive-grid overflow-auto py-12 px-6">
-      <div className="max-w-5xl mx-auto">
-        <header className="mb-10 text-center">
-          <p className="text-xs font-mono uppercase text-executive-muted tracking-widest mb-2">
-            First-time setup
-          </p>
-          <h1 className="text-3xl font-bold text-executive-text">Pick a setup that fits you</h1>
-          <p className="text-sm text-executive-muted mt-3 max-w-xl mx-auto">
-            One click configures your AI history depth, briefing schedule, and email
-            monitoring. You can change anything later in Settings.
-          </p>
-        </header>
+  // Step 3 (bot) state
+  const [submittingPrefs, setSubmittingPrefs] = useState(false);
+  const [prefsSubmitted, setPrefsSubmitted] = useState(false);
+  const [globalError, setGlobalError] = useState<string | null>(null);
 
-        {error && (
-          <div className="mb-6 text-sm text-rose-400 bg-rose-400/10 border border-rose-400/30 rounded-lg px-3 py-2 max-w-2xl mx-auto">
-            {error}
-          </div>
-        )}
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-          {PERSONAS.map(p => (
-            <PersonaCard
-              key={p.id}
-              persona={p}
-              busy={submittingPersona === p.id}
-              disabled={submittingPersona !== null && submittingPersona !== p.id}
-              onClick={() => pickPersona(p.id)}
-            />
-          ))}
-          <CustomizeCard
-            disabled={submittingPersona !== null}
-            onClick={() => setView('customize')}
-          />
-        </div>
-
-        <p className="text-center text-xs text-executive-muted mt-8">
-          Not sure? Pick <span className="text-executive-text font-medium">Standard Executive</span> —
-          works for almost everyone.
-        </p>
-      </div>
-    </div>
-  );
-}
-
-// ── Persona card ──────────────────────────────────────────
-
-interface PersonaCardProps {
-  persona: typeof PERSONAS[number];
-  busy: boolean;
-  disabled: boolean;
-  onClick: () => void;
-}
-
-function PersonaCard({ persona, busy, disabled, onClick }: PersonaCardProps) {
-  const Icon = persona.icon;
-  return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      className={`relative text-left p-6 rounded-2xl border transition-all flex flex-col h-full
-                  ${persona.recommended
-                    ? 'border-executive-accent/50 bg-executive-card shadow-lg shadow-executive-accent/5'
-                    : 'border-executive-border bg-executive-card'}
-                  ${!disabled && !busy ? 'hover:-translate-y-1 hover:shadow-xl hover:border-executive-accent' : ''}
-                  ${disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}
-                  `}
-    >
-      {persona.recommended && (
-        <span className="absolute -top-2.5 left-5 px-2.5 py-0.5 rounded-full text-[10px] uppercase tracking-wider font-semibold bg-executive-accent text-white shadow-sm">
-          Recommended
-        </span>
-      )}
-
-      <div className="flex items-center gap-3 mb-4">
-        <div className={`w-10 h-10 rounded-xl flex items-center justify-center
-                         ${persona.recommended ? 'bg-executive-accent/15' : 'bg-executive-border/40'}`}>
-          <Icon size={20} className={persona.recommended ? 'text-executive-accent' : 'text-executive-text'} />
-        </div>
-        <div className="min-w-0">
-          <h3 className="text-lg font-bold text-executive-text leading-tight">{persona.title}</h3>
-          <p className="text-xs text-executive-muted mt-0.5">{persona.tagline}</p>
-        </div>
-      </div>
-
-      <ul className="space-y-2.5 mb-5 flex-1">
-        {persona.features.map((f, i) => (
-          <li key={i} className="flex items-start gap-2 text-xs text-executive-muted leading-relaxed">
-            <CheckCircle2 size={12} className="text-executive-accent/70 mt-0.5 flex-shrink-0" />
-            <span>{f}</span>
-          </li>
-        ))}
-      </ul>
-
-      <div className={`flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg font-semibold text-sm transition-colors
-                       ${persona.recommended
-                         ? 'bg-executive-accent text-white'
-                         : 'bg-executive-border/60 text-executive-text'}
-                       ${busy ? 'opacity-80' : ''}`}>
-        {busy ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
-        {busy ? 'Setting up…' : 'Start with this'}
-      </div>
-    </button>
-  );
-}
-
-// ── Customize card ────────────────────────────────────────
-
-function CustomizeCard({ onClick, disabled }: { onClick: () => void; disabled: boolean }) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      className={`relative text-left p-6 rounded-2xl border border-dashed border-executive-border bg-executive-card/50 transition-all flex flex-col h-full
-                  ${!disabled ? 'hover:bg-executive-card hover:border-executive-accent/60 cursor-pointer' : 'opacity-50 cursor-not-allowed'}`}
-    >
-      <div className="flex items-center gap-3 mb-4">
-        <div className="w-10 h-10 rounded-xl flex items-center justify-center bg-executive-border/40">
-          <SettingsIcon size={20} className="text-executive-muted" />
-        </div>
-        <div className="min-w-0">
-          <h3 className="text-lg font-bold text-executive-text leading-tight">Customize</h3>
-          <p className="text-xs text-executive-muted mt-0.5">Tune every setting yourself</p>
-        </div>
-      </div>
-
-      <ul className="space-y-2.5 mb-5 flex-1">
-        {[
-          'Slider for history depth (3–24 months)',
-          'Pick each briefing schedule individually',
-          'Configure monitor interval + active hours',
-          'Add a personal profile for AI signatures',
-        ].map((f, i) => (
-          <li key={i} className="flex items-start gap-2 text-xs text-executive-muted leading-relaxed">
-            <span className="text-executive-muted/60 mt-0.5">›</span>
-            <span>{f}</span>
-          </li>
-        ))}
-      </ul>
-
-      <div className="flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg border border-executive-border text-executive-muted text-sm font-medium">
-        Configure manually <ArrowRight size={14} />
-      </div>
-    </button>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════
-//                  CUSTOMIZE 4-STEP FLOW
-// (only shown when user clicks the Customize card)
-// ═══════════════════════════════════════════════════════════
-
-type Step = 1 | 2 | 3 | 4;
-
-const STEPS: { n: Step; label: string }[] = [
-  { n: 1, label: 'History' },
-  { n: 2, label: 'Briefings' },
-  { n: 3, label: 'Email Monitor' },
-  { n: 4, label: 'About You' },
-];
-
-function CustomizeFlow({ onBack, onSubmitted }: { onBack: () => void; onSubmitted: () => void }) {
-  const [step, setStep] = useState<Step>(1);
-  const [historyMonths, setHistoryMonths] = useState(12);
-  const [briefingsPreset, setBriefingsPreset] = useState<BriefingsPreset>('recommended');
-  const [monitorPreset, setMonitorPreset] = useState<MonitorPreset>('recommended');
-  const [personalProfile, setPersonalProfile] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const next = () => setStep(s => Math.min(4, s + 1) as Step);
-  const prev = () => setStep(s => Math.max(1, s - 1) as Step);
-
-  const submit = async () => {
-    setSubmitting(true);
-    setError(null);
+  // When user confirms Step 2, we POST preferences in the background while
+  // they go through Step 3. The init chain starts immediately; Step 3's
+  // device flow runs in parallel. This way the long inbox scan begins
+  // ~30 seconds earlier than if we waited for the bot.
+  //
+  // Returns true on success so the caller can advance immediately —
+  // checking globalError state after the await would read a stale value.
+  const fireSubmitPreferences = async (): Promise<boolean> => {
+    setSubmittingPrefs(true);
+    setGlobalError(null);
     try {
       await submitOnboardingPreferences({
-        history_months:   historyMonths,
-        briefings_preset: briefingsPreset,
-        monitor_preset:   monitorPreset,
-        personal_profile: personalProfile.trim() || undefined,
+        company_website_url:     websiteUrl.trim(),
+        company_name:            companyName.trim(),
+        company_what_they_do:    enrichment?.what_they_do || enrichment?.description || '',
+        company_headquarters:    enrichment?.headquarters || '',
+        company_business_lines:  enrichment?.business_lines || [],
+        company_products:        enrichment?.products || [],
+        company_market_segments: enrichment?.segments || [],
+        company_role_emails:     enrichment?.role_emails || [],
+        linkedin_bio:            extraContext.trim(),
       });
-      onSubmitted();
+      setPrefsSubmitted(true);
+      return true;
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      setSubmitting(false);
+      setGlobalError(e instanceof Error ? e.message : String(e));
+      return false;
+    } finally {
+      setSubmittingPrefs(false);
     }
   };
 
+  // Triggered when Step 4 finishes (bot connected) or user skips.
+  // Backend init chain is already running (or about to run); parent will
+  // detect stage='generating' on its next status poll and show Step 5.
+  const finishOnboarding = () => {
+    onSubmitted();
+  };
+
   return (
-    <div className="min-h-screen w-full bg-executive-bg executive-grid overflow-auto py-12 px-6">
-      <div className="max-w-3xl mx-auto">
-        <button
-          onClick={onBack}
-          disabled={submitting}
-          className="flex items-center gap-1.5 text-xs text-executive-muted hover:text-executive-text mb-6 transition-colors"
-        >
-          <ChevronLeft size={12} />
-          Back to preset cards
-        </button>
+    <div className="min-h-screen w-full bg-executive-bg executive-grid overflow-auto py-10 px-6">
+      <div className="max-w-2xl mx-auto">
+        <Header step={step} />
 
-        <header className="mb-8">
-          <p className="text-xs font-mono uppercase text-executive-muted tracking-widest mb-2">
-            Customize setup — Step {step} of 4
-          </p>
-          <h1 className="text-2xl font-bold text-executive-text">Fine-tune every option</h1>
-        </header>
-
-        <StepBar current={step} />
-
-        <div className="mt-6 bg-executive-card border border-executive-border rounded-2xl p-8 shadow-sm">
-          {step === 1 && <Step1History months={historyMonths} setMonths={setHistoryMonths} />}
-          {step === 2 && <Step2Briefings preset={briefingsPreset} setPreset={setBriefingsPreset} />}
-          {step === 3 && <Step3Monitor preset={monitorPreset} setPreset={setMonitorPreset} />}
-          {step === 4 && <Step4Personal text={personalProfile} setText={setPersonalProfile} />}
-        </div>
-
-        {error && (
-          <div className="mt-4 text-sm text-rose-400 bg-rose-400/10 border border-rose-400/30 rounded-lg px-3 py-2">
-            {error}
+        {globalError && (
+          <div className="mb-4 flex items-start gap-2 text-sm text-rose-400 bg-rose-400/8 border border-rose-400/30 rounded-lg px-3 py-2">
+            <AlertCircle size={14} className="mt-0.5 shrink-0" />
+            <span>{globalError}</span>
           </div>
         )}
 
-        <div className="mt-6 flex items-center justify-between">
-          <button
-            onClick={prev}
-            disabled={step === 1 || submitting}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm text-executive-muted hover:text-executive-text disabled:opacity-30 transition-colors"
+        <AnimatePresence mode="wait">
+          <motion.div
+            key={step}
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+            transition={{ duration: 0.22, ease: [0.32, 0.72, 0, 1] }}
+            className="bg-executive-card border border-executive-border rounded-2xl p-8 shadow-sm"
           >
-            <ArrowLeft size={14} /> Back
-          </button>
-          {step < 4 ? (
-            <button
-              onClick={next}
-              className="flex items-center gap-2 px-6 py-2.5 rounded-lg bg-executive-accent text-white font-semibold hover:opacity-90 transition-opacity"
-            >
-              Next <ArrowRight size={14} />
-            </button>
-          ) : (
-            <button
-              onClick={submit}
-              disabled={submitting}
-              className="flex items-center gap-2 px-6 py-2.5 rounded-lg bg-executive-accent text-white font-semibold hover:opacity-90 disabled:opacity-50 transition-opacity"
-            >
-              {submitting ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
-              {submitting ? 'Starting setup…' : 'Confirm & start setup'}
-            </button>
-          )}
-        </div>
+            {step === 1 && (
+              <Step1Website
+                value={websiteUrl}
+                onChange={setWebsiteUrl}
+                enrichment={enrichment}
+                enriching={enriching}
+                onNext={async () => {
+                  const url = websiteUrl.trim();
+                  if (!url) return;
+                  // Enrichment is fired non-blocking so Step 2 mounts
+                  // immediately and the user sees the loading state there.
+                  // Step 2's confirm button is disabled while `enriching`
+                  // is true so a fast click can't submit empty company_name.
+                  setEnriching(true);
+                  enrichCompanyWebsite(url)
+                    .then((r) => {
+                      setEnrichment(r);
+                      if (r.company_name) setCompanyName(r.company_name);
+                    })
+                    .catch(() => {/* graceful — Step 2 will show empty */})
+                    .finally(() => setEnriching(false));
+                  setStep(2);
+                }}
+              />
+            )}
+
+            {step === 2 && (
+              <Step2Confirm
+                displayName={displayName}
+                extraContext={extraContext}
+                onExtraContextChange={setExtraContext}
+                enrichment={enrichment}
+                enriching={enriching}
+                submitting={submittingPrefs}
+                onBack={() => setStep(1)}
+                onConfirm={async () => {
+                  // companyName is silently captured from enrichment (may be
+                  // empty if extraction failed) — user no longer required to
+                  // confirm it here. Falls back gracefully downstream.
+                  const ok = await fireSubmitPreferences();
+                  if (ok) setStep(3);
+                }}
+              />
+            )}
+
+            {step === 3 && (
+              <Step3ConnectBot
+                onBack={() => setStep(2)}
+                onSkip={finishOnboarding}
+                onDone={finishOnboarding}
+                prefsSubmitted={prefsSubmitted}
+              />
+            )}
+          </motion.div>
+        </AnimatePresence>
       </div>
     </div>
   );
 }
 
-// ── StepBar + step bodies (Customize flow only) ───────────
+// ═══════════════════════════════════════════════════════════════════
+//                            HEADER + BAR
+// ═══════════════════════════════════════════════════════════════════
 
-function StepBar({ current }: { current: Step }) {
+function Header({ step }: { step: StepNum }) {
   return (
-    <div className="flex items-center gap-2">
-      {STEPS.map((s, i) => (
-        <div key={s.n} className="flex items-center gap-2 flex-1">
-          <div className={`flex items-center gap-2 ${s.n <= current ? 'text-executive-accent' : 'text-executive-muted'}`}>
-            <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-semibold border ${
-              s.n === current ? 'border-executive-accent bg-executive-accent/15'
-              : s.n < current ? 'border-executive-accent bg-executive-accent text-white'
-              : 'border-executive-border'
-            }`}>
-              {s.n < current ? '✓' : s.n}
+    <header className="mb-6">
+      <p className="text-xs font-mono uppercase text-executive-muted tracking-widest mb-2">
+        Set up your AI assistant — step {step} of {STEPS.length}
+      </p>
+      <h1 className="text-2xl font-bold text-executive-text">
+        {step === 1 && "Let's start with your company"}
+        {step === 2 && 'Confirm and start'}
+        {step === 3 && 'Connect Audrey to Teams'}
+      </h1>
+      <div className="mt-4 flex items-center gap-2">
+        {STEPS.map((s, i) => (
+          <div key={s.n} className="flex items-center gap-2 flex-1">
+            <div className={`flex items-center gap-1.5 ${s.n <= step ? 'text-executive-accent' : 'text-executive-muted'}`}>
+              <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-semibold border ${
+                s.n === step ? 'border-executive-accent bg-executive-accent/15'
+                : s.n < step  ? 'border-executive-accent bg-executive-accent text-white'
+                              : 'border-executive-border'
+              }`}>
+                {s.n < step ? '✓' : s.n}
+              </div>
+              <span className="text-[11px] font-medium hidden sm:inline">{s.label}</span>
             </div>
-            <span className="text-xs font-medium hidden md:inline">{s.label}</span>
+            {i < STEPS.length - 1 && (
+              <div className={`flex-1 h-px ${s.n < step ? 'bg-executive-accent' : 'bg-executive-border'}`} />
+            )}
           </div>
-          {i < STEPS.length - 1 && (
-            <div className={`flex-1 h-px ${s.n < current ? 'bg-executive-accent' : 'bg-executive-border'}`} />
-          )}
-        </div>
-      ))}
+        ))}
+      </div>
+    </header>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//                              STEP 1
+// ═══════════════════════════════════════════════════════════════════
+
+function Step1Website({
+  value, onChange, enrichment, enriching, onNext,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  enrichment: WebsiteEnrichment | null;
+  enriching: boolean;
+  onNext: () => void;
+}) {
+  const canSubmit = value.trim().length > 0 && !enriching;
+  return (
+    <div>
+      <StepHeader
+        icon={Globe}
+        color="text-sky-400"
+        title="What's your company website?"
+        subtitle="We'll use this to learn what your business does, so the AI gets it right from day one."
+      />
+
+      <label className="text-xs text-executive-muted block mb-2 mt-2">Company website URL</label>
+      <input
+        type="url"
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        placeholder="https://your-company.com"
+        autoFocus
+        onKeyDown={e => { if (e.key === 'Enter' && canSubmit) onNext(); }}
+        className="w-full px-4 py-3 text-sm bg-executive-bg border border-executive-border rounded-lg focus:outline-none focus:border-executive-accent/60"
+      />
+
+      {enrichment && (
+        <p className="mt-2 text-xs text-emerald-400">
+          ✓ Pre-scanned — we'll confirm what we found in Step 3
+        </p>
+      )}
+
+      <div className="mt-8 flex items-center justify-end">
+        <NextButton onClick={onNext} disabled={!canSubmit}>
+          {enriching ? 'Scanning...' : 'Next'}
+        </NextButton>
+      </div>
     </div>
   );
 }
 
-function StepHeader({ icon: Icon, color, title, subtitle }: {
-  icon: LucideIcon; color: string; title: string; subtitle: string;
+// ═══════════════════════════════════════════════════════════════════
+//                              STEP 2
+// ═══════════════════════════════════════════════════════════════════
+
+function Step2Confirm({
+  displayName,
+  extraContext, onExtraContextChange,
+  enrichment, enriching, submitting,
+  onBack, onConfirm,
+}: {
+  displayName: string;
+  extraContext: string;
+  onExtraContextChange: (v: string) => void;
+  enrichment: WebsiteEnrichment | null;
+  enriching: boolean;
+  submitting: boolean;
+  onBack: () => void;
+  onConfirm: () => void;
+}) {
+  // Headline shows the user's OAuth display name — always available, always
+  // correct. Falls back to "you" if Microsoft Graph didn't return one (rare).
+  const headerName = displayName.trim() || 'you';
+
+  return (
+    <div>
+      <StepHeader
+        icon={Sparkles}
+        color="text-amber-400"
+        title="Almost ready"
+        subtitle="Review what's about to happen and start your setup."
+      />
+
+      <div>
+        <p className="text-[10px] font-mono uppercase text-executive-muted tracking-wider mb-1">
+          Setting up for
+        </p>
+        <p className="text-2xl font-bold text-executive-text leading-tight">{headerName}</p>
+        {enriching && (
+          <p className="mt-2 text-xs text-executive-muted flex items-center gap-1.5">
+            <Loader2 size={11} className="animate-spin" />
+            Still reading your website…
+          </p>
+        )}
+      </div>
+
+      {enrichment && (enrichment.what_they_do || enrichment.description
+                      || enrichment.headquarters || enrichment.business_lines?.length
+                      || enrichment.products?.length || enrichment.segments?.length
+                      || enrichment.role_emails?.length) && (
+        <div className="mt-4 p-3 rounded-lg bg-executive-bg border border-executive-border space-y-2">
+          <p className="text-[10px] font-mono uppercase text-executive-muted tracking-wider">
+            What we learned from your site
+          </p>
+
+          {(enrichment.what_they_do || enrichment.description) && (
+            <p className="text-xs text-executive-text leading-relaxed">
+              {enrichment.what_they_do || enrichment.description}
+            </p>
+          )}
+
+          {enrichment.headquarters && (
+            <p className="text-[11px] text-executive-muted">
+              <span className="text-executive-text font-medium">HQ:</span> {enrichment.headquarters}
+            </p>
+          )}
+
+          {enrichment.business_lines?.length > 0 && (
+            <div>
+              <p className="text-[11px] text-executive-text font-medium mb-0.5">Business lines</p>
+              <ul className="text-[11px] text-executive-muted list-disc ml-4 space-y-0.5">
+                {enrichment.business_lines.map(b => <li key={b}>{b}</li>)}
+              </ul>
+            </div>
+          )}
+
+          {enrichment.products?.length > 0 && (
+            <p className="text-[11px] text-executive-muted">
+              <span className="text-executive-text font-medium">Products:</span>{' '}
+              {enrichment.products.join(', ')}
+            </p>
+          )}
+
+          {enrichment.segments?.length > 0 && (
+            <div className="flex flex-wrap gap-1">
+              {enrichment.segments.map(s => (
+                <span key={s} className="text-[10px] px-2 py-0.5 rounded-full bg-executive-accent/10 text-executive-accent">
+                  {s}
+                </span>
+              ))}
+            </div>
+          )}
+
+          {enrichment.role_emails?.length > 0 && (
+            <p className="text-[11px] text-executive-muted">
+              <span className="text-executive-text font-medium">Contact:</span>{' '}
+              {enrichment.role_emails.join(' · ')}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Optional freeform context — replaces the deleted "About you" step.
+          Stored under the legacy `linkedin_bio` settings key. */}
+      <div className="mt-6">
+        <label className="text-xs text-executive-muted block mb-2">
+          Anything else you'd like the AI to know? <span className="italic text-executive-muted/70">(optional — you can edit later in Profile)</span>
+        </label>
+        <textarea
+          value={extraContext}
+          onChange={e => onExtraContextChange(e.target.value)}
+          placeholder="Anything that would help the AI understand you better — your background, working style, languages you speak, key preferences. Optional, you can edit later."
+          rows={3}
+          className="w-full p-3 rounded-lg bg-executive-bg border border-executive-border text-sm text-executive-text resize-y focus:border-executive-accent focus:outline-none"
+        />
+      </div>
+
+      <div className="mt-6">
+        <p className="text-sm text-executive-text font-medium mb-2">What we'll set up for you:</p>
+        <ul className="space-y-1.5 text-xs text-executive-muted">
+          {[
+            'Scan the last 12 months of your inbox',
+            'Build your contact, project, and company databases',
+            'Draft your personal, business, and market-segment profiles',
+            'Schedule a daily morning briefing in Teams',
+            'Push new important emails to Teams as they arrive',
+            'Watch OneDrive for meeting recordings — summarize automatically',
+            'Capture invoices and receipts from email attachments',
+          ].map(t => (
+            <li key={t} className="flex items-start gap-2">
+              <ChevronRight size={11} className="mt-0.5 text-executive-accent shrink-0" />
+              <span>{t}</span>
+            </li>
+          ))}
+        </ul>
+      </div>
+
+      <div className="mt-5 flex items-start gap-3 p-3 rounded-lg bg-emerald-500/8 border border-emerald-500/20">
+        <Shield size={16} className="text-emerald-500 mt-0.5 shrink-0" />
+        <div className="text-xs text-executive-text">
+          <p className="font-semibold text-emerald-500 mb-0.5">Your data stays on your Microsoft Azure</p>
+          <p className="text-executive-muted">
+            Nothing leaves your tenant. The platform runs inside your own cloud and only your
+            Microsoft Graph API sees the email content.
+          </p>
+        </div>
+      </div>
+
+      <div className="mt-6 flex items-center justify-between">
+        <BackButton onClick={onBack} disabled={submitting} />
+        {/* Disable Start setup while enrichment is still running — otherwise
+            a fast click submits before the website extraction returns, which
+            leaves settings.company_name empty downstream (race condition that
+            caused the empty-sidebar bug). */}
+        <NextButton onClick={onConfirm} disabled={submitting || enriching}>
+          {submitting
+            ? <><Loader2 size={14} className="animate-spin" /> Starting…</>
+            : enriching
+              ? <><Loader2 size={14} className="animate-spin" /> Reading site…</>
+              : 'Start setup →'}
+        </NextButton>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//                              STEP 3 (bot device flow)
+// ═══════════════════════════════════════════════════════════════════
+
+interface DeviceCode {
+  user_code: string;
+  verification_url: string;
+}
+
+function Step3ConnectBot({
+  onBack, onSkip, onDone, prefsSubmitted,
+}: {
+  onBack: () => void;
+  onSkip: () => void;
+  onDone: () => void;
+  prefsSubmitted: boolean;
+}) {
+  const [deviceCode, setDeviceCode] = useState<DeviceCode | null>(null);
+  const [status, setStatus] = useState<'idle' | 'starting' | 'polling' | 'success' | 'error'>('idle');
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  // Auto-start as soon as preferences are submitted (smooth handoff).
+  useEffect(() => {
+    if (prefsSubmitted && status === 'idle') {
+      startFlow();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefsSubmitted]);
+
+  const startFlow = async () => {
+    setStatus('starting');
+    setErrorMsg(null);
+    try {
+      const r = await fetch('/api/teams/bot/auth-start', {
+        method: 'POST', credentials: 'include',
+      });
+      if (!r.ok) throw new Error('Failed to start device flow');
+      setDeviceCode(await r.json());
+      setStatus('polling');
+      pollLoop();
+    } catch (e) {
+      setStatus('error');
+      setErrorMsg(e instanceof Error ? e.message : 'Could not start');
+    }
+  };
+
+  const pollLoop = async () => {
+    const startedAt = Date.now();
+    const tick = async () => {
+      if (Date.now() - startedAt > 5 * 60 * 1000) {
+        setStatus('error');
+        setErrorMsg('Device code expired — please try again.');
+        setDeviceCode(null);
+        return;
+      }
+      try {
+        const r = await fetch('/api/teams/bot/auth-poll', {
+          method: 'POST', credentials: 'include',
+        });
+        const d = await r.json();
+        if (d.status === 'success') {
+          // The bot's tokens are saved + in MSAL cache (commit a28518c).
+          // Now bind owner_uid via activate. If the user signed in as
+          // themselves (Fix C in commit ab53705), we get a 400 here.
+          const activateRes = await fetch(`/api/teams/bot/activate?bot_uid=${d.bot_uid}`, {
+            method: 'POST', credentials: 'include',
+          });
+          if (!activateRes.ok) {
+            const err = await activateRes.json().catch(() => ({} as any));
+            const detail: string = err?.detail || '';
+            let msg: string;
+            if (activateRes.status === 409) {
+              msg = 'This AI assistant account is already claimed by another user. '
+                  + 'Ask that user to disconnect first, or contact your admin.';
+            } else if (activateRes.status === 400) {
+              msg = detail || 'You signed in as yourself. The AI assistant must be a '
+                  + 'separate Microsoft account in your tenant (e.g. audrey@your-company.com).';
+            } else {
+              msg = `Activation failed (HTTP ${activateRes.status})${detail ? ': ' + detail : ''}`;
+            }
+            setStatus('error');
+            setErrorMsg(msg);
+            setDeviceCode(null);
+            return;
+          }
+          setStatus('success');
+          setDeviceCode(null);
+          // Tiny pause so the success state is visible, then advance.
+          setTimeout(onDone, 900);
+        } else if (d.status === 'pending' || d.status === 'authorization_pending') {
+          setTimeout(tick, 4000);
+        } else {
+          setStatus('error');
+          setErrorMsg(d.message || 'Authentication failed');
+          setDeviceCode(null);
+        }
+      } catch {
+        setTimeout(tick, 5000);
+      }
+    };
+    tick();
+  };
+
+  const copyCode = () => {
+    if (!deviceCode) return;
+    navigator.clipboard.writeText(deviceCode.user_code);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  return (
+    <div>
+      <StepHeader
+        icon={Bot}
+        color="text-sky-500"
+        title="Connect Audrey to Microsoft Teams"
+        subtitle="Audrey is a separate Microsoft account in your tenant that talks to you 1:1 in Teams. Set up by your IT — sign in as her below."
+      />
+
+      {!prefsSubmitted && (
+        <p className="text-xs text-executive-muted italic">Waiting for setup to start…</p>
+      )}
+
+      {status === 'success' && (
+        <SuccessBlock />
+      )}
+
+      {status === 'error' && (
+        <div className="mb-4 flex items-start gap-2 p-3 rounded-lg bg-rose-500/8 border border-rose-500/30 text-sm">
+          <AlertCircle size={16} className="text-rose-500 mt-0.5 shrink-0" />
+          <div className="flex-1 text-executive-text">
+            <p className="font-semibold text-rose-500 mb-0.5">Connection failed</p>
+            <p className="text-xs text-executive-muted">{errorMsg}</p>
+            <button
+              onClick={startFlow}
+              className="mt-2 text-xs text-executive-accent hover:underline font-medium"
+            >
+              Try again →
+            </button>
+          </div>
+        </div>
+      )}
+
+      {status === 'polling' && deviceCode && (
+        <div className="flex flex-col gap-4">
+          <a
+            href={deviceCode.verification_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-1.5 text-sm text-executive-accent hover:underline font-mono"
+          >
+            <ExternalLink size={13} />
+            Open {deviceCode.verification_url}
+          </a>
+
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2 px-5 py-3 bg-executive-bg border-2 border-executive-accent rounded-xl">
+              <span className="text-2xl font-mono font-bold tracking-[0.3em] text-executive-text">
+                {deviceCode.user_code}
+              </span>
+            </div>
+            <button
+              onClick={copyCode}
+              className={`flex items-center gap-1.5 px-3 py-2 rounded-lg border text-xs font-mono transition-all ${
+                copied
+                  ? 'border-emerald-500 text-emerald-500'
+                  : 'border-executive-border text-executive-muted hover:border-executive-accent hover:text-executive-accent'
+              }`}
+            >
+              <Copy size={11} /> {copied ? 'Copied!' : 'Copy'}
+            </button>
+          </div>
+
+          <div className="text-xs text-executive-muted leading-relaxed">
+            <p className="font-semibold text-executive-text mb-1">⚠️ Important</p>
+            <p>
+              When Microsoft asks who to sign in as, choose the <strong>AI assistant account</strong>
+              {' '}(e.g. <code className="text-executive-text">audrey@your-company.com</code>) —{' '}
+              <strong>not your own login</strong>. If you sign in as yourself,
+              Audrey becomes a clone of you instead of a separate assistant.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2 text-xs text-executive-muted font-mono mt-1">
+            <Loader2 size={11} className="animate-spin" />
+            Waiting for Microsoft sign-in…
+          </div>
+
+        </div>
+      )}
+
+      {status === 'starting' && (
+        <div className="flex items-center gap-2 text-xs text-executive-muted font-mono">
+          <Loader2 size={11} className="animate-spin" />
+          Getting a device code from Microsoft…
+        </div>
+      )}
+
+      <div className="mt-8 flex items-center justify-between">
+        <BackButton onClick={onBack} disabled={status === 'polling'} />
+        <button
+          onClick={onSkip}
+          className="text-sm text-executive-muted hover:text-executive-text underline-offset-2 hover:underline transition-colors"
+        >
+          {status === 'success' ? 'Continue →' : 'Set up later — skip for now'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SuccessBlock() {
+  return (
+    <motion.div
+      initial={{ opacity: 0, scale: 0.95 }}
+      animate={{ opacity: 1, scale: 1 }}
+      transition={{ duration: 0.25 }}
+      className="mb-4 flex items-start gap-3 p-4 rounded-lg bg-emerald-500/10 border border-emerald-500/30"
+    >
+      <CheckCircle2 size={20} className="text-emerald-500 mt-0.5 shrink-0" />
+      <div className="text-sm text-executive-text">
+        <p className="font-semibold text-emerald-500 mb-0.5">Audrey is connected!</p>
+        <p className="text-xs text-executive-muted">
+          She'll appear in your Microsoft Teams 1:1 list shortly. Let's see what we built…
+        </p>
+      </div>
+    </motion.div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//                            SHARED BITS
+// ═══════════════════════════════════════════════════════════════════
+
+function StepHeader({
+  icon: Icon, color, title, subtitle,
+}: {
+  icon: typeof Globe;
+  color: string;
+  title: string;
+  subtitle: string;
 }) {
   return (
-    <div className="mb-5">
-      <div className="flex items-center gap-3 mb-2">
+    <div className="mb-6">
+      <div className="flex items-center gap-2 mb-2">
         <Icon size={18} className={color} />
         <h2 className="text-lg font-semibold text-executive-text">{title}</h2>
       </div>
-      <p className="text-sm text-executive-muted">{subtitle}</p>
+      <p className="text-sm text-executive-muted leading-relaxed">{subtitle}</p>
     </div>
   );
 }
 
-function Step1History({ months, setMonths }: { months: number; setMonths: (m: number) => void }) {
-  return (
-    <div>
-      <StepHeader
-        icon={Calendar}
-        color="text-amber-400"
-        title="How much email history?"
-        subtitle="More history = richer AI context but longer initial scan (~1 min per month)."
-      />
-      <div className="bg-executive-bg border border-executive-border rounded-xl p-6">
-        <label className="text-xs text-executive-muted block mb-3">Months of email history</label>
-        <div className="flex items-center gap-4">
-          <input
-            type="range"
-            min={3}
-            max={24}
-            step={1}
-            value={months}
-            onChange={e => setMonths(parseInt(e.target.value, 10))}
-            className="flex-1 accent-executive-accent"
-          />
-          <div className="w-20 text-center">
-            <div className="text-2xl font-semibold text-executive-text tabular-nums">{months}</div>
-            <div className="text-xs text-executive-muted">months</div>
-          </div>
-        </div>
-        <div className="mt-3 flex justify-between text-[10px] text-executive-muted uppercase tracking-wider">
-          <span>3 mo</span><span>12 mo</span><span>24 mo</span>
-        </div>
-        <p className="mt-4 text-xs text-executive-muted">
-          Estimated scan: <span className="text-executive-text font-medium">~{Math.round(months * 0.8)}–{Math.round(months * 1.5)} minutes</span>
-        </p>
-      </div>
-    </div>
-  );
-}
-
-function Step2Briefings({ preset, setPreset }: { preset: BriefingsPreset; setPreset: (p: BriefingsPreset) => void }) {
-  return (
-    <div>
-      <StepHeader
-        icon={Clock}
-        color="text-emerald-400"
-        title="Scheduled briefings"
-        subtitle="Pushed to your Teams chat on a cron schedule. Changeable later in Skills."
-      />
-      <div className="space-y-2">
-        <RowOption active={preset === 'recommended'} onClick={() => setPreset('recommended')}
-          label="Recommended" desc="3 briefings: daily 7 AM + weekly Mon 8 AM + market intel every 3 days" />
-        <RowOption active={preset === 'minimal'} onClick={() => setPreset('minimal')}
-          label="Minimal" desc="One daily morning brief at 7 AM. No weekly, no intel." />
-        <RowOption active={preset === 'none'} onClick={() => setPreset('none')}
-          label="None" desc="No scheduled pushes. I'll check the dashboard myself." />
-        <RowOption active={preset === 'custom'} onClick={() => setPreset('custom')}
-          label="Skip preset — configure later in Skills → Briefings" desc="" />
-      </div>
-    </div>
-  );
-}
-
-function Step3Monitor({ preset, setPreset }: { preset: MonitorPreset; setPreset: (p: MonitorPreset) => void }) {
-  return (
-    <div>
-      <StepHeader
-        icon={Mail}
-        color="text-sky-400"
-        title="Email monitor"
-        subtitle="Batches non-priority emails. High-priority can bypass the batch."
-      />
-      <div className="space-y-2">
-        <RowOption active={preset === 'recommended'} onClick={() => setPreset('recommended')}
-          label="Recommended" desc="Every 15 min (8 AM–8 PM) + immediate push for high-priority" />
-        <RowOption active={preset === 'quiet'} onClick={() => setPreset('quiet')}
-          label="Quiet" desc="Every 60 min (9 AM–6 PM), no immediate pushes" />
-        <RowOption active={preset === 'off'} onClick={() => setPreset('off')}
-          label="Off" desc="No email push notifications (you'll see new mail in dashboard)" />
-        <RowOption active={preset === 'custom'} onClick={() => setPreset('custom')}
-          label="Skip preset — configure later in Skills → Auto-triggered" desc="" />
-      </div>
-    </div>
-  );
-}
-
-function Step4Personal({ text, setText }: { text: string; setText: (s: string) => void }) {
-  const placeholder = `# Personal Profile
-
-## Name and title
-Daniel Zhang, CEO
-
-## Company
-i3D Model Inc.
-
-## Contact
-- Email: daniel.zhang@imodel3d.com
-- Location: Toronto, Canada
-
-## Languages
-English, Mandarin
-
-## Working hours preference
-9 AM – 6 PM ET, no meetings before 10 AM
-
-## Other preferences AI should know
-Prefer concise emails. Always close with "Bests, Daniel".`;
-  return (
-    <div>
-      <StepHeader
-        icon={User}
-        color="text-rose-400"
-        title="About you (optional)"
-        subtitle="AI uses this when drafting emails — signatures, address forms, tone."
-      />
-      <textarea
-        value={text}
-        onChange={e => setText(e.target.value)}
-        placeholder={placeholder}
-        rows={14}
-        className="w-full p-3 rounded-lg bg-executive-bg border border-executive-border text-sm font-mono text-executive-text resize-y focus:border-executive-accent focus:outline-none"
-      />
-      <p className="mt-2 text-xs text-executive-muted italic">
-        Leave blank to skip — fill it later under Profile → Personal Profile.
-      </p>
-    </div>
-  );
-}
-
-function RowOption({ active, onClick, label, desc }: {
-  active: boolean; onClick: () => void; label: string; desc: string;
+function NextButton({
+  children, onClick, disabled,
+}: {
+  children: React.ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
 }) {
   return (
     <button
       onClick={onClick}
-      className={`w-full text-left p-4 rounded-xl border transition-all ${
-        active
-          ? 'border-executive-accent bg-executive-accent/8'
-          : 'border-executive-border hover:bg-executive-border/30'
-      }`}
+      disabled={disabled}
+      className="flex items-center gap-2 px-6 py-2.5 rounded-lg bg-executive-accent text-white font-semibold text-sm hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed transition-opacity"
     >
-      <p className={`text-sm font-semibold ${active ? 'text-executive-accent' : 'text-executive-text'}`}>{label}</p>
-      {desc && <p className="text-xs text-executive-muted mt-1">{desc}</p>}
+      {children} <ArrowRight size={14} />
     </button>
   );
 }
 
-// Avoid unused-warnings on lucide imports we keep around for the customize flow
-void Sliders;
+function BackButton({ onClick, disabled }: { onClick: () => void; disabled?: boolean }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className="flex items-center gap-1.5 px-3 py-2 text-sm text-executive-muted hover:text-executive-text disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+    >
+      <ArrowLeft size={13} /> Back
+    </button>
+  );
+}

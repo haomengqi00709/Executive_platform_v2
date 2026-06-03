@@ -253,10 +253,24 @@ export interface ProfileText {
   market_segments: string;
 }
 
+/** A single phase in the onboarding init chain. reveal_data is attached
+ *  by the backend when status flips to 'done' — the wizard's Step 5 uses
+ *  it to render the animated reveal card. */
+export interface InitStep {
+  key: string;       // 'crm' | 'projects' | 'companies' | 'personal_profile' | 'business_profile' | 'market_segments'
+  label: string;
+  status: 'pending' | 'in_progress' | 'done' | 'failed';
+  reveal_data?: {
+    count?: number;          // for crm / projects / companies
+    samples?: string[];      // 0-3 display names
+    preview?: string;        // for the 3 profile docs (trimmed to ~240 chars)
+  };
+}
+
 export interface ProfileStatus {
-  stage: 'pending' | 'generating' | 'draft_ready' | 'user_confirmed';
+  stage: 'pending' | 'awaiting_confirmation' | 'generating' | 'draft_ready' | 'user_confirmed';
   last_update: string | null;
-  steps: { key: string; label: string; status: string }[];
+  steps: InitStep[];
   current_message: string;
 }
 

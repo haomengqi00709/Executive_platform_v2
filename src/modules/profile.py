@@ -148,10 +148,19 @@ _VALID_STAGES = ("pending", "awaiting_confirmation", "generating", "draft_ready"
 _VALID_STEP_STATUSES = ("pending", "in_progress", "done", "failed")
 
 # Order matters — frontend renders this list top-to-bottom.
+# Each item: (key, label). Steps are revealed sequentially in the onboarding
+# UI as the backend marks them "done". personal + market_segments come
+# from one combined AI call; business_profile runs a two-pass generation
+# (website-only draft, then CRM enrichment) and ✓s last — hence the
+# ordering below puts business_profile after market_segments so the user
+# never sees a stuck middle card.
 INIT_STEPS = [
-    ("crm",      "Building contact database from inbox"),
-    ("projects", "Detecting active projects"),
-    ("profile",  "Drafting your business profile"),
+    ("crm",               "Reading your inbox"),
+    ("projects",          "Detecting active projects"),
+    ("companies",         "Mapping companies"),
+    ("personal_profile",  "Drafting your personal profile"),
+    ("market_segments",   "Identifying market segments"),
+    ("business_profile",  "Drafting your business profile"),
 ]
 
 
@@ -209,14 +218,31 @@ def save_init_status(data_dir: Path, stage: str, current_message: str | None = N
     _write_status(data_dir, status)
 
 
-def update_init_step(data_dir: Path, step_key: str, status: str, message: str = "") -> None:
-    """Mark one step's status. status ∈ pending|in_progress|done|failed."""
+def update_init_step(
+    data_dir: Path,
+    step_key: str,
+    status: str,
+    message: str = "",
+    reveal_data: dict | None = None,
+) -> None:
+    """Mark one step's status. status ∈ pending|in_progress|done|failed.
+
+    reveal_data is a small payload attached to the step that the frontend
+    uses to render the "reveal card" when status flips to done. Typical
+    shapes:
+      {"count": 247, "samples": ["Sarah Chen", "Mark Wei", "Tony Moro"]}
+      {"preview": "first 200 chars of the doc..."}
+    Pass None to leave the existing reveal_data untouched (e.g. on the
+    in_progress update).
+    """
     if status not in _VALID_STEP_STATUSES:
         raise ValueError(f"invalid step status: {status}")
     current = load_init_status(data_dir)
     for s in current["steps"]:
         if s["key"] == step_key:
             s["status"] = status
+            if reveal_data is not None:
+                s["reveal_data"] = reveal_data
             break
     current["current_message"] = message
     _write_status(data_dir, current)

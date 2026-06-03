@@ -1,9 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
 import {
   Settings, Save, CheckCircle2, AlertCircle, LogIn, LogOut,
   Bot, Webhook, User, Loader2, Copy, ExternalLink, Moon, Sun,
   LayoutDashboard, Sparkles, Wrench, UserCircle2, Database,
   BarChart3, Building2, RefreshCw, AlertTriangle, RotateCcw,
+  Users, FolderKanban, FileText, ArrowRight, ChevronDown,
 } from 'lucide-react';
 
 import DashboardPage from './pages/DashboardPage';
@@ -22,7 +24,12 @@ type Page = 'dashboard' | 'skills' | 'section' | 'records' | 'tools' | 'profile'
 type ProfileStage = 'pending' | 'awaiting_confirmation' | 'generating' | 'draft_ready' | 'user_confirmed';
 
 type StepStatus = 'pending' | 'in_progress' | 'done' | 'failed';
-interface InitStep { key: string; label: string; status: StepStatus; }
+interface InitStep {
+  key: string;
+  label: string;
+  status: StepStatus;
+  reveal_data?: { count?: number; samples?: string[]; preview?: string };
+}
 interface InitStatus {
   stage: ProfileStage;
   last_update: string | null;
@@ -67,6 +74,14 @@ const NAV: { id: Page; label: string; icon: React.ReactNode; color: string }[] =
   { id: 'profile',   label: 'Profile',   icon: <UserCircle2 size={16} />,     color: 'text-rose-400' },
 ];
 
+function brandInitials(name: string): string {
+  const cleaned = (name || '').trim();
+  if (!cleaned) return '';
+  const words = cleaned.split(/\s+/).filter(Boolean);
+  if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+  return (words[0][0] + words[words.length - 1][0]).toUpperCase();
+}
+
 // ── App shell ──────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -78,6 +93,17 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
   const [profileConfirmed, setProfileConfirmed] = useState<boolean | null>(null);
   const [authHealth, setAuthHealth] = useState<AuthHealth | null>(null);
+  const [brandCompany, setBrandCompany] = useState<string>('');
+  const [brandDisplay, setBrandDisplay] = useState<string>('');
+
+  const loadBranding = useCallback(async () => {
+    try {
+      const s: Record<string, string> = await fetch('/api/settings', { credentials: 'include' })
+        .then(r => r.ok ? r.json() : {});
+      setBrandCompany((s?.company_name || '').toString().trim());
+      setBrandDisplay((s?.display_name || '').toString().trim());
+    } catch {}
+  }, []);
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
@@ -96,11 +122,12 @@ export default function App() {
           } catch {
             setProfileConfirmed(false);
           }
+          loadBranding();
         }
       })
       .catch(() => setUser(null))
       .finally(() => setAuthLoading(false));
-  }, []);
+  }, [loadBranding]);
 
   useEffect(() => {
     if (!user) return;
@@ -120,7 +147,10 @@ export default function App() {
   if (!user) return <LoginScreen />;
 
   if (profileConfirmed === false) {
-    return <OnboardingPage onComplete={() => setProfileConfirmed(true)} />;
+    return <OnboardingPage
+      displayName={brandDisplay}
+      onComplete={() => { setProfileConfirmed(true); loadBranding(); }}
+    />;
   }
   if (profileConfirmed === null) return <Spinner />;
 
@@ -140,10 +170,19 @@ export default function App() {
       <aside className="w-56 shrink-0 h-full flex flex-col border-r border-executive-border bg-executive-card z-10">
         {/* Brand */}
         <div className="h-14 flex items-center gap-3 px-5 border-b border-executive-border">
-          <div className="w-7 h-7 rounded-lg bg-executive-accent flex items-center justify-center font-bold text-white text-xs">
-            EA
+          <div className="w-7 h-7 rounded-lg bg-executive-accent flex items-center justify-center font-bold text-white text-xs shrink-0">
+            {brandInitials(brandCompany) || 'EA'}
           </div>
-          <span className="font-semibold text-sm">CEO Platform</span>
+          <div className="min-w-0">
+            <p className="font-semibold text-sm truncate leading-tight">
+              {brandCompany || 'CEO Platform'}
+            </p>
+            {brandDisplay && (
+              <p className="text-[10px] text-executive-muted truncate leading-tight mt-0.5">
+                {brandDisplay} · Executive Assistant
+              </p>
+            )}
+          </div>
         </div>
 
         {/* Nav */}
@@ -222,7 +261,7 @@ export default function App() {
         {page === 'records'   && <RecordsPage />}
         {page === 'tools'     && <ToolsPage />}
         {page === 'profile'   && <ProfilePage />}
-        {page === 'settings'  && <SettingsPage user={user} />}
+        {page === 'settings'  && <SettingsPage user={user} onBrandingChange={loadBranding} />}
       </main>
     </div>
     </ActivityProvider>
@@ -233,7 +272,7 @@ export default function App() {
 // PRESERVED PAGES & COMPONENTS — DO NOT TOUCH (Settings / Auth / Onboarding)
 // ════════════════════════════════════════════════════════════════════════════
 
-function SettingsPage({ user }: { user: AuthUser }) {
+function SettingsPage({ user, onBrandingChange }: { user: AuthUser; onBrandingChange?: () => void }) {
   const [settings, setSettings]       = useState<Record<string, string>>({});
   const [settLoading, setSettLoading] = useState(false);
   const [saved, setSaved]             = useState(false);
@@ -286,6 +325,9 @@ function SettingsPage({ user }: { user: AuthUser }) {
       if (!r1.ok || !r2.ok || !r3.ok) throw new Error('Save failed');
       setSaved(true);
       setTimeout(() => setSaved(false), 2500);
+      // Sidebar shows company_name + display_name. Either could have changed
+      // — bump the parent so the sidebar re-renders without a page reload.
+      onBrandingChange?.();
     } catch (e: any) { setSaveError(e.message || 'Save failed'); }
   };
 
@@ -448,6 +490,7 @@ function SettingsPage({ user }: { user: AuthUser }) {
       <div className="flex flex-col gap-6">
         <Section icon={<User size={16} />} title="Profile" color="text-executive-accent">
           <Field label="Display Name" value={settings.display_name || ''} onChange={v => setSettings(p => ({ ...p, display_name: v }))} placeholder="e.g. Daniel" />
+          <Field label="Company Name" value={settings.company_name || ''} onChange={v => setSettings(p => ({ ...p, company_name: v }))} placeholder="Shown in your sidebar" />
           <Field label="Report Email" value={settings.report_email || ''} onChange={v => setSettings(p => ({ ...p, report_email: v }))} placeholder="daniel@company.com" type="email" />
           <div className="flex items-center justify-between pt-2 border-t border-executive-border">
             <div>
@@ -651,35 +694,6 @@ function Field({ label, value, onChange, placeholder, type = 'text' }: { label: 
   );
 }
 
-function StepIcon({ status }: { status: StepStatus }) {
-  if (status === 'done') {
-    return (
-      <div className="w-6 h-6 rounded-full bg-emerald-500/15 flex items-center justify-center shrink-0">
-        <CheckCircle2 size={14} className="text-emerald-500" />
-      </div>
-    );
-  }
-  if (status === 'in_progress') {
-    return (
-      <div className="w-6 h-6 rounded-full bg-executive-accent/15 flex items-center justify-center shrink-0">
-        <Loader2 size={14} className="text-executive-accent animate-spin" />
-      </div>
-    );
-  }
-  if (status === 'failed') {
-    return (
-      <div className="w-6 h-6 rounded-full bg-rose-500/15 flex items-center justify-center shrink-0">
-        <AlertCircle size={14} className="text-rose-500" />
-      </div>
-    );
-  }
-  return (
-    <div className="w-6 h-6 rounded-full border border-executive-border flex items-center justify-center shrink-0">
-      <div className="w-1.5 h-1.5 rounded-full bg-executive-muted" />
-    </div>
-  );
-}
-
 function ErrorBanner({ message }: { message: string }) {
   return (
     <div className="flex items-center gap-2 p-3 bg-rose-500/8 border border-rose-500/20 rounded-xl text-rose-500 text-xs font-mono">
@@ -788,15 +802,19 @@ function LoginScreen() {
   );
 }
 
-function OnboardingPage({ onComplete }: { onComplete: () => void }) {
-  const [status, setStatus]               = useState<InitStatus | null>(null);
-  const [businessProfile, setBusinessProfile] = useState('');
-  const [marketSegments,  setMarketSegments]  = useState('');
-  const [saving, setSaving]               = useState(false);
-  const [error, setError]                 = useState('');
-  const [pollNonce, setPollNonce]         = useState(0);  // force re-fetch after wizard submit
+function OnboardingPage({ onComplete, displayName }: { onComplete: () => void; displayName: string }) {
+  const [status, setStatus]       = useState<InitStatus | null>(null);
+  const [thinkingLog, setThinkingLog] = useState<string[]>([]);
+  const [confirming, setConfirming] = useState(false);
+  const [confirmError, setConfirmError] = useState('');
 
-  const stage = status?.stage || 'pending';
+  // null = haven't decided yet (waiting for initial status fetch).
+  // false = show wizard. true = wizard handed off, show reveal page.
+  //
+  // On a fresh refresh mid-init we land here with stage='generating' even
+  // though the user already completed the wizard in a prior session —
+  // honor that by skipping the wizard.
+  const [wizardDone, setWizardDone] = useState<boolean | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -805,12 +823,15 @@ function OnboardingPage({ onComplete }: { onComplete: () => void }) {
         const s: InitStatus = await fetch('/api/profile/status', { credentials: 'include' }).then(r => r.json());
         if (cancelled) return;
         setStatus(s);
-        if (s?.stage === 'draft_ready') {
-          const p = await fetch('/api/profile', { credentials: 'include' }).then(r => r.json());
-          if (cancelled) return;
-          setBusinessProfile(p.business_profile || '');
-          setMarketSegments(p.market_segments  || '');
-          return;
+        // Accumulate AI "thinking" messages — current_message overwrites
+        // server-side per phase, but the user wants to see the trail.
+        const msg = s?.current_message?.trim();
+        if (msg) {
+          setThinkingLog(prev => (prev[prev.length - 1] === msg ? prev : [...prev, msg]));
+        }
+        if (wizardDone === null) {
+          // First fetch decides which UI to show
+          setWizardDone(['generating', 'draft_ready', 'user_confirmed'].includes(s?.stage));
         }
         if (s?.stage === 'user_confirmed') {
           onComplete();
@@ -821,152 +842,524 @@ function OnboardingPage({ onComplete }: { onComplete: () => void }) {
     };
     poll();
     return () => { cancelled = true; };
-  }, [onComplete, pollNonce]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onComplete]);
 
-  const confirm = async () => {
-    setSaving(true); setError('');
+  const allDone = (status?.steps || []).length > 0
+    && (status?.steps || []).every(s => s.status === 'done');
+
+  const enterAssistant = async () => {
+    setConfirming(true); setConfirmError('');
     try {
-      await Promise.all([
-        fetch('/api/profile/business', {
-          method: 'POST', credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: businessProfile }),
-        }),
-        fetch('/api/profile/segments', {
-          method: 'POST', credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: marketSegments }),
-        }),
-      ]);
-      await fetch('/api/profile/confirm', { method: 'POST', credentials: 'include' });
+      const r = await fetch('/api/profile/confirm', { method: 'POST', credentials: 'include' });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
       onComplete();
     } catch (e: any) {
-      setError(e?.message || 'Failed to save profile');
-      setSaving(false);
+      setConfirmError(e?.message || 'Failed to confirm');
+      setConfirming(false);
     }
   };
 
-  const regenerate = async () => {
-    setStatus(s => s ? { ...s, stage: 'generating' } : s);
-    await fetch('/api/profile/regenerate', { method: 'POST', credentials: 'include' });
-  };
+  if (wizardDone === null) return <Spinner />;
 
-  // Awaiting wizard — show 4-step configuration before kicking off init
-  if (stage === 'pending' || stage === 'awaiting_confirmation') {
+  if (!wizardDone) {
     return (
       <OnboardingWizard
-        onSubmitted={() => {
-          // Wizard returned 200 — backend just set stage='generating'.
-          // Bump the poll nonce so the effect immediately refetches status
-          // and falls through to the checklist UI below.
-          setStatus(s => s ? { ...s, stage: 'generating' } : { stage: 'generating', last_update: null, steps: [], current_message: '' });
-          setPollNonce(n => n + 1);
-        }}
+        displayName={displayName}
+        onSubmitted={() => setWizardDone(true)}
       />
     );
   }
 
-  // Generating state — show step-by-step checklist
-  if (stage === 'generating') {
-    const steps = status?.steps || [];
-    const currentMessage = status?.current_message || '';
-    return (
-      <div className="min-h-screen w-full flex items-center justify-center bg-executive-bg executive-grid p-6">
-        <div className="w-full max-w-xl bg-executive-card border border-executive-border rounded-2xl p-8 shadow-sm">
-          <div className="flex items-center gap-3 mb-6">
-            <div className="w-10 h-10 rounded-xl bg-executive-accent/10 flex items-center justify-center">
-              <Loader2 size={20} className="text-executive-accent animate-spin" />
-            </div>
-            <div>
-              <p className="text-xs font-mono uppercase text-executive-muted tracking-widest">First-time setup</p>
-              <h1 className="text-lg font-bold">Setting up your AI profile</h1>
-            </div>
-          </div>
+  return (
+    <RevealPage
+      steps={status?.steps || []}
+      currentMessage={status?.current_message || ''}
+      thinkingLog={thinkingLog}
+      allDone={allDone}
+      confirming={confirming}
+      error={confirmError}
+      onEnter={enterAssistant}
+    />
+  );
+}
 
-          <p className="text-sm text-executive-muted mb-6 leading-relaxed">
-            We're scanning your inbox to build the foundation that every AI feature on the platform will use.
-            This usually takes 2–5 minutes on first sign-in.
+// ── Onboarding reveal page (two-pane) ──────────────────────────────────────
+//
+// Left pane shows the AI's progress: 6 compact step rows + a scrolling
+// "thinking" feed that accumulates current_message values over time.
+// Right pane shows generated artifacts as cards that appear when each
+// step completes (DB counts + sample chips for crm/projects/companies,
+// markdown previews for the three profile docs).
+
+const REVEAL_ICONS: Record<string, { Icon: typeof Users; color: string }> = {
+  crm:               { Icon: Users,         color: 'text-emerald-400' },
+  projects:          { Icon: FolderKanban,  color: 'text-amber-400' },
+  companies:         { Icon: Building2,     color: 'text-sky-400' },
+  personal_profile:  { Icon: UserCircle2,   color: 'text-rose-400' },
+  business_profile:  { Icon: FileText,      color: 'text-violet-400' },
+  market_segments:   { Icon: BarChart3,     color: 'text-cyan-400' },
+};
+
+const REVEAL_TITLES: Record<string, string> = {
+  crm:              'CRM Database',
+  projects:         'Active Projects',
+  companies:        'Company Map',
+  personal_profile: 'Personal Profile',
+  business_profile: 'Business Profile',
+  market_segments:  'Market Segments',
+};
+
+// Profile docs go to the top of the right pane (per UX brief). Within each
+// group (profiles vs DBs) preserve the natural INIT_STEPS order so the user
+// reads `Personal → Business → Market` then `CRM → Projects → Companies`.
+const PROFILE_KEYS = new Set(['personal_profile', 'business_profile', 'market_segments']);
+function sortForRightPane(steps: InitStep[]): InitStep[] {
+  return [...steps].sort((a, b) => {
+    const aProfile = PROFILE_KEYS.has(a.key) ? 0 : 1;
+    const bProfile = PROFILE_KEYS.has(b.key) ? 0 : 1;
+    return aProfile - bProfile;
+  });
+}
+
+// Expanded card content — fetched on demand from real endpoints.
+interface ExpandedContent {
+  // For profile keys: the full markdown text
+  markdown?: string;
+  // For DB keys: list of items to render (top N already sliced)
+  items?:    { primary: string; secondary?: string }[];
+  total?:    number;
+}
+
+function RevealPage({
+  steps, currentMessage, thinkingLog, allDone, confirming, error, onEnter,
+}: {
+  steps: InitStep[];
+  currentMessage: string;
+  thinkingLog: string[];
+  allDone: boolean;
+  confirming: boolean;
+  error: string;
+  onEnter: () => void;
+}) {
+  const doneSteps = steps.filter(s => s.status === 'done' && s.reveal_data);
+
+  return (
+    <div className="min-h-screen w-full bg-executive-bg executive-grid overflow-auto py-8 px-6">
+      <div className="max-w-6xl mx-auto">
+        <header className="mb-6 text-center">
+          <p className="text-xs font-mono uppercase text-executive-muted tracking-widest mb-2">
+            Building your assistant
           </p>
+          <h1 className="text-2xl font-bold text-executive-text">
+            {allDone ? 'Everything is ready' : 'Setting up your AI assistant…'}
+          </h1>
+        </header>
 
-          <ol className="flex flex-col gap-3">
-            {steps.map(step => (
-              <li key={step.key} className="flex items-start gap-3">
-                <StepIcon status={step.status} />
-                <div className="flex-1 min-w-0">
-                  <p className={`text-sm font-medium ${
-                    step.status === 'done'        ? 'text-executive-text' :
-                    step.status === 'in_progress' ? 'text-executive-accent' :
-                    step.status === 'failed'      ? 'text-rose-500' :
-                                                    'text-executive-muted'
-                  }`}>{step.label}</p>
-                  {step.status === 'in_progress' && currentMessage && (
-                    <p className="text-xs font-mono text-executive-muted mt-0.5 truncate">{currentMessage}</p>
-                  )}
-                </div>
-              </li>
-            ))}
-          </ol>
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 items-start">
+          <LeftPanel steps={steps} currentMessage={currentMessage} thinkingLog={thinkingLog} />
+          <RightPanel doneSteps={sortForRightPane(doneSteps)} />
         </div>
+
+        {error && (
+          <div className="mt-6 max-w-2xl mx-auto flex items-start gap-2 text-sm text-rose-400 bg-rose-400/8 border border-rose-400/30 rounded-lg px-3 py-2">
+            <AlertCircle size={14} className="mt-0.5 shrink-0" />
+            <span>{error}</span>
+          </div>
+        )}
+
+        <motion.div
+          initial={false}
+          animate={{ opacity: allDone ? 1 : 0.35 }}
+          className="mt-8 flex flex-col items-center gap-2"
+        >
+          <button
+            onClick={onEnter}
+            disabled={!allDone || confirming}
+            className="flex items-center gap-2 px-6 py-3 rounded-xl bg-executive-accent text-white font-semibold text-sm hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed transition-opacity shadow-sm"
+          >
+            {confirming ? <Loader2 size={14} className="animate-spin" /> : <ArrowRight size={14} />}
+            {confirming ? 'Opening…' : 'Enter your assistant'}
+          </button>
+          <p className="text-[11px] text-executive-muted">
+            {allDone ? 'You can review and edit any of these in Profile later.' : 'Hang tight — this usually takes 2–5 minutes.'}
+          </p>
+        </motion.div>
+      </div>
+    </div>
+  );
+}
+
+// ── Left pane: progress + thinking feed ────────────────────────────────────
+
+function LeftPanel({
+  steps, currentMessage, thinkingLog,
+}: {
+  steps: InitStep[];
+  currentMessage: string;
+  thinkingLog: string[];
+}) {
+  // Show the most recent thoughts at the top, cap at ~8 to keep it readable
+  const recentThoughts = [...thinkingLog].slice(-8).reverse();
+
+  return (
+    <div className="bg-executive-card border border-executive-border rounded-2xl p-5">
+      <p className="text-[10px] font-mono uppercase text-executive-muted tracking-widest mb-3">
+        AI is thinking
+      </p>
+
+      <ol className="flex flex-col gap-1.5 mb-5">
+        {steps.length === 0 && (
+          <li className="flex items-center gap-2 py-2 text-executive-muted text-sm">
+            <Loader2 size={14} className="animate-spin" /> Starting up…
+          </li>
+        )}
+        {steps.map(step => <StepRow key={step.key} step={step} />)}
+      </ol>
+
+      {(currentMessage || recentThoughts.length > 0) && (
+        <div className="pt-4 border-t border-executive-border">
+          <p className="text-[10px] font-mono uppercase text-executive-muted tracking-widest mb-2">
+            Thoughts
+          </p>
+          <ul className="flex flex-col gap-1.5 text-xs text-executive-muted">
+            <AnimatePresence initial={false}>
+              {recentThoughts.map((t, i) => (
+                <motion.li
+                  key={`${t}-${thinkingLog.length - i}`}
+                  initial={{ opacity: 0, x: -4 }}
+                  animate={{ opacity: i === 0 ? 1 : 0.55 - i * 0.07 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.25 }}
+                  className={`flex items-start gap-2 font-mono leading-relaxed ${
+                    i === 0 ? 'text-executive-text' : ''
+                  }`}
+                >
+                  <span className="text-executive-accent shrink-0">›</span>
+                  <span className="break-words">{t}</span>
+                </motion.li>
+              ))}
+            </AnimatePresence>
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StepRow({ step }: { step: InitStep }) {
+  const meta = REVEAL_ICONS[step.key] || { Icon: CheckCircle2, color: 'text-executive-muted' };
+  const { Icon } = meta;
+  const done = step.status === 'done';
+  const inProgress = step.status === 'in_progress';
+  const failed = step.status === 'failed';
+
+  const restart = async () => {
+    if (!confirm('Restart onboarding from scratch? Current data will be cleared.')) return;
+    await fetch('/api/onboarding/restart', { method: 'POST', credentials: 'include' });
+    window.location.reload();
+  };
+
+  return (
+    <li className="flex items-center gap-3 py-1.5">
+      <div className="w-5 h-5 flex items-center justify-center shrink-0">
+        {done
+          ? <CheckCircle2 size={14} className="text-emerald-500" />
+          : inProgress
+            ? <Loader2 size={14} className="text-executive-accent animate-spin" />
+            : failed
+              ? <AlertCircle size={14} className="text-rose-500" />
+              : <Icon size={13} className={meta.color + ' opacity-40'} />}
+      </div>
+      <p className={`text-sm flex-1 ${
+        done       ? 'text-executive-text' :
+        inProgress ? 'text-executive-accent font-medium' :
+        failed     ? 'text-rose-500' :
+                     'text-executive-muted'
+      }`}>
+        {step.label}
+      </p>
+      {failed && (
+        <button
+          onClick={restart}
+          className="text-[11px] px-2 py-0.5 rounded border border-rose-500/40 text-rose-500 hover:bg-rose-500/10 transition-colors shrink-0"
+        >
+          Restart
+        </button>
+      )}
+    </li>
+  );
+}
+
+// ── Right pane: generated artifacts ────────────────────────────────────────
+
+const DB_FETCH_LIMIT = 15;  // top-N items rendered when a DB card expands
+
+async function fetchExpandedContent(key: string): Promise<ExpandedContent | null> {
+  try {
+    if (PROFILE_KEYS.has(key)) {
+      const r = await fetch('/api/profile', { credentials: 'include' });
+      if (!r.ok) return null;
+      const all = await r.json();
+      return { markdown: all[key] || '' };
+    }
+    if (key === 'crm') {
+      const r = await fetch('/api/crm', { credentials: 'include' });
+      if (!r.ok) return null;
+      const d = await r.json();
+      const contacts = (d.contacts || []).slice(0, DB_FETCH_LIMIT);
+      return {
+        total: d.total ?? contacts.length,
+        items: contacts.map((c: { name?: string; email?: string; role?: string; company?: string }) => ({
+          primary:   c.name || c.email || '(no name)',
+          secondary: [c.role, c.company].filter(Boolean).join(' · '),
+        })),
+      };
+    }
+    if (key === 'projects') {
+      const r = await fetch('/api/projects', { credentials: 'include' });
+      if (!r.ok) return null;
+      const d = await r.json();
+      const list = (d.projects || d.items || []).slice(0, DB_FETCH_LIMIT);
+      return {
+        total: d.total ?? list.length,
+        items: list.map((p: { name?: string; summary?: string; category?: string; status?: string }) => ({
+          primary:   p.name || '(unnamed)',
+          secondary: p.summary || [p.category, p.status].filter(Boolean).join(' · '),
+        })),
+      };
+    }
+    if (key === 'companies') {
+      const r = await fetch('/api/companies', { credentials: 'include' });
+      if (!r.ok) return null;
+      const d = await r.json();
+      const list = (d.companies || d.items || []).slice(0, DB_FETCH_LIMIT);
+      return {
+        total: d.total ?? list.length,
+        items: list.map((c: { name?: string; contact_count?: number; status?: string }) => ({
+          primary:   c.name || '(unknown)',
+          secondary: [c.contact_count ? `${c.contact_count} contacts` : '', c.status].filter(Boolean).join(' · '),
+        })),
+      };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function RightPanel({ doneSteps }: { doneSteps: InitStep[] }) {
+  // Per-key expand state + cached fetched content. Fetch is fired the first
+  // time a card is expanded; subsequent toggles just show/hide.
+  const [expandedKeys, setExpandedKeys] = useState<Set<string>>(new Set());
+  const [contentByKey, setContentByKey] = useState<Record<string, ExpandedContent | null>>({});
+  const [loadingKeys,  setLoadingKeys]  = useState<Set<string>>(new Set());
+
+  const toggleExpand = async (key: string) => {
+    setExpandedKeys(prev => {
+      const next = new Set(prev);
+      next.has(key) ? next.delete(key) : next.add(key);
+      return next;
+    });
+    if (!(key in contentByKey)) {
+      setLoadingKeys(prev => new Set(prev).add(key));
+      const result = await fetchExpandedContent(key);
+      setContentByKey(prev => ({ ...prev, [key]: result }));
+      setLoadingKeys(prev => {
+        const next = new Set(prev); next.delete(key); return next;
+      });
+    }
+  };
+
+  return (
+    <div className="bg-executive-card border border-executive-border rounded-2xl p-5 min-h-[400px]">
+      <p className="text-[10px] font-mono uppercase text-executive-muted tracking-widest mb-3">
+        Generated for you
+      </p>
+
+      {doneSteps.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-12 text-executive-muted text-xs">
+          <FileText size={28} className="opacity-30 mb-2" />
+          <p>Files will appear here as the AI finishes each one.</p>
+        </div>
+      ) : (
+        <ol className="flex flex-col gap-3">
+          <AnimatePresence initial={false}>
+            {doneSteps.map(step => (
+              <OutputCard
+                key={step.key}
+                step={step}
+                expanded={expandedKeys.has(step.key)}
+                loading={loadingKeys.has(step.key)}
+                content={contentByKey[step.key] ?? null}
+                onToggle={() => toggleExpand(step.key)}
+              />
+            ))}
+          </AnimatePresence>
+        </ol>
+      )}
+    </div>
+  );
+}
+
+function OutputCard({
+  step, expanded, loading, content, onToggle,
+}: {
+  step: InitStep;
+  expanded: boolean;
+  loading: boolean;
+  content: ExpandedContent | null;
+  onToggle: () => void;
+}) {
+  const meta = REVEAL_ICONS[step.key] || { Icon: FileText, color: 'text-executive-muted' };
+  const { Icon } = meta;
+  const title = REVEAL_TITLES[step.key] || step.label;
+  const data = step.reveal_data;
+  if (!data) return null;
+
+  return (
+    <motion.li
+      layout
+      initial={{ opacity: 0, scale: 0.96, y: 6 }}
+      animate={{ opacity: 1, scale: 1, y: 0 }}
+      exit={{ opacity: 0, scale: 0.96 }}
+      transition={{ duration: 0.3, ease: [0.32, 0.72, 0, 1] }}
+      className="rounded-xl border border-executive-border bg-executive-bg overflow-hidden hover:border-executive-accent/40 transition-colors"
+    >
+      <button
+        onClick={onToggle}
+        className="w-full flex items-start gap-3 p-4 text-left hover:bg-executive-border/20 transition-colors"
+      >
+        <div className="w-7 h-7 rounded-lg bg-executive-border/30 flex items-center justify-center shrink-0 mt-0.5">
+          <Icon size={14} className={meta.color} />
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-semibold text-executive-text">{title}</p>
+          <div className="mt-1.5">
+            <RevealDetail data={data} />
+          </div>
+        </div>
+        <motion.div
+          animate={{ rotate: expanded ? 180 : 0 }}
+          transition={{ duration: 0.2 }}
+          className="text-executive-muted mt-1"
+        >
+          <ChevronDown size={16} />
+        </motion.div>
+      </button>
+
+      <AnimatePresence initial={false}>
+        {expanded && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.25, ease: [0.32, 0.72, 0, 1] }}
+            className="overflow-hidden border-t border-executive-border"
+          >
+            <ExpandedView stepKey={step.key} loading={loading} content={content} />
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </motion.li>
+  );
+}
+
+function ExpandedView({
+  stepKey, loading, content,
+}: {
+  stepKey: string;
+  loading: boolean;
+  content: ExpandedContent | null;
+}) {
+  if (loading) {
+    return (
+      <div className="p-4 flex items-center gap-2 text-xs text-executive-muted">
+        <Loader2 size={12} className="animate-spin" /> Loading content…
+      </div>
+    );
+  }
+  if (!content) {
+    return (
+      <div className="p-4 text-xs text-executive-muted italic">
+        (Couldn't load — refresh to retry)
       </div>
     );
   }
 
-  // Draft ready — show editable form
-  return (
-    <div className="min-h-screen w-full bg-executive-bg executive-grid overflow-auto">
-      <div className="max-w-3xl mx-auto px-8 py-12">
-        <div className="mb-8">
-          <p className="text-xs font-mono uppercase text-executive-muted tracking-widest mb-2">Welcome — first-time setup</p>
-          <h1 className="text-3xl font-bold mb-3">Your profile draft is ready</h1>
-          <p className="text-executive-muted leading-relaxed">
-            We generated this from your recent emails, CRM contacts, and active projects.
-            This profile is the foundation every AI feature on the platform reads — searches, email triage, briefings.
-            Edit anything that's wrong, then confirm to continue.
-          </p>
-        </div>
-
-        {error && <ErrorBanner message={error} />}
-
-        <div className="flex flex-col gap-6">
-          <Section icon={<Building2 size={16} />} title="Business Profile" color="text-amber-500">
-            <p className="text-xs text-executive-muted -mt-1">What your company does, who you serve, and your strategic focus.</p>
-            <textarea
-              value={businessProfile}
-              onChange={e => setBusinessProfile(e.target.value)}
-              rows={18}
-              className="w-full p-3 rounded-lg border border-executive-border bg-executive-bg text-sm font-mono text-executive-text focus:border-executive-accent focus:outline-none resize-y"
-            />
-          </Section>
-
-          <Section icon={<BarChart3 size={16} />} title="Market Segments" color="text-sky-500">
-            <p className="text-xs text-executive-muted -mt-1">The markets you operate in. The AI uses this to filter which signals are relevant.</p>
-            <textarea
-              value={marketSegments}
-              onChange={e => setMarketSegments(e.target.value)}
-              rows={12}
-              className="w-full p-3 rounded-lg border border-executive-border bg-executive-bg text-sm font-mono text-executive-text focus:border-executive-accent focus:outline-none resize-y"
-            />
-          </Section>
-        </div>
-
-        <div className="flex items-center justify-between mt-8">
-          <button
-            onClick={regenerate}
-            disabled={saving}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg border border-executive-border text-sm text-executive-muted hover:text-executive-text transition-all"
-          >
-            <RefreshCw size={14} /> Regenerate with AI
-          </button>
-          <button
-            onClick={confirm}
-            disabled={saving}
-            className="flex items-center gap-2 px-6 py-3 rounded-xl bg-executive-accent text-white font-semibold hover:bg-emerald-400 disabled:opacity-50 transition-all shadow-sm"
-          >
-            {saving ? <Loader2 size={16} className="animate-spin" /> : <CheckCircle2 size={16} />}
-            {saving ? 'Saving...' : 'Confirm and continue'}
-          </button>
-        </div>
+  if (typeof content.markdown === 'string') {
+    return (
+      <div className="p-4 max-h-[400px] overflow-auto">
+        {content.markdown.trim() ? (
+          <pre className="text-xs text-executive-text leading-relaxed whitespace-pre-wrap font-mono">
+            {content.markdown}
+          </pre>
+        ) : (
+          <p className="text-xs text-executive-muted italic">(empty — AI didn't produce this yet)</p>
+        )}
       </div>
-    </div>
-  );
+    );
+  }
+
+  if (content.items) {
+    return (
+      <div className="p-4 max-h-[400px] overflow-auto">
+        {content.items.length === 0 ? (
+          <p className="text-xs text-executive-muted italic">(no records found)</p>
+        ) : (
+          <ol className="flex flex-col gap-2">
+            {content.items.map((it, i) => (
+              <li key={i} className="text-xs leading-tight">
+                <p className="text-executive-text font-medium">{it.primary}</p>
+                {it.secondary && (
+                  <p className="text-executive-muted">{it.secondary}</p>
+                )}
+              </li>
+            ))}
+            {content.total && content.total > content.items.length && (
+              <li className="pt-1 text-[10px] text-executive-muted italic">
+                + {(content.total - content.items.length).toLocaleString()} more — view all in Records
+              </li>
+            )}
+          </ol>
+        )}
+      </div>
+    );
+  }
+
+  return null;
+}
+
+function RevealDetail({ data }: { data: NonNullable<InitStep['reveal_data']> }) {
+  if (typeof data.count === 'number') {
+    return (
+      <div>
+        <p className="text-2xl font-bold text-executive-text leading-tight">
+          {data.count.toLocaleString()}
+        </p>
+        {data.samples && data.samples.length > 0 && (
+          <div className="mt-1.5 flex flex-wrap gap-1">
+            {data.samples.slice(0, 3).map(s => (
+              <span key={s} className="text-[10px] px-2 py-0.5 rounded-full bg-executive-border/40 text-executive-muted">
+                {s}
+              </span>
+            ))}
+            {data.count > (data.samples?.length || 0) && (
+              <span className="text-[10px] px-2 py-0.5 text-executive-muted italic">
+                + {(data.count - (data.samples?.length || 0)).toLocaleString()} more
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+  if (data.preview) {
+    return (
+      <p className="text-xs text-executive-muted leading-relaxed italic line-clamp-4">
+        {data.preview}
+      </p>
+    );
+  }
+  return null;
 }

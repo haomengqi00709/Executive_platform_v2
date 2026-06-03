@@ -6,6 +6,7 @@ import json
 import re
 import secrets
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -731,15 +732,27 @@ def get_bot_status(session: dict = Depends(require_session)):
 
 @app.post("/api/teams/bot/auth-start")
 def bot_auth_start(session: dict = Depends(require_session)):
-    import concurrent.futures
+    # See src/ai.py::_call_with_timeout for why the
+    # `with ThreadPoolExecutor` + future.result(timeout=...) pattern is broken:
+    # the with-block calls shutdown(wait=True) on exit, which blocks on the
+    # hung worker even after the future times out — so the timeout is fake.
+    # Use the same daemon-thread fix as ai.py.
     global _bot_device_flow
     with _bot_device_flow_lock:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(auth.start_device_flow)
+        result: dict = {}
+        def runner():
             try:
-                flow = future.result(timeout=20)
-            except concurrent.futures.TimeoutError:
-                raise HTTPException(504, "Timeout connecting to Microsoft — please retry")
+                result["value"] = auth.start_device_flow()
+            except BaseException as e:
+                result["error"] = e
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+        t.join(timeout=20)
+        if t.is_alive():
+            raise HTTPException(504, "Timeout connecting to Microsoft — please retry")
+        if "error" in result:
+            raise result["error"]
+        flow = result["value"]
         _bot_device_flow = flow
         return {
             "user_code":        flow["user_code"],
@@ -1108,14 +1121,20 @@ def _make_progress_cb(uid: str):
     return cb
 
 
-def _generate_profile(uid: str, progress_cb=None) -> None:
-    """Call run_profile_init for a user — no status side-effects."""
+def _generate_profile(uid: str, progress_cb=None, on_doc_ready=None) -> None:
+    """Call run_profile_init for a user — no status side-effects.
+
+    on_doc_ready: optional callback (doc_key, content) — onboarding uses this
+        to reveal each of the 3 profile docs to the user one at a time as
+        they're written.
+    """
     from src.modules.profile_init import run_profile_init
     token    = auth.get_valid_access_token(uid)
     graph    = GraphClient(token)
     ai       = AIClient()
     settings = _read_json(_user_settings(uid))
-    run_profile_init(_udir(uid), graph, ai, settings, progress=progress_cb)
+    run_profile_init(_udir(uid), graph, ai, settings,
+                     progress=progress_cb, on_doc_ready=on_doc_ready)
 
 
 def _regenerate_profile_for_user(uid: str) -> None:
@@ -1179,20 +1198,83 @@ def _build_projects_with_progress(uid: str, progress_cb, months: int = 6) -> Non
         raise
 
 
+def _sample_contact_names(uid: str, n: int = 3) -> tuple[int, list[str]]:
+    """Return (total_count, [n sample display names]) from crm.json."""
+    crm_path = _udir(uid) / "crm.json"
+    if not crm_path.exists():
+        return 0, []
+    try:
+        crm = json.loads(crm_path.read_text())
+        contacts = list(crm.get("contacts", {}).values())
+        contacts = [c for c in contacts if not (c.get("ignore") or c.get("archived"))]
+        contacts.sort(key=lambda c: c.get("thread_count", 0), reverse=True)
+        samples = [(c.get("name") or c.get("email") or "").strip() for c in contacts[:n]]
+        samples = [s for s in samples if s]
+        return len(contacts), samples
+    except Exception:
+        return 0, []
+
+
+def _sample_project_names(uid: str, n: int = 3) -> tuple[int, list[str]]:
+    proj_path = _udir(uid) / "projects.json"
+    if not proj_path.exists():
+        return 0, []
+    try:
+        data = json.loads(proj_path.read_text())
+        projs = [p for p in data.get("projects", {}).values() if not (p.get("ignore") or p.get("archived"))]
+        projs.sort(key=lambda p: p.get("thread_count", 0), reverse=True)
+        samples = [(p.get("name") or "").strip() for p in projs[:n]]
+        samples = [s for s in samples if s]
+        return len(projs), samples
+    except Exception:
+        return 0, []
+
+
+def _sample_company_names(uid: str, n: int = 3) -> tuple[int, list[str]]:
+    comp_path = _udir(uid) / "companies.json"
+    if not comp_path.exists():
+        return 0, []
+    try:
+        data = json.loads(comp_path.read_text())
+        comps = [c for c in data.get("companies", {}).values() if not c.get("ignore")]
+        comps.sort(key=lambda c: c.get("thread_count_total", 0), reverse=True)
+        samples = [(c.get("name") or (c.get("identity") or {}).get("original_name") or "").strip() for c in comps[:n]]
+        samples = [s for s in samples if s]
+        return len(comps), samples
+    except Exception:
+        return 0, []
+
+
+def _preview_doc(text: str, limit: int = 240) -> str:
+    """Trim to ~limit chars on a clean boundary for the reveal card."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0]
+    return cut.rstrip(".,;:—-") + "…"
+
+
 def _run_first_login_init(uid: str, history_months: int | None = None) -> None:
     """
-    Serial init chain on first OAuth login.
-      1. CRM build (scans `history_months` of inbox; default reads settings)
-      2. Projects build (same window)
-      3. Profile init (drafts business_profile + market_segments)
+    Serial init chain on first OAuth login. Drives the 6 reveal phases
+    shown in onboarding Step 5:
 
-    Each stage updates init_status.json so the OnboardingPage can show
-    a live checklist. Failures don't block the chain — the user still
-    gets to the Onboarding page with whatever was generated.
+      1. crm                — Reading your inbox
+      2. projects           — Detecting active projects
+      3. companies          — Mapping companies
+      4. personal_profile   — Drafting personal profile  ┐
+      5. business_profile   — Drafting business profile  │  All from
+      6. market_segments    — Identifying market segments┘  ONE AI call,
+                                                            staggered for
+                                                            sequential reveal.
+
+    Each step writes a `reveal_data` payload (counts + samples for the 3 DBs,
+    text preview for the 3 docs) that the frontend uses to animate the card.
     """
     from src.modules.profile import (
         save_init_status, reset_init_steps, update_init_step,
     )
+    udir = _udir(uid)
     if history_months is None:
         settings = _read_json(_user_settings(uid))
         history_months = int(settings.get("onboarding_history_months") or 12)
@@ -1200,51 +1282,86 @@ def _run_first_login_init(uid: str, history_months: int | None = None) -> None:
 
     progress_cb = _make_progress_cb(uid)
     try:
-        save_init_status(_udir(uid), "generating")
-        reset_init_steps(_udir(uid))
+        save_init_status(udir, "generating")
+        reset_init_steps(udir)
 
-        # Step 1 — CRM
-        if (_udir(uid) / "crm.json").exists():
-            update_init_step(_udir(uid), "crm", "done", "CRM already built")
+        # ── Phase 1: CRM ──────────────────────────────────
+        if (udir / "crm.json").exists():
+            n, samples = _sample_contact_names(uid)
+            update_init_step(udir, "crm", "done", "CRM already built",
+                             reveal_data={"count": n, "samples": samples})
         else:
-            update_init_step(_udir(uid), "crm", "in_progress", f"Scanning inbox ({history_months}mo)...")
+            update_init_step(udir, "crm", "in_progress", f"Scanning inbox ({history_months}mo)...")
             try:
                 _build_crm_with_progress(uid, progress_cb, months=history_months)
-                update_init_step(_udir(uid), "crm", "done", f"Contacts captured")
+                n, samples = _sample_contact_names(uid)
+                update_init_step(udir, "crm", "done", f"{n} contacts indexed",
+                                 reveal_data={"count": n, "samples": samples})
             except Exception as e:
-                update_init_step(_udir(uid), "crm", "failed", f"CRM scan failed: {e}")
+                update_init_step(udir, "crm", "failed", f"CRM scan failed: {e}")
 
-        # Step 2 — Projects
-        if (_udir(uid) / "projects.json").exists():
-            update_init_step(_udir(uid), "projects", "done", "Projects already built")
+        # ── Phase 2: Projects ─────────────────────────────
+        if (udir / "projects.json").exists():
+            n, samples = _sample_project_names(uid)
+            update_init_step(udir, "projects", "done", "Projects already built",
+                             reveal_data={"count": n, "samples": samples})
         else:
-            update_init_step(_udir(uid), "projects", "in_progress", f"Identifying active projects ({history_months}mo)...")
+            update_init_step(udir, "projects", "in_progress",
+                             f"Identifying active projects ({history_months}mo)...")
             try:
                 _build_projects_with_progress(uid, progress_cb, months=history_months)
-                update_init_step(_udir(uid), "projects", "done", "Projects identified")
+                n, samples = _sample_project_names(uid)
+                update_init_step(udir, "projects", "done", f"{n} active projects detected",
+                                 reveal_data={"count": n, "samples": samples})
             except Exception as e:
-                update_init_step(_udir(uid), "projects", "failed", f"Project scan failed: {e}")
+                update_init_step(udir, "projects", "failed", f"Project scan failed: {e}")
 
-        # Step 2b — Companies (derived from CRM + Projects, no AI cost).
-        # Runs every time, not just on first build — picks up any new
-        # company names that landed in CRM/Projects during this init.
+        # ── Phase 3: Companies (no AI, derived from CRM + Projects) ──
+        update_init_step(udir, "companies", "in_progress", "Aggregating company list...")
         try:
             _build_companies_for_user(uid)
+            n, samples = _sample_company_names(uid)
+            update_init_step(udir, "companies", "done", f"{n} companies mapped",
+                             reveal_data={"count": n, "samples": samples})
         except Exception as e:
             print(f"[Companies] Init build failed for {uid}: {e}")
+            update_init_step(udir, "companies", "failed", f"Company build failed: {e}")
 
-        # Step 3 — Profile draft
-        update_init_step(_udir(uid), "profile", "in_progress", "Reading email signatures and drafting profile...")
+        # ── Phases 4-6: Profile docs (run_profile_init internal phases) ──
+        # business_profile uses a two-pass generation (website-only v1 then
+        # CRM-enriched v2) — only the v2 fires on_doc_ready('business'), so
+        # the user sees a single ✓ after the final pass. personal + segments
+        # come from one combined AI call between v1 and v2.
+        update_init_step(udir, "personal_profile", "in_progress", "Drafting your personal profile...")
+        update_init_step(udir, "business_profile", "in_progress", "")
+        update_init_step(udir, "market_segments",  "in_progress", "")
+
+        def _on_doc_ready(doc_key: str, content: str):
+            mapping = {
+                "personal": ("personal_profile", "Personal profile drafted"),
+                "business": ("business_profile", "Business profile drafted"),
+                "segments": ("market_segments",  "Market segments mapped"),
+            }
+            step_key, msg = mapping.get(doc_key, (doc_key, "Done"))
+            update_init_step(udir, step_key, "done", msg,
+                             reveal_data={"preview": _preview_doc(content)})
+            time.sleep(0.6)  # stagger so cards animate one at a time
+
         try:
-            _generate_profile(uid, progress_cb=progress_cb)
-            update_init_step(_udir(uid), "profile", "done", "Profile draft ready")
+            _generate_profile(uid, progress_cb=progress_cb, on_doc_ready=_on_doc_ready)
+            # Any docs the AI failed to produce are still in_progress — mark failed.
+            from src.modules.profile import load_init_status as _load
+            for s in _load(udir).get("steps", []):
+                if s["key"] in ("personal_profile", "business_profile", "market_segments") \
+                   and s.get("status") == "in_progress":
+                    update_init_step(udir, s["key"], "failed",
+                                     "AI didn't return this section")
         except Exception as e:
             print(f"[profile_init] Generate failed for {uid}: {e}")
-            update_init_step(_udir(uid), "profile", "failed", f"Draft generation failed: {e}")
+            for key in ("personal_profile", "business_profile", "market_segments"):
+                update_init_step(udir, key, "failed", f"Draft generation failed: {e}")
 
-        # Step 4 (background) — Meeting recordings backfill
-        # Runs in a separate thread so onboarding draft_ready isn't blocked
-        # by potentially-long Gemini transcriptions.
+        # Background: meeting recordings backfill — doesn't block onboarding
         threading.Thread(
             target=_run_meeting_backfill_for_user,
             args=(uid,),
@@ -1252,7 +1369,7 @@ def _run_first_login_init(uid: str, history_months: int | None = None) -> None:
         ).start()
         print(f"[init] Meeting backfill thread started for {uid} (runs in parallel; not in onboarding gate)")
     finally:
-        save_init_status(_udir(uid), "draft_ready")
+        save_init_status(udir, "draft_ready")
 
 
 def _run_meeting_backfill_for_user(uid: str) -> None:
@@ -3546,16 +3663,75 @@ def start_init(session: dict = Depends(require_session)):
     return {"ok": True, "stage": "generating"}
 
 
+@app.post("/api/onboarding/enrich-website")
+async def enrich_company_website(request: Request, session: dict = Depends(require_session)):
+    """Onboarding Step 1 helper. User pastes their company URL; we call
+    Gemini's Google Search grounding to infer company_name + description +
+    market segments. Frontend uses the result to pre-fill Step 3's editable
+    company name field and bundles the rest into the final preferences POST.
+
+    Always returns 200 with whatever we managed to extract. On AI failure,
+    falls back to a URL-based heuristic for company_name and empty values
+    for the rest.
+
+    Body: {url: str}
+    Returns: {company_name: str, description: str, segments: list[str], source: 'ai'|'fallback'}
+    """
+    from src.modules.website_intel import (
+        extract_company_info, extract_company_name_fallback,
+    )
+    body = await request.json()
+    url = str(body.get("url") or "").strip()
+    if not url:
+        raise HTTPException(400, "url is required")
+
+    try:
+        info = extract_company_info(url, AIClient())
+        # AI sometimes returns empty company_name even on a 200 response.
+        if not info.get("company_name"):
+            info["company_name"] = extract_company_name_fallback(url)
+            info["source"] = "ai_partial"
+        else:
+            info["source"] = "ai"
+        return info
+    except Exception as e:
+        print(f"[Onboarding/enrich] AI extraction failed for {url}: {e}")
+        return {
+            "company_name":   extract_company_name_fallback(url),
+            "headquarters":   "",
+            "what_they_do":   "",
+            "business_lines": [],
+            "products":       [],
+            "segments":       [],
+            "role_emails":    [],
+            "description":    "",
+            "source":         "fallback",
+            "error":          str(e)[:120],
+        }
+
+
 @app.post("/api/onboarding/preferences")
 async def submit_onboarding_preferences(request: Request, session: dict = Depends(require_session)):
-    """Wizard-driven init: writes user-chosen history depth, briefing/monitor
-    presets, and personal profile draft, then kicks off the init chain.
-    Body: {
-      history_months:   int (3-24, default 12),
-      briefings_preset: 'recommended'|'minimal'|'none'|'custom' (custom = leave existing),
-      monitor_preset:   'recommended'|'quiet'|'off'|'custom',
-      personal_profile: str (optional)
-    }"""
+    """Wizard-driven init: persists company + bio context provided by the new
+    5-step wizard, applies default briefing/monitor presets, then kicks off
+    the init chain in the background.
+
+    Body fields (all optional except where noted):
+      company_website_url:     str — user's pasted URL (Step 1)
+      company_name:            str — AI-extracted or user-edited (Step 3)
+      company_description:     str — legacy alias for company_what_they_do
+      company_what_they_do:    str — AI-extracted, 2-3 sentence company self-description
+      company_headquarters:    str — "City, Region, Country"
+      company_business_lines:  list[str] — distinct service areas
+      company_products:        list[str] — named products/services
+      company_market_segments: list[str] — industries
+      company_role_emails:     list[str] — functional emails (info@, sales@, etc.)
+      linkedin_bio:            str — user pasted (Step 2, optional)
+      history_months:          int — defaults to 12 (UI no longer exposes this)
+      briefings_preset:        str — defaults to 'recommended'
+      monitor_preset:          str — defaults to 'recommended'
+      personal_profile:        str — legacy field, kept for backwards compat
+    """
     from src.modules.profile import (
         load_init_status, save_init_status, save_personal_profile,
     )
@@ -3571,13 +3747,49 @@ async def submit_onboarding_preferences(request: Request, session: dict = Depend
     monitor_preset   = (body.get("monitor_preset")   or "recommended").lower()
     personal_text    = body.get("personal_profile")
 
-    # 1. Persist history depth so _run_first_login_init picks it up
+    # New: company + user context from the 5-step wizard
+    company_website_url     = str(body.get("company_website_url") or "").strip()
+    company_name            = str(body.get("company_name") or "").strip()
+    company_description     = str(body.get("company_description") or "").strip()
+    company_market_segments = body.get("company_market_segments") or []
+    if not isinstance(company_market_segments, list):
+        company_market_segments = []
+    company_market_segments = [str(s).strip() for s in company_market_segments if str(s).strip()][:10]
+    linkedin_bio            = str(body.get("linkedin_bio") or "").strip()
+
+    # Step 1 (website_intel) richer fields — fed into business_profile v1.
+    company_headquarters    = str(body.get("company_headquarters") or "").strip()
+    company_what_they_do    = str(body.get("company_what_they_do") or "").strip()
+    def _list_field(key: str, cap: int) -> list[str]:
+        raw_list = body.get(key) or []
+        if not isinstance(raw_list, list):
+            return []
+        return [str(s).strip() for s in raw_list if str(s).strip()][:cap]
+    company_business_lines  = _list_field("company_business_lines", 8)
+    company_products        = _list_field("company_products",       8)
+    company_role_emails     = _list_field("company_role_emails",    8)
+
+    # 1. Persist everything to settings so _run_first_login_init / profile_init
+    #    pick it up. Branding (company_name) is also read by the frontend
+    #    sidebar to rebrand the dashboard after onboarding.
     settings = _read_json(_user_settings(uid))
     settings["onboarding_history_months"] = history_months
+    if company_website_url:     settings["company_website_url"]     = company_website_url
+    if company_name:            settings["company_name"]            = company_name
+    if company_description:     settings["company_description"]     = company_description
+    if company_market_segments: settings["company_market_segments"] = company_market_segments
+    if linkedin_bio:            settings["linkedin_bio"]            = linkedin_bio
+    if company_headquarters:    settings["company_headquarters"]    = company_headquarters
+    if company_what_they_do:    settings["company_what_they_do"]    = company_what_they_do
+    if company_business_lines:  settings["company_business_lines"]  = company_business_lines
+    if company_products:        settings["company_products"]        = company_products
+    if company_role_emails:     settings["company_role_emails"]     = company_role_emails
     _write_json(_user_settings(uid), settings)
     tz = settings.get("timezone") or "UTC"
 
-    # 2. Personal profile draft (optional — wizard skips it if blank)
+    # 2. Legacy personal_profile field (the old 4-step wizard's Step 4 textarea).
+    #    New wizard doesn't send this — profile_init will draft it from linkedin_bio
+    #    + signatures during the init chain.
     if personal_text:
         save_personal_profile(_udir(uid), str(personal_text))
 
@@ -3606,7 +3818,8 @@ async def submit_onboarding_preferences(request: Request, session: dict = Depend
         daemon=True,
     ).start()
     print(f"[Onboarding] wizard submitted for {uid} — history={history_months}mo, "
-          f"briefings={briefings_preset}, monitor={monitor_preset}")
+          f"briefings={briefings_preset}, monitor={monitor_preset}, "
+          f"company={company_name or '(none)'}, has_bio={bool(linkedin_bio)}")
     return {"ok": True, "stage": "generating", "history_months": history_months}
 
 
@@ -4347,6 +4560,62 @@ if _frontend_dist.exists():
     app.mount("/", StaticFiles(directory=str(_frontend_dist), html=True), name="static")
 
 
+def _detect_stuck_init_chains():
+    """Watchdog: if any user's init chain stops emitting progress for too long,
+    mark the in_progress step as failed so the UI can move on. Defense in depth
+    against any Gemini call or other operation that escapes our timeout coverage.
+
+    Triggers every 60 seconds. Considers an init chain stuck when:
+      - stage == 'generating'
+      - last_update on init_status.json is older than 5 minutes
+      - at least one step is still in_progress
+
+    On detection: marks each in_progress step as failed (with a diagnostic
+    message), bumps stage to 'draft_ready' so the frontend's Enter button
+    enables, and lets the user choose to confirm or restart. Does NOT touch
+    any other state — partial CRM data / signatures / etc. stay intact for
+    a subsequent restart to use.
+    """
+    from datetime import datetime, timezone
+    from src.modules.profile import load_init_status, update_init_step, save_init_status
+
+    if not auth.DATA_DIR.exists():
+        return
+    cutoff_ts = datetime.now(timezone.utc).timestamp() - 300  # 5 minutes
+
+    for udir in auth.DATA_DIR.iterdir():
+        if not udir.is_dir() or udir.name.startswith("_") or udir.name.startswith("."):
+            continue
+        try:
+            status = load_init_status(udir)
+            if status.get("stage") != "generating":
+                continue
+            last_update_str = status.get("last_update") or ""
+            try:
+                last_ts = datetime.fromisoformat(last_update_str.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                continue
+            if last_ts >= cutoff_ts:
+                continue  # recent enough — actively progressing
+
+            in_progress = [s for s in status.get("steps", []) if s.get("status") == "in_progress"]
+            if not in_progress:
+                continue  # already past whatever was running
+
+            print(f"[StuckDetector] {udir.name}: init chain silent for "
+                  f"{int((datetime.now(timezone.utc).timestamp() - last_ts) // 60)}min — "
+                  f"failing {len(in_progress)} step(s): "
+                  f"{[s['key'] for s in in_progress]}")
+            msg = ("No progress in 5+ minutes — likely a Gemini hang or "
+                   "network issue. Restart onboarding to retry.")
+            for step in in_progress:
+                update_init_step(udir, step["key"], "failed", msg)
+            save_init_status(udir, "draft_ready",
+                             current_message="Watchdog: init aborted after silent timeout")
+        except Exception as e:
+            print(f"[StuckDetector] error checking {udir.name}: {e}")
+
+
 @app.on_event("startup")
 def startup_event():
     # Clean up any sections left "running" by the previous (killed) process
@@ -4354,6 +4623,15 @@ def startup_event():
     # clean state.
     _reset_stuck_running_results()
     _scheduler.start()
+    _scheduler.add_job(
+        _detect_stuck_init_chains,
+        trigger="interval",
+        seconds=60,
+        id="init_stuck_detector",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
     _scheduler.add_job(
         _poll_teams_bot_all_users,
         trigger="interval",
