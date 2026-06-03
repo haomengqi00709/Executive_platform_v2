@@ -102,6 +102,38 @@ def _user_bot_link_path(user_id: str) -> Path:
     return _udir(user_id) / "bot_link.json"
 
 
+def _get_bot_display_name(user_id: str) -> str:
+    """Per-user AI assistant display name. Resolved in priority order:
+      1. settings.bot_display_name — explicit override (rarely set)
+      2. Bot's OAuth email local-part — auto-derived from Step 3 setup
+         (e.g. "Audrey@imodel3d.com" → "Audrey", "Edileen@x.com" → "Edileen")
+      3. Fallback to "Audrey"
+    The auto path means the user never has to configure this — the name is
+    whatever they (or their IT) called the assistant's M365 account."""
+    try:
+        s = _read_json(_user_settings(user_id))
+        explicit = (s.get("bot_display_name") or "").strip()
+        if explicit:
+            return explicit
+    except Exception:
+        pass
+    # Auto from bot account email
+    try:
+        link    = _read_json(_user_bot_link_path(user_id))
+        bot_uid = link.get("bot_uid")
+        if bot_uid:
+            bot_email = (auth.load_user_tokens(bot_uid) or {}).get("username") or ""
+            if "@" in bot_email:
+                local = bot_email.split("@")[0]
+                if local:
+                    # Capitalize first char if all lower ("audrey" → "Audrey")
+                    # but leave names already cased ("iModelBot") alone.
+                    return local[0].upper() + local[1:] if local[0].islower() else local
+    except Exception:
+        pass
+    return "Audrey"
+
+
 # ── Session helpers ───────────────────────────────────────
 
 def get_current_session(session_token: str = Cookie(None)) -> dict | None:
@@ -284,6 +316,12 @@ def get_settings(request: Request, session: dict = Depends(require_session)):
     if tz and settings.get("timezone") != tz:
         settings["timezone"] = tz
     _write_json(path, settings)
+    # bot_display_name is computed (not stored) — derived from the bot's M365
+    # account email so the UI can render it without the user configuring
+    # anything. Computed AFTER the disk write so it doesn't leak into the
+    # persisted settings file (avoids stale data if user reassigns the bot).
+    if not settings.get("bot_display_name"):
+        settings["bot_display_name"] = _get_bot_display_name(uid)
     return settings
 
 
@@ -822,9 +860,10 @@ def bot_auth_poll(session: dict = Depends(require_session)):
             # user's OWN account. activate_bot rejects a self-bind too, but only
             # AFTER the flag below is written — leaving a permanent zombie that
             # every per-user event poll then skips. Reject here, before any write.
+            _bot = _get_bot_display_name(session["user_id"])
             return {"status": "error", "message":
                     "You signed in as your own account. The AI assistant must be "
-                    "a separate Microsoft account (e.g. Audrey@yourcompany.com). "
+                    f"a separate Microsoft account (e.g. {_bot.lower()}@yourcompany.com). "
                     "Restart setup and sign in as the assistant account."}
         if bot_uid:
             expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
@@ -887,11 +926,12 @@ def activate_bot(background_tasks: BackgroundTasks, session: dict = Depends(requ
         # The AI assistant must be a separate Microsoft account. Self-binding
         # creates a confusing "you chatting with yourself" state and loses the
         # two-account failure isolation the architecture relies on.
+        _bot = _get_bot_display_name(user_id)
         raise HTTPException(
             400,
             "The AI assistant must be a different Microsoft account than your "
             "own. When prompted at microsoft.com/devicelogin, sign in as your "
-            "AI assistant account (e.g. Audrey@yourcompany.com), not your "
+            f"AI assistant account (e.g. {_bot.lower()}@yourcompany.com), not your "
             "personal account.",
         )
     bp = _bot_state_path(bot_uid)

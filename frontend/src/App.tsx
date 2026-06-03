@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, createContext, useContext } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   Settings, Save, CheckCircle2, AlertCircle, LogIn, LogOut,
@@ -74,6 +74,13 @@ const NAV: { id: Page; label: string; icon: React.ReactNode; color: string }[] =
   { id: 'profile',   label: 'Profile',   icon: <UserCircle2 size={16} />,     color: 'text-rose-400' },
 ];
 
+// Per-user bot display name (e.g. "Audrey", "Edileen"). Read from
+// settings.bot_display_name; defaults to "Audrey" for backwards compat with
+// the original Daniel/Jason setups. Any component that mentions the assistant
+// by name in user-facing text should pull it from here rather than hardcoding.
+export const BrandingContext = createContext<{ bot: string }>({ bot: 'Audrey' });
+export const useBotName = (): string => useContext(BrandingContext).bot;
+
 function brandInitials(name: string): string {
   const cleaned = (name || '').trim();
   if (!cleaned) return '';
@@ -95,6 +102,7 @@ export default function App() {
   const [authHealth, setAuthHealth] = useState<AuthHealth | null>(null);
   const [brandCompany, setBrandCompany] = useState<string>('');
   const [brandDisplay, setBrandDisplay] = useState<string>('');
+  const [brandBot,     setBrandBot]     = useState<string>('Audrey');
 
   const loadBranding = useCallback(async () => {
     try {
@@ -102,6 +110,7 @@ export default function App() {
         .then(r => r.ok ? r.json() : {});
       setBrandCompany((s?.company_name || '').toString().trim());
       setBrandDisplay((s?.display_name || '').toString().trim());
+      setBrandBot((s?.bot_display_name || '').toString().trim() || 'Audrey');
     } catch {}
   }, []);
 
@@ -147,10 +156,15 @@ export default function App() {
   if (!user) return <LoginScreen />;
 
   if (profileConfirmed === false) {
-    return <OnboardingPage
-      displayName={brandDisplay}
-      onComplete={() => { setProfileConfirmed(true); loadBranding(); }}
-    />;
+    return (
+      <BrandingContext.Provider value={{ bot: brandBot }}>
+        <OnboardingPage
+          displayName={brandDisplay}
+          botName={brandBot}
+          onComplete={() => { setProfileConfirmed(true); loadBranding(); }}
+        />
+      </BrandingContext.Provider>
+    );
   }
   if (profileConfirmed === null) return <Spinner />;
 
@@ -164,6 +178,7 @@ export default function App() {
   };
 
   return (
+    <BrandingContext.Provider value={{ bot: brandBot }}>
     <ActivityProvider>
     <div className="flex h-screen w-full bg-executive-bg text-executive-text overflow-hidden executive-grid">
       {/* Sidebar */}
@@ -265,6 +280,7 @@ export default function App() {
       </main>
     </div>
     </ActivityProvider>
+    </BrandingContext.Provider>
   );
 }
 
@@ -802,7 +818,9 @@ function LoginScreen() {
   );
 }
 
-function OnboardingPage({ onComplete, displayName }: { onComplete: () => void; displayName: string }) {
+function OnboardingPage({
+  onComplete, displayName, botName,
+}: { onComplete: () => void; displayName: string; botName: string }) {
   const [status, setStatus]       = useState<InitStatus | null>(null);
   const [thinkingLog, setThinkingLog] = useState<string[]>([]);
   const [confirming, setConfirming] = useState(false);
@@ -866,6 +884,7 @@ function OnboardingPage({ onComplete, displayName }: { onComplete: () => void; d
     return (
       <OnboardingWizard
         displayName={displayName}
+        botName={botName}
         onSubmitted={() => setWizardDone(true)}
       />
     );

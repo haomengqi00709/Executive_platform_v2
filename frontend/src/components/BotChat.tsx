@@ -2,12 +2,13 @@ import { useEffect, useRef, useState } from 'react';
 import { Send, Loader2, MessageCircle } from 'lucide-react';
 import { botChat, getBotHistory } from '../lib/api';
 import type { BotTurn } from '../lib/api';
+import { useBotName } from '../App';
 
 interface BotChatProps {
   /** Optional preamble inserted as the first message into the AI conversation
    * when the user sends their first message in this session. Hidden from UI. */
   contextPreamble?: string;
-  /** Optional placeholder shown in the empty input. */
+  /** Optional placeholder shown in the empty input. Defaults to "Ask <bot>…". */
   placeholder?: string;
   /** Optional starter suggestions shown when there's no history. */
   suggestions?: string[];
@@ -17,10 +18,12 @@ interface BotChatProps {
 
 export default function BotChat({
   contextPreamble,
-  placeholder = 'Ask Audrey…',
+  placeholder,
   suggestions = [],
   historyLimit = 10,
 }: BotChatProps) {
+  const botName = useBotName();
+  const effectivePlaceholder = placeholder ?? `Ask ${botName}…`;
   const [turns, setTurns] = useState<BotTurn[]>([]);
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
@@ -103,7 +106,7 @@ export default function BotChat({
     <div className="flex flex-col bg-executive-bg border border-executive-border rounded-lg overflow-hidden">
       <div className="px-3 py-2 border-b border-executive-border flex items-center gap-2">
         <MessageCircle size={12} className="text-executive-accent" />
-        <span className="text-xs font-semibold text-executive-text">Chat with Audrey</span>
+        <span className="text-xs font-semibold text-executive-text">Chat with {botName}</span>
         <span className="text-[10px] text-executive-muted ml-auto">Shared with Teams</span>
       </div>
 
@@ -117,7 +120,7 @@ export default function BotChat({
         )}
         {!loadingHistory && turns.length === 0 && !showSuggestions && (
           <p className="text-xs text-executive-muted italic">
-            No conversation yet. Ask Audrey to refine this briefing — e.g. "Add yesterday recap to this".
+            No conversation yet. Ask {botName} to refine this briefing — e.g. "Add yesterday recap to this".
           </p>
         )}
         {turns.map((t, i) => (
@@ -126,7 +129,7 @@ export default function BotChat({
         {sending && (
           <div className="flex items-center gap-2 text-xs text-executive-muted">
             <Loader2 size={12} className="animate-spin" />
-            Audrey is thinking…
+            {botName} is thinking…
           </div>
         )}
         {error && (
@@ -160,7 +163,7 @@ export default function BotChat({
           type="text"
           value={draft}
           onChange={e => setDraft(e.target.value)}
-          placeholder={placeholder}
+          placeholder={effectivePlaceholder}
           disabled={sending}
           className="flex-1 px-2 py-1.5 text-sm bg-executive-bg border border-executive-border rounded-md focus:outline-none focus:border-executive-accent/60 disabled:opacity-50"
         />

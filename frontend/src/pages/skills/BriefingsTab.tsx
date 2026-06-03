@@ -11,6 +11,7 @@ import { SECTION_BY_ID, CATEGORY_ORDER, CATEGORY_LABEL, sectionsByCategory } fro
 import { parseCron, buildCron, describeSchedule, DAY_OPTIONS } from '../../lib/schedule';
 import type { Preset } from '../../lib/schedule';
 import BotChat from '../../components/BotChat';
+import { useBotName } from '../../App';
 
 const NON_SCHEDULABLE = new Set([
   'recent_meetings', 'meeting_action_items', 'expenses', 'meeting_prep',
@@ -126,6 +127,7 @@ function BriefingCard({
 }) {
   const sched = describeSchedule({ enabled: briefing.enabled, cron: briefing.cron });
   const tz = briefing.tz || 'UTC';
+  const botName = useBotName();
 
   return (
     <div className={`bg-executive-card border rounded-xl p-4 transition-colors ${
@@ -198,7 +200,7 @@ function BriefingCard({
       >
         {chatOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
         <MessageCircle size={11} />
-        {chatOpen ? 'Hide chat' : 'Chat with Audrey about this briefing'}
+        {chatOpen ? 'Hide chat' : `Chat with ${botName} about this briefing`}
       </button>
 
       {chatOpen && (

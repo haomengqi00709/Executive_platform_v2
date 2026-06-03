@@ -5,6 +5,7 @@ import {
 } from 'lucide-react';
 import { getOutreachLast, relativeTime } from '../lib/api';
 import type { OutreachLastRun } from '../lib/types';
+import { useBotName } from '../App';
 
 /** Body content for the Outreach tool — rendered inside the Tools page
  *  ToolPanel. Display-only: the table lists the most recent run's drafts.
@@ -184,6 +185,7 @@ function SkippedSection({
 // ── Empty state ─────────────────────────────────────────────────────
 
 function EmptyState() {
+  const botName = useBotName();
   return (
     <section className="bg-executive-bg/40 border border-executive-border rounded-lg p-8 text-center">
       <div className="w-12 h-12 mx-auto mb-3 rounded-full bg-executive-border/30 flex items-center justify-center">
@@ -191,7 +193,7 @@ function EmptyState() {
       </div>
       <h3 className="text-base font-medium text-executive-text mb-2">No outreach drafts yet</h3>
       <p className="text-sm text-executive-muted mb-5 max-w-md mx-auto">
-        Ask Audrey in Teams to draft outreach emails. Each contact becomes one Outlook Draft
+        Ask {botName} in Teams to draft outreach emails. Each contact becomes one Outlook Draft
         you can review and send.
       </p>
       <div className="inline-block text-left bg-executive-bg/60 border border-executive-border rounded-lg px-4 py-3 space-y-1.5 text-sm">

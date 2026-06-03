@@ -6,8 +6,10 @@ import type { LucideIcon } from 'lucide-react';
 // as a template.
 import ExpensesTab from './records/ExpensesTab';
 import OutreachCard from '../components/OutreachCard';
+import { useBotName } from '../App';
 
 export default function ToolsPage() {
+  const botName = useBotName();
   // Independent toggle state — user can have multiple tools open at once.
   // Outreach starts expanded since it's the more "actionable" display.
   const [expanded, setExpanded] = useState<Set<string>>(new Set(['outreach']));
@@ -30,7 +32,7 @@ export default function ToolsPage() {
         id="outreach"
         icon={Mail}
         title="Outreach"
-        subtitle="AI-drafted emails awaiting your review. Trigger new runs from Teams via Audrey."
+        subtitle={`AI-drafted emails awaiting your review. Trigger new runs from Teams via ${botName}.`}
         expanded={expanded.has('outreach')}
         onToggle={() => toggle('outreach')}
       >

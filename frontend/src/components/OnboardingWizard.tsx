@@ -18,6 +18,10 @@ interface Props {
    *  page as the friendly "Setting up for X" header. Falls back to "you"
    *  if empty. */
   displayName?: string;
+  /** Configurable AI assistant name (settings.bot_display_name). Used in
+   *  Step 3 ("Connect <bot> to Teams") and the device-flow warnings.
+   *  Defaults to "Audrey" if the customer hasn't customized it. */
+  botName?: string;
 }
 
 type StepNum = 1 | 2 | 3;
@@ -32,7 +36,7 @@ const STEPS: { n: StepNum; label: string }[] = [
 //                        WIZARD CONTAINER
 // ═══════════════════════════════════════════════════════════════════
 
-export default function OnboardingWizard({ onSubmitted, displayName = '' }: Props) {
+export default function OnboardingWizard({ onSubmitted, displayName = '', botName = 'Audrey' }: Props) {
   const [step, setStep] = useState<StepNum>(1);
 
   // Step 1 data
@@ -93,7 +97,7 @@ export default function OnboardingWizard({ onSubmitted, displayName = '' }: Prop
   return (
     <div className="min-h-screen w-full bg-executive-bg executive-grid overflow-auto py-10 px-6">
       <div className="max-w-2xl mx-auto">
-        <Header step={step} />
+        <Header step={step} botName={botName} />
 
         {globalError && (
           <div className="mb-4 flex items-start gap-2 text-sm text-rose-400 bg-rose-400/8 border border-rose-400/30 rounded-lg px-3 py-2">
@@ -162,6 +166,7 @@ export default function OnboardingWizard({ onSubmitted, displayName = '' }: Prop
                 onSkip={finishOnboarding}
                 onDone={finishOnboarding}
                 prefsSubmitted={prefsSubmitted}
+                botName={botName}
               />
             )}
           </motion.div>
@@ -175,7 +180,7 @@ export default function OnboardingWizard({ onSubmitted, displayName = '' }: Prop
 //                            HEADER + BAR
 // ═══════════════════════════════════════════════════════════════════
 
-function Header({ step }: { step: StepNum }) {
+function Header({ step, botName }: { step: StepNum; botName: string }) {
   return (
     <header className="mb-6">
       <p className="text-xs font-mono uppercase text-executive-muted tracking-widest mb-2">
@@ -183,8 +188,8 @@ function Header({ step }: { step: StepNum }) {
       </p>
       <h1 className="text-2xl font-bold text-executive-text">
         {step === 1 && "Let's start with your company"}
-        {step === 2 && 'Confirm and start'}
-        {step === 3 && 'Connect Audrey to Teams'}
+        {step === 2 && 'Almost ready'}
+        {step === 3 && `Connect ${botName} to Teams`}
       </h1>
       <div className="mt-4 flex items-center gap-2">
         {STEPS.map((s, i) => (
@@ -433,13 +438,17 @@ interface DeviceCode {
 }
 
 function Step3ConnectBot({
-  onBack, onSkip, onDone, prefsSubmitted,
+  onBack, onSkip, onDone, prefsSubmitted, botName,
 }: {
   onBack: () => void;
   onSkip: () => void;
   onDone: () => void;
   prefsSubmitted: boolean;
+  botName: string;
 }) {
+  // Lowercase form for example emails (e.g. "audrey@..."). Falls back to the
+  // raw value if it's already lower-case or contains symbols.
+  const botEmailLocal = botName.toLowerCase().replace(/\s+/g, '');
   const [deviceCode, setDeviceCode] = useState<DeviceCode | null>(null);
   const [status, setStatus] = useState<'idle' | 'starting' | 'polling' | 'success' | 'error'>('idle');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -499,8 +508,8 @@ function Step3ConnectBot({
               msg = 'This AI assistant account is already claimed by another user. '
                   + 'Ask that user to disconnect first, or contact your admin.';
             } else if (activateRes.status === 400) {
-              msg = detail || 'You signed in as yourself. The AI assistant must be a '
-                  + 'separate Microsoft account in your tenant (e.g. audrey@your-company.com).';
+              msg = detail || `You signed in as yourself. The AI assistant must be a `
+                  + `separate Microsoft account in your tenant (e.g. ${botEmailLocal}@your-company.com).`;
             } else {
               msg = `Activation failed (HTTP ${activateRes.status})${detail ? ': ' + detail : ''}`;
             }
@@ -539,8 +548,8 @@ function Step3ConnectBot({
       <StepHeader
         icon={Bot}
         color="text-sky-500"
-        title="Connect Audrey to Microsoft Teams"
-        subtitle="Audrey is a separate Microsoft account in your tenant that talks to you 1:1 in Teams. Set up by your IT — sign in as her below."
+        title={`Connect ${botName} to Microsoft Teams`}
+        subtitle={`${botName} is a separate Microsoft account in your tenant that talks to you 1:1 in Teams. Set up by your IT — sign in as her below.`}
       />
 
       {!prefsSubmitted && (
@@ -548,7 +557,7 @@ function Step3ConnectBot({
       )}
 
       {status === 'success' && (
-        <SuccessBlock />
+        <SuccessBlock botName={botName} />
       )}
 
       {status === 'error' && (
@@ -601,9 +610,9 @@ function Step3ConnectBot({
             <p className="font-semibold text-executive-text mb-1">⚠️ Important</p>
             <p>
               When Microsoft asks who to sign in as, choose the <strong>AI assistant account</strong>
-              {' '}(e.g. <code className="text-executive-text">audrey@your-company.com</code>) —{' '}
+              {' '}(e.g. <code className="text-executive-text">{botEmailLocal}@your-company.com</code>) —{' '}
               <strong>not your own login</strong>. If you sign in as yourself,
-              Audrey becomes a clone of you instead of a separate assistant.
+              {' '}{botName} becomes a clone of you instead of a separate assistant.
             </p>
           </div>
 
@@ -635,7 +644,7 @@ function Step3ConnectBot({
   );
 }
 
-function SuccessBlock() {
+function SuccessBlock({ botName }: { botName: string }) {
   return (
     <motion.div
       initial={{ opacity: 0, scale: 0.95 }}
@@ -645,7 +654,7 @@ function SuccessBlock() {
     >
       <CheckCircle2 size={20} className="text-emerald-500 mt-0.5 shrink-0" />
       <div className="text-sm text-executive-text">
-        <p className="font-semibold text-emerald-500 mb-0.5">Audrey is connected!</p>
+        <p className="font-semibold text-emerald-500 mb-0.5">{botName} is connected!</p>
         <p className="text-xs text-executive-muted">
           She'll appear in your Microsoft Teams 1:1 list shortly. Let's see what we built…
         </p>
