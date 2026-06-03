@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
-  Mail, Loader2, ExternalLink, Inbox, ChevronDown, ChevronRight,
+  Loader2, ExternalLink, Inbox, ChevronDown, ChevronRight,
   FolderOpen, Tag, Clock, AlertCircle,
 } from 'lucide-react';
 import { getOutreachLast, relativeTime } from '../lib/api';
 import type { OutreachLastRun } from '../lib/types';
 
-export default function OutreachPage() {
+/** Body content for the Outreach tool — rendered inside the Tools page
+ *  ToolPanel. Display-only: the table lists the most recent run's drafts.
+ *  Runs are triggered via the Teams bot (see EmptyState hints). */
+export default function OutreachCard() {
   const [data, setData] = useState<OutreachLastRun | null>(null);
   const [loading, setLoading] = useState(true);
   const [skippedOpen, setSkippedOpen] = useState(false);
@@ -23,44 +26,26 @@ export default function OutreachPage() {
 
   if (loading) {
     return (
-      <div className="p-8 max-w-6xl mx-auto">
-        <div className="flex items-center gap-2 text-sm text-executive-muted">
-          <Loader2 size={14} className="animate-spin" /> Loading outreach drafts…
-        </div>
+      <div className="flex items-center gap-2 text-sm text-executive-muted py-4">
+        <Loader2 size={14} className="animate-spin" /> Loading outreach drafts…
       </div>
     );
   }
 
   const hasRun = data?.status === 'fresh' && drafts.length > 0;
 
-  return (
-    <div className="p-8 max-w-6xl mx-auto space-y-4">
-      <header>
-        <div className="flex items-center gap-3 mb-1">
-          <div className="w-9 h-9 rounded-lg flex items-center justify-center bg-executive-accent/15 text-executive-accent">
-            <Mail size={16} />
-          </div>
-          <h1 className="text-2xl font-semibold text-executive-text">Outreach</h1>
-        </div>
-        <p className="text-sm text-executive-muted ml-12">
-          AI-drafted outreach emails awaiting your review in Outlook Drafts.
-        </p>
-      </header>
+  if (!hasRun) return <EmptyState />;
 
-      {hasRun ? (
-        <>
-          <RunSummary data={data!} />
-          <DraftsTable drafts={drafts} />
-          {skipped.length > 0 && (
-            <SkippedSection
-              skipped={skipped}
-              open={skippedOpen}
-              onToggle={() => setSkippedOpen(o => !o)}
-            />
-          )}
-        </>
-      ) : (
-        <EmptyState />
+  return (
+    <div className="space-y-4">
+      <RunSummary data={data!} />
+      <DraftsTable drafts={drafts} />
+      {skipped.length > 0 && (
+        <SkippedSection
+          skipped={skipped}
+          open={skippedOpen}
+          onToggle={() => setSkippedOpen(o => !o)}
+        />
       )}
     </div>
   );
@@ -76,7 +61,7 @@ function RunSummary({ data }: { data: OutreachLastRun }) {
   const errorCount = data.summary?.errors ?? 0;
 
   return (
-    <section className="bg-executive-card border border-executive-border rounded-xl px-5 py-4">
+    <section className="bg-executive-bg/40 border border-executive-border rounded-lg px-4 py-3">
       <div className="flex items-center justify-between gap-4 flex-wrap">
         <div className="flex items-center gap-4 text-sm text-executive-muted">
           {lastRun && (
@@ -109,8 +94,8 @@ function RunSummary({ data }: { data: OutreachLastRun }) {
 
 function DraftsTable({ drafts }: { drafts: NonNullable<OutreachLastRun['drafts_created']> }) {
   return (
-    <section className="bg-executive-card border border-executive-border rounded-xl overflow-hidden">
-      <div className="grid grid-cols-[2fr_1.5fr_2fr_1.2fr_auto] gap-4 px-5 py-3 text-xs font-medium uppercase tracking-wide text-executive-muted border-b border-executive-border bg-executive-border/10">
+    <section className="bg-executive-bg/40 border border-executive-border rounded-lg overflow-hidden">
+      <div className="grid grid-cols-[2fr_1.5fr_2fr_1.2fr_auto] gap-4 px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-executive-muted border-b border-executive-border bg-executive-border/10">
         <div>Contact</div>
         <div>Company</div>
         <div>Subject</div>
@@ -120,7 +105,7 @@ function DraftsTable({ drafts }: { drafts: NonNullable<OutreachLastRun['drafts_c
       {drafts.map((d, i) => (
         <div
           key={`${d.to}-${i}`}
-          className={`grid grid-cols-[2fr_1.5fr_2fr_1.2fr_auto] gap-4 px-5 py-3 items-start text-sm ${
+          className={`grid grid-cols-[2fr_1.5fr_2fr_1.2fr_auto] gap-4 px-4 py-3 items-start text-sm ${
             i < drafts.length - 1 ? 'border-b border-executive-border/60' : ''
           }`}
         >
@@ -164,10 +149,10 @@ function SkippedSection({
   onToggle: () => void;
 }) {
   return (
-    <section className="bg-executive-card/60 border border-executive-border rounded-xl overflow-hidden">
+    <section className="bg-executive-bg/30 border border-executive-border rounded-lg overflow-hidden">
       <button
         onClick={onToggle}
-        className="w-full flex items-center gap-2 px-5 py-3 text-left text-sm text-executive-muted hover:bg-executive-border/15 transition-colors"
+        className="w-full flex items-center gap-2 px-4 py-2.5 text-left text-sm text-executive-muted hover:bg-executive-border/15 transition-colors"
       >
         {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
         <AlertCircle size={13} className="text-amber-400" />
@@ -177,7 +162,7 @@ function SkippedSection({
         </span>
       </button>
       {open && (
-        <div className="px-5 pb-4 pt-1 space-y-2 text-sm border-t border-executive-border/60">
+        <div className="px-4 pb-3 pt-1 space-y-2 text-sm border-t border-executive-border/60">
           {skipped.map((s, i) => {
             const c = s.contact || {};
             const who = c.name || c.email || 'Unknown contact';
@@ -200,16 +185,16 @@ function SkippedSection({
 
 function EmptyState() {
   return (
-    <section className="bg-executive-card border border-executive-border rounded-xl p-10 text-center">
-      <div className="w-14 h-14 mx-auto mb-4 rounded-full bg-executive-border/30 flex items-center justify-center">
-        <Inbox size={24} className="text-executive-muted" />
+    <section className="bg-executive-bg/40 border border-executive-border rounded-lg p-8 text-center">
+      <div className="w-12 h-12 mx-auto mb-3 rounded-full bg-executive-border/30 flex items-center justify-center">
+        <Inbox size={20} className="text-executive-muted" />
       </div>
-      <h2 className="text-lg font-medium text-executive-text mb-2">No outreach drafts yet</h2>
-      <p className="text-sm text-executive-muted mb-6 max-w-md mx-auto">
-        Ask Audrey in Teams to draft outreach emails. Each contact becomes one Outlook Draft you can
-        review and send.
+      <h3 className="text-base font-medium text-executive-text mb-2">No outreach drafts yet</h3>
+      <p className="text-sm text-executive-muted mb-5 max-w-md mx-auto">
+        Ask Audrey in Teams to draft outreach emails. Each contact becomes one Outlook Draft
+        you can review and send.
       </p>
-      <div className="inline-block text-left bg-executive-bg/60 border border-executive-border rounded-lg px-5 py-4 space-y-2 text-sm">
+      <div className="inline-block text-left bg-executive-bg/60 border border-executive-border rounded-lg px-4 py-3 space-y-1.5 text-sm">
         <ExampleLine>"draft outreach for everyone in <em>/Contacts/Berlin AI Summit</em>"</ExampleLine>
         <ExampleLine>"draft outreach for everyone tagged <em>TechConf 2026</em>"</ExampleLine>
         <ExampleLine>"draft outreach for contacts I added today"</ExampleLine>

@@ -1,14 +1,16 @@
 import { useState } from 'react';
-import { Receipt, FolderOpen, ChevronDown } from 'lucide-react';
+import { Mail, Receipt, FolderOpen, ChevronDown } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 // Expense remains physically in pages/records/ — surfaced here as a Tool by
 // intent, but the file is left in place because other in-flight work uses it
 // as a template.
 import ExpensesTab from './records/ExpensesTab';
+import OutreachCard from '../components/OutreachCard';
 
 export default function ToolsPage() {
   // Independent toggle state — user can have multiple tools open at once.
-  const [expanded, setExpanded] = useState<Set<string>>(new Set(['expenses']));
+  // Outreach starts expanded since it's the more "actionable" display.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set(['outreach']));
   const toggle = (id: string) => setExpanded(s => {
     const next = new Set(s);
     if (next.has(id)) next.delete(id); else next.add(id);
@@ -23,6 +25,17 @@ export default function ToolsPage() {
           On-demand workflows and personal utilities. Click a tool to expand it.
         </p>
       </header>
+
+      <ToolPanel
+        id="outreach"
+        icon={Mail}
+        title="Outreach"
+        subtitle="AI-drafted emails awaiting your review. Trigger new runs from Teams via Audrey."
+        expanded={expanded.has('outreach')}
+        onToggle={() => toggle('outreach')}
+      >
+        <OutreachCard />
+      </ToolPanel>
 
       <ToolPanel
         id="expenses"
