@@ -211,6 +211,115 @@ def _merge_projects(existing: dict, new_projects: list[dict]) -> dict:
     return existing
 
 
+# ── Entity-centric helpers (anchored broad re-scan) ──────
+#
+# A project is an entity (people + topic) that spans MANY email threads — not a
+# single conversationId. The refresh re-derives each project's state from a broad
+# recent scan of all mail involving its people, so a new thread about an existing
+# project updates that project instead of spawning a duplicate or freezing it.
+
+_REFRESH_WINDOW_DAYS = 45   # broad re-scan window for refresh()
+_DORMANT_DAYS = 45          # no cross-thread activity in this window → dormant flag
+
+
+def _owner_addresses(data_dir: Path, settings: dict) -> set[str]:
+    """The owner's own addresses — excluded from a project's fingerprint. The owner
+    is a participant in every project, so matching on them would match everything."""
+    addrs: set[str] = set()
+    rep = (settings or {}).get("report_email")
+    if rep:
+        addrs.add(rep.lower())
+    # OAuth login identity is the most reliable owner address.
+    try:
+        uid = Path(data_dir).name
+        sess = Path(data_dir).parent / "_sessions" / f"{uid}.json"
+        if sess.exists():
+            u = json.loads(sess.read_text()).get("username")
+            if u:
+                addrs.add(u.lower())
+    except Exception:
+        pass
+    return addrs
+
+
+def _msg_external_addrs(m: dict, owner_addrs: set[str]) -> set[str]:
+    """External (non-owner, non-noise) addresses on a message — from + to."""
+    cands = [((m.get("from") or {}).get("emailAddress", {}).get("address", "") or "").lower()]
+    for r in (m.get("toRecipients") or []):
+        cands.append(((r.get("emailAddress") or {}).get("address") or "").lower())
+    return {a for a in cands if a and a not in owner_addrs and not _is_noise(a)}
+
+
+def _project_participants(proj: dict, owner_addrs: set[str]) -> set[str]:
+    return {
+        p.lower() for p in (proj.get("participants") or [])
+        if p and p.lower() not in owner_addrs and not _is_noise(p.lower())
+    }
+
+
+def _msg_date(m: dict) -> str:
+    return (m.get("receivedDateTime") or m.get("sentDateTime") or "")[:10]
+
+
+def _reassess_project(proj: dict, msgs: list[dict], ai: AIClient,
+                      display_name: str, today_str: str) -> dict | None:
+    """Given an EXISTING project and CANDIDATE emails (matched by shared participant —
+    but the same people also email about OTHER topics), have the AI (1) pick which
+    threads are ACTUALLY about this project, then (2) re-assess its state from only
+    those. This is what stops a high-frequency contact's unrelated mail from being
+    lumped into one project. Returns a dict with relevant_conversation_ids + the
+    AI-derived fields, or None."""
+    by_cid: dict[str, list[dict]] = {}
+    for m in msgs:
+        by_cid.setdefault(m.get("conversationId") or m.get("id", ""), []).append(m)
+
+    labels: dict[str, str] = {}   # "T1" -> conversationId
+    blocks: list[str] = []
+    for i, (cid, ms) in enumerate(by_cid.items(), 1):
+        lab = f"T{i}"
+        labels[lab] = cid
+        ms_sorted = sorted(ms, key=_msg_date)
+        subj = (ms_sorted[-1].get("subject") or "(no subject)")[:90]
+        prev = (ms_sorted[-1].get("bodyPreview") or "")[:150]
+        blocks.append(f"  {lab} [{_msg_date(ms_sorted[-1])}] {subj} | {prev}")
+
+    prompt = f"""You are maintaining an EXISTING project for {display_name}. Today is {today_str}.
+Do NOT rename or split it — its identity is fixed.
+
+PROJECT:
+  name: {proj.get('name', '')}
+  current summary: {proj.get('summary', '')}
+
+Below are recent email THREADS involving this project's people. IMPORTANT: these
+people also discuss OTHER topics/projects — only some threads are about THIS project.
+Exclude anything that is not about this specific project.
+
+THREADS:
+{chr(10).join(blocks)}
+
+Return ONLY a JSON object:
+  "relevant_threads": [thread labels that are ACTUALLY about THIS project, e.g. ["T1","T3"]; [] if none]
+  "status": early_stage | ongoing | needs_attention | paused | completed
+  "momentum": accelerating | steady | slowing | stalled
+  "summary": 1-2 sentence current state, based ONLY on the relevant threads
+  "next_action": next concrete action if clear, else ""
+Return only the JSON object, no explanation."""
+    try:
+        raw = ai.generate(prompt).strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-z]*\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw)
+        out = json.loads(raw)
+        if not isinstance(out, dict):
+            return None
+        rel = out.get("relevant_threads") or []
+        out["relevant_conversation_ids"] = [labels[l] for l in rel if l in labels]
+        return out
+    except Exception as e:
+        print(f"[Projects] Re-assess failed for {proj.get('name', '?')}: {e}")
+        return None
+
+
 # ── Public API ────────────────────────────────────────────
 
 def build_projects(
@@ -333,24 +442,15 @@ def refresh_projects(
     now = datetime.now(timezone.utc)
 
     existing = load_projects(data_dir)
-    last_scan_str = existing.get("last_scan")
 
-    # Determine scan window (min 2 days, max 30 days)
-    if last_scan_str:
-        try:
-            last_scan_dt = datetime.fromisoformat(last_scan_str.replace("Z", "+00:00"))
-            delta = now - last_scan_dt
-            days_back = max(2, min(int(delta.total_seconds() / 86400) + 1, 30))
-        except Exception:
-            days_back = 7
-    else:
-        days_back = 7
-
-    log(f"Scanning last {days_back} days for new email activity...")
+    # Anchored broad re-scan: always look back a FIXED window so a project's recent
+    # activity across ALL threads is visible — not just new mail since last_scan.
+    days_back = _REFRESH_WINDOW_DAYS
+    log(f"Broad re-scan: last {days_back} days of mail...")
 
     # ── Fetch recent inbox ────────────────────────────────
     try:
-        inbox_msgs = graph.get_messages_since(days=days_back, max_results=200)
+        inbox_msgs = graph.get_messages_since(days=days_back, max_results=500)
     except Exception as e:
         log(f"Inbox fetch failed: {e}")
         inbox_msgs = []
@@ -391,76 +491,89 @@ def refresh_projects(
         existing["last_scan"] = now.isoformat()
         return existing
 
-    # ── Group and filter ──────────────────────────────────
-    groups = _group_by_conversation(all_messages)
-    filtered = _filter_conversations(groups)
-    log(f"Found {len(filtered)} relevant conversations in new messages")
+    # ── Entity-centric re-assessment (anchored broad re-scan) ──
+    owner_addrs = _owner_addresses(data_dir, settings)
+    projects = existing.get("projects", {})
 
-    # Build lookup: conversationId → project_id
-    conv_to_project: dict[str, str] = {}
-    for pid, proj in existing.get("projects", {}).items():
-        for cid in proj.get("conversation_ids", []):
-            conv_to_project[cid] = pid
-
-    stale_threshold = (now - timedelta(days=_STALE_DAYS)).strftime("%Y-%m-%d")
-    inactive_threshold = (now - timedelta(days=_INACTIVE_DAYS)).strftime("%Y-%m-%d")
-
-    matched_pids: set[str] = set()
-    unmatched_convs: list[tuple[str, list[dict]]] = []
-
-    for cid, msgs in filtered:
-        if cid in conv_to_project:
-            pid = conv_to_project[cid]
-            matched_pids.add(pid)
-            proj = existing["projects"][pid]
-
-            # Update last_activity and thread_count
-            last_activity = max(
-                (m.get("receivedDateTime") or m.get("sentDateTime") or "")
-                for m in msgs
-            )[:10]
-            if last_activity > proj.get("last_activity", ""):
-                proj["last_activity"] = last_activity
-
-            proj["thread_count"] = proj.get("thread_count", 0) + len(msgs)
-
-            # Re-enrich if stale
-            if proj.get("updated_at", "9999") < stale_threshold:
-                log(f"Re-enriching stale project: {proj.get('name', pid)}")
-                batch_result = _extract_projects_from_batch([(cid, msgs)], ai, display_name, today_str)
-                if batch_result:
-                    refreshed = batch_result[0]
-                    for field in ("status", "momentum", "summary", "next_action"):
-                        if field in refreshed:
-                            proj[field] = refreshed[field]
-                    proj["updated_at"] = today_str
-        else:
-            unmatched_convs.append((cid, msgs))
-
-    # ── Find brand new projects ───────────────────────────
-    if unmatched_convs:
-        log(f"Checking {len(unmatched_convs)} new conversations for new projects...")
-        new_projects_raw: list[dict] = []
-        batches = [unmatched_convs[i:i + _BATCH_SIZE] for i in range(0, len(unmatched_convs), _BATCH_SIZE)]
-        for i, batch in enumerate(batches, 1):
-            extracted = _extract_projects_from_batch(batch, ai, display_name, today_str)
-            new_projects_raw.extend(extracted)
-        if new_projects_raw:
-            log(f"Found {len(new_projects_raw)} new project(s)")
-            existing["projects"] = _merge_projects(existing.get("projects", {}), new_projects_raw)
-
-    # ── Mark completed projects ───────────────────────────
-    for pid, proj in list(existing.get("projects", {}).items()):
-        if proj.get("status") == "completed":
-            continue
+    # 1) Re-assess each active project from ALL recent mail involving its people —
+    #    across every thread, not just its known conversationIds. This is what
+    #    fixes "frozen" projects whose new activity lives in a fresh thread.
+    claimed_ids: set[str] = set()
+    for pid, proj in projects.items():
         if proj.get("ignore") or proj.get("archived"):
             continue
-        last_act = proj.get("last_activity", "")
-        if last_act and last_act < inactive_threshold:
-            log(f"Marking {proj.get('name', pid)} as completed (no activity in 30 days)")
-            proj["status"] = "completed"
-            proj["updated_at"] = today_str
+        parts = _project_participants(proj, owner_addrs)
+        if not parts:
+            continue
+        # Candidates = mail sharing a participant. The same people email about other
+        # things, so the AI then keeps only threads ACTUALLY about this project.
+        cand = [m for m in all_messages if _msg_external_addrs(m, owner_addrs) & parts]
+        if not cand:
+            continue
+        result = _reassess_project(proj, cand, ai, display_name, today_str)
+        if not result:
+            continue
+        rel_cids = set(result.get("relevant_conversation_ids", []))
+        rel_msgs = [m for m in cand if (m.get("conversationId") or m.get("id", "")) in rel_cids]
+        if not rel_msgs:
+            log(f"Re-assessed '{proj.get('name', pid)}': 0/{len(cand)} candidate threads relevant — skipped")
+            continue
+        for m in rel_msgs:
+            claimed_ids.add(m.get("id", ""))
+        latest = max(_msg_date(m) for m in rel_msgs)
+        if latest > proj.get("last_activity", ""):
+            proj["last_activity"] = latest
+        proj["conversation_ids"] = sorted(set(proj.get("conversation_ids", [])) | rel_cids)
+        proj["thread_count"] = len(proj["conversation_ids"])
+        for f in ("status", "momentum", "summary", "next_action"):
+            if result.get(f) not in (None, ""):
+                proj[f] = result[f]
+        proj["updated_at"] = today_str
+        log(f"Re-assessed '{proj.get('name', pid)}': "
+            f"{len(rel_msgs)}/{len(cand)} msgs relevant → {proj.get('status')}")
 
+    # 2) Unclaimed mail → candidate NEW projects. Reconcile against existing first
+    #    (≥2 shared external participants → fold in, don't create a duplicate).
+    unclaimed = [m for m in all_messages if m.get("id", "") not in claimed_ids]
+    filtered = _filter_conversations(_group_by_conversation(unclaimed))
+    if filtered:
+        log(f"Checking {len(filtered)} unclaimed conversation(s) for new projects...")
+        new_raw: list[dict] = []
+        for i in range(0, len(filtered), _BATCH_SIZE):
+            new_raw.extend(_extract_projects_from_batch(
+                filtered[i:i + _BATCH_SIZE], ai, display_name, today_str))
+        truly_new: list[dict] = []
+        for np in new_raw:
+            np_parts = {p.lower() for p in (np.get("participants") or [])
+                        if p and p.lower() not in owner_addrs and not _is_noise(p.lower())}
+            best_pid, best_ov = None, 0
+            for pid, proj in projects.items():
+                ov = len(np_parts & _project_participants(proj, owner_addrs))
+                if ov > best_ov and ov >= 2:
+                    best_pid, best_ov = pid, ov
+            if best_pid:  # same people as an existing project → fold in, no duplicate
+                ex = projects[best_pid]
+                ex["conversation_ids"] = sorted(
+                    set(ex.get("conversation_ids", [])) | set(np.get("conversation_ids", [])))
+                ex["thread_count"] = len(ex["conversation_ids"])
+                log(f"Folded new cluster into existing '{ex.get('name', best_pid)}' (shared {best_ov})")
+            else:
+                truly_new.append(np)
+        if truly_new:
+            log(f"Found {len(truly_new)} genuinely new project(s)")
+            projects = _merge_projects(projects, truly_new)
+
+    # 3) Lifecycle: flag dormant by BROAD-scan inactivity. We do NOT auto-complete
+    #    on inactivity anymore (that wrongly buried active-but-frozen projects);
+    #    'completed' is now decided only by the AI re-assessment or the user.
+    dormant_threshold = (now - timedelta(days=_DORMANT_DAYS)).strftime("%Y-%m-%d")
+    for pid, proj in projects.items():
+        if proj.get("archived"):
+            continue
+        la = (proj.get("last_activity") or "")
+        proj["dormant"] = bool(la and la < dormant_threshold and proj.get("status") != "completed")
+
+    existing["projects"] = projects
     existing["last_scan"] = now.isoformat()
-    log(f"Refresh done — {len(existing.get('projects', {}))} total projects")
+    log(f"Refresh done — {len(projects)} projects")
     return existing

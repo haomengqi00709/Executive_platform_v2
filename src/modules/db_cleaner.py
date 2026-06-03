@@ -87,6 +87,30 @@ def _project_signature(p: dict) -> str:
     return name
 
 
+# Generic words that don't identify a project's entity — excluded when deciding
+# whether two projects share a distinctive company/entity name.
+_GENERIC_NAME_WORDS = {
+    "project", "projects", "the", "and", "for", "of", "with", "strategy",
+    "implementation", "system", "delivery", "assessment", "model", "plan",
+    "program", "initiative", "phase", "review", "management", "services",
+    "solution", "update", "supply", "chain", "core", "financial",
+}
+
+
+def _name_tokens(name: str) -> list[str]:
+    toks = re.sub(r"[^\w\s]", " ", (name or "").lower()).split()
+    return [t for t in toks if len(t) >= 3 and t not in _GENERIC_NAME_WORDS]
+
+
+def _leading_entity(name: str) -> str:
+    """First distinctive token of a project name — usually the company/entity
+    (e.g. 'nexus', 'medicare', 'retailmax'). Two projects that lead with the same
+    entity are merge candidates even if neither name is a substring of the other
+    and they share no participants (the only-owner-participant blind spot)."""
+    toks = _name_tokens(name)
+    return toks[0] if toks else ""
+
+
 def _project_pair_features(a: dict, b: dict) -> dict:
     """Heuristic features to feed the AI for high/medium/low confidence."""
     parts_a = set(p.lower() for p in (a.get("participants") or []))
@@ -105,11 +129,16 @@ def _project_pair_features(a: dict, b: dict) -> dict:
     }
 
 
-def find_duplicate_projects(data_dir: Path, ai: AIClient, progress=None) -> list[dict]:
+def find_duplicate_projects(data_dir: Path, ai: AIClient, progress=None,
+                            messages_by_cid: dict = None) -> list[dict]:
     """
     Two-stage detection:
-      1. Cheap heuristic: group projects with overlapping participants / similar names
-      2. AI judges each candidate pair → confidence + reasoning
+      1. Cheap heuristic: group projects with overlapping participants / similar names /
+         same leading entity (company name)
+      2. AI judges each candidate pair → confidence + reasoning. When messages_by_cid is
+         provided (conversationId -> [messages]), the AI reads the projects' actual emails
+         instead of only their names/summaries, so it can tell that e.g. a "kickoff" record
+         and a "wrap-up" record are the same engagement.
     """
     data_dir = Path(data_dir)
     projects_path = data_dir / "projects.json"
@@ -133,10 +162,16 @@ def find_duplicate_projects(data_dir: Path, ai: AIClient, progress=None) -> list
             sig_a = _project_signature(a)
             sig_b = _project_signature(b)
             name_overlap = bool(sig_a and sig_b and (sig_a in sig_b or sig_b in sig_a))
+            ent_a = _leading_entity(a.get("name", ""))
+            same_entity = bool(ent_a and ent_a == _leading_entity(b.get("name", "")))
 
-            # Eligibility: ≥2 shared participants OR fuzzy name overlap OR ≥2 shared topics
+            # Eligibility: ≥2 shared participants OR fuzzy name overlap OR same leading
+            # entity (company name) OR ≥2 shared topics. The same-entity rule catches
+            # "Nexus Capital — AI Strategy" vs "Nexus Capital AI Opportunity" even when
+            # neither name is a substring of the other and participants are owner-only.
             if (features["participant_overlap"] >= 2
                 or name_overlap
+                or same_entity
                 or features["topic_overlap"] >= 2):
                 key = tuple(sorted([a["id"], b["id"]]))
                 if key in seen_pair_keys:
@@ -152,7 +187,7 @@ def find_duplicate_projects(data_dir: Path, ai: AIClient, progress=None) -> list
     # Stage 2: AI judges each pair
     candidates: list[dict] = []
     for a, b, features in pairs[:40]:  # cap to control cost
-        verdict = _ai_judge_project_pair(ai, a, b, features)
+        verdict = _ai_judge_project_pair(ai, a, b, features, messages_by_cid)
         if verdict and verdict.get("is_duplicate"):
             confidence = verdict.get("confidence", "low")
             if confidence not in ("high", "medium", "low"):
@@ -185,35 +220,56 @@ def _project_preview(p: dict) -> dict:
     }
 
 
-def _ai_judge_project_pair(ai: AIClient, a: dict, b: dict, features: dict) -> dict | None:
-    prompt = f"""Are these two projects actually the same project that was extracted twice from different email threads?
+def _project_email_lines(proj: dict, messages_by_cid: dict | None, limit: int = 10) -> str:
+    """Representative real emails behind a project (subject | preview), bounces skipped."""
+    if not messages_by_cid:
+        return ""
+    lines: list[str] = []
+    for cid in proj.get("conversation_ids", []):
+        for m in messages_by_cid.get(cid, []):
+            subj = (m.get("subject") or "").strip()
+            if not subj or subj.lower().startswith(("undeliverable", "canceled:", "accepted:", "declined:")):
+                continue
+            prev = (m.get("bodyPreview") or "").strip()[:90]
+            line = f"    - {subj[:80]}" + (f" | {prev}" if prev else "")
+            if line not in lines:
+                lines.append(line)
+            if len(lines) >= limit:
+                return "\n".join(lines)
+    return "\n".join(lines)
+
+
+def _ai_judge_project_pair(ai: AIClient, a: dict, b: dict, features: dict,
+                           messages_by_cid: dict = None) -> dict | None:
+    a_emails = _project_email_lines(a, messages_by_cid)
+    b_emails = _project_email_lines(b, messages_by_cid)
+    a_block = f"\n  actual emails:\n{a_emails}" if a_emails else ""
+    b_block = f"\n  actual emails:\n{b_emails}" if b_emails else ""
+    prompt = f"""Are these two projects the SAME engagement, extracted twice from different
+email threads? Judge primarily from the ACTUAL EMAILS below, not just the names.
 
 PROJECT A:
-- id: {a.get('id')}
 - name: {a.get('name')}
-- summary: {a.get('summary', '')[:300]}
-- status: {a.get('status')}
-- participants: {', '.join(a.get('participants', [])[:8])}
-- key_topics: {', '.join(a.get('key_topics', [])[:8])}
+- summary: {a.get('summary', '')[:200]}
+- key_topics: {', '.join(a.get('key_topics', [])[:8])}{a_block}
 
 PROJECT B:
-- id: {b.get('id')}
 - name: {b.get('name')}
-- summary: {b.get('summary', '')[:300]}
-- status: {b.get('status')}
-- participants: {', '.join(b.get('participants', [])[:8])}
-- key_topics: {', '.join(b.get('key_topics', [])[:8])}
+- summary: {b.get('summary', '')[:200]}
+- key_topics: {', '.join(b.get('key_topics', [])[:8])}{b_block}
 
 Shared participants: {features['participant_overlap']} ({', '.join(features['shared_participants'][:5])})
-Shared topics: {features['topic_overlap']} ({', '.join(features['shared_topics'][:5])})
 
-Return JSON: {{"is_duplicate": true/false, "confidence": "high"|"medium"|"low", "reasoning": "one sentence why"}}
+Rules:
+- They ARE the same project (duplicate) if the emails show the SAME client / initiative —
+  EVEN IF one record covers the kickoff/early phase and the other the wrap-up/later phase, or
+  the names differ (e.g. "Audit" vs "Audit Remediation", "Optimization" vs "Supply Chain
+  Optimization"). Sequential phases or sub-topics of one engagement = duplicate.
+- They are DISTINCT only if the emails show genuinely different initiatives (different
+  objective/deliverable for the same client is OK to keep separate, e.g. a strategy engagement
+  vs a separate financial-model review).
 
-Confidence rubric:
-- high: same client + same project scope, just renamed or split across threads
-- medium: clearly related but might be separate workstreams under one umbrella
-- low: weak match — could be the same, could be two related-but-distinct efforts
-"""
+Return JSON: {{"is_duplicate": true/false, "confidence": "high"|"medium"|"low", "reasoning": "one sentence citing the emails"}}"""
     try:
         raw = ai.extract_json(prompt)
         return json.loads(raw)
