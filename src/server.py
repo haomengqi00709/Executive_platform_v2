@@ -302,6 +302,40 @@ def _bot_state_path(user_id: str) -> Path:
     return _udir(user_id) / "teams_bot.json"
 
 
+def _is_bound_bot(state: dict) -> bool:
+    """True if this account is a bot currently bound to an owner. Keyed on
+    owner_uid (which IS cleared on unbind) — not on is_registered_bot alone,
+    which is write-once and was historically never cleared — so a stale
+    registration flag can no longer permanently mis-route an account as a bot
+    (the 'zombie bot' bug). Per-user OWNER polls skip these; bot-side polls
+    additionally require `enabled`."""
+    return bool(state.get("is_registered_bot") and state.get("owner_uid"))
+
+
+def _heal_zombie_bot_flags_at_startup() -> None:
+    """One-time self-heal at boot: reset 'zombie' bot flags left by an aborted
+    bot setup. A zombie is is_registered_bot=True with no owner_uid — created
+    when someone signed in as their OWN account during the bot device-flow
+    (bot_auth_poll set the flag before activate_bot rejected the self-bind, and
+    nothing ever cleared it). Such an account is really an owner, but every
+    per-user event poll skipped it as a bot. Reset it to a clean owner state so
+    its meetings/expenses process again. Only touches zombies — real bound bots
+    (owner_uid set) are left untouched."""
+    sessions_dir = auth.DATA_DIR / "_sessions"
+    if not sessions_dir.exists():
+        return
+    for tf in sessions_dir.glob("*.json"):
+        bp = _bot_state_path(tf.stem)
+        if not bp.exists():
+            continue
+        bs = _read_json(bp)
+        if bs.get("is_registered_bot") and not bs.get("owner_uid"):
+            bs["is_registered_bot"] = False
+            bs["enabled"] = False
+            _write_json(bp, bs)
+            print(f"[startup] reset zombie bot flag for {tf.stem}")
+
+
 def _find_bot_for_user(user_id: str):
     link_path = _user_bot_link_path(user_id)
     if link_path.exists():
@@ -336,7 +370,7 @@ def _bind_bot_to_user(bot_uid: str, user_id: str, username: str):
         ep = _bot_state_path(existing)
         if ep.exists():
             es = json.loads(ep.read_text())
-            es.update({"owner_uid": None, "peer_email": None, "chat_id": None, "last_seen_ts": None})
+            es.update({"is_registered_bot": False, "owner_uid": None, "peer_email": None, "chat_id": None, "last_seen_ts": None})
             _write_json(ep, es)
 
     bp = _bot_state_path(bot_uid)
@@ -379,7 +413,7 @@ def _unbind_bot_from_user(user_id: str) -> str | None:
         bp = _bot_state_path(bot_uid)
         if bp.exists():
             bs = json.loads(bp.read_text())
-            bs.update({"owner_uid": None, "peer_email": None, "chat_id": None, "last_seen_ts": None})
+            bs.update({"is_registered_bot": False, "owner_uid": None, "peer_email": None, "chat_id": None, "last_seen_ts": None})
             _write_json(bp, bs)
         link_path.unlink(missing_ok=True)
     return bot_uid
@@ -542,7 +576,7 @@ def _poll_expense_scan_all_users():
     for token_file in sessions_dir.glob("*.json"):
         uid = token_file.stem
         bot_path = _bot_state_path(uid)
-        if bot_path.exists() and _read_json(bot_path).get("is_registered_bot"):
+        if bot_path.exists() and _is_bound_bot(_read_json(bot_path)):
             continue
         try:
             owner_graph = GraphClient(auth.get_valid_access_token(uid))
@@ -575,7 +609,7 @@ def _poll_meeting_prep_all_users():
     for token_file in sessions_dir.glob("*.json"):
         uid = token_file.stem
         bot_path = _bot_state_path(uid)
-        if bot_path.exists() and _read_json(bot_path).get("is_registered_bot"):
+        if bot_path.exists() and _is_bound_bot(_read_json(bot_path)):
             continue
         try:
             from src.modules.schedules import load_schedules
@@ -622,7 +656,7 @@ def _poll_meeting_recordings_all_users():
         uid = token_file.stem
         bot_path = _bot_state_path(uid)
         # Skip bot accounts (they don't have their own OneDrive recordings to process)
-        if bot_path.exists() and _read_json(bot_path).get("is_registered_bot"):
+        if bot_path.exists() and _is_bound_bot(_read_json(bot_path)):
             continue
         try:
             token    = auth.get_valid_access_token(uid)
@@ -770,6 +804,15 @@ def bot_auth_poll(session: dict = Depends(require_session)):
 
         bot_uid   = me.get("id", "")
         bot_email = me.get("mail") or me.get("userPrincipalName", "")
+        if bot_uid and bot_uid == session["user_id"]:
+            # Self-registration guard. The bot role must never land on the
+            # user's OWN account. activate_bot rejects a self-bind too, but only
+            # AFTER the flag below is written — leaving a permanent zombie that
+            # every per-user event poll then skips. Reject here, before any write.
+            return {"status": "error", "message":
+                    "You signed in as your own account. The AI assistant must be "
+                    "a separate Microsoft account (e.g. Audrey@yourcompany.com). "
+                    "Restart setup and sign in as the assistant account."}
         if bot_uid:
             expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
 
@@ -868,6 +911,7 @@ def disable_bot(session: dict = Depends(require_session)):
         if bp.exists():
             bs = json.loads(bp.read_text())
             bs["enabled"] = False
+            bs["is_registered_bot"] = False
             _write_json(bp, bs)
     return {"ok": True}
 
@@ -1010,11 +1054,12 @@ def admin_unbind_bot(bot_uid: str, session: dict = Depends(require_session)):
     bs = json.loads(bp.read_text())
     prev_owner = bs.get("owner_uid")
     bs.update({
-        "enabled":      False,
-        "owner_uid":    None,
-        "peer_email":   None,
-        "chat_id":      None,
-        "last_seen_ts": None,
+        "enabled":           False,
+        "is_registered_bot": False,
+        "owner_uid":         None,
+        "peer_email":        None,
+        "chat_id":           None,
+        "last_seen_ts":      None,
     })
     _write_json(bp, bs)
     if prev_owner:
@@ -4385,5 +4430,6 @@ def startup_event():
         max_instances=1,
         coalesce=True,
     )
+    _heal_zombie_bot_flags_at_startup()
     _load_all_user_schedules_at_startup()
     print("[Scheduler] Teams bot 10s | Email monitor 1m | Expense scan 1m | Meeting prep 5m | Meeting recordings 20m | CRM refresh daily 06:00 UTC | Projects refresh daily 06:30 UTC | Companies refresh daily 06:45 UTC | DB cleanup weekly Mon 07:00 UTC")
