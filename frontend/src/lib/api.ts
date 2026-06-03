@@ -183,13 +183,6 @@ export function regenerateProfile(): Promise<{ ok: boolean }> {
 
 // ── Tools ─────────────────────────────────────────────────
 
-export function runOutreach(folder: string, context_note: string): Promise<{ ok: boolean }> {
-  return fetchJson(`/api/outreach/run`, {
-    method: 'POST',
-    body: JSON.stringify({ folder, context_note }),
-  });
-}
-
 export function getOutreachLast(): Promise<OutreachLastRun> {
   return fetchJson<OutreachLastRun>(`/api/outreach/last`);
 }

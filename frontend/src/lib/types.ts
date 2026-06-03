@@ -206,13 +206,43 @@ export interface YesterdayRecapItem {
 // ──────────────────────────────────────────────────────────
 // Tools
 
+export interface OutreachDraft {
+  to: string;
+  name: string;
+  company: string;
+  subject: string;
+  web_link: string;
+  source_file: string;
+}
+
+export interface OutreachSkippedContact {
+  reason: string;       // 'no_email' | 'draft_gen_failed' | ...
+  file?: string;
+  contact: {
+    name?: string;
+    email?: string;
+    company?: string;
+    role?: string;
+    notes?: string;
+  };
+}
+
 export interface OutreachLastRun {
-  ran_at?: string;
+  status?: 'fresh' | 'not_run' | 'error';
+  last_run?: string;        // ISO datetime — what the backend writes
+  ran_at?: string;          // legacy alias (older runs may still have this)
   folder?: string;
-  total_contacts?: number;
-  drafts_created?: number;
-  errors?: number;
-  log?: string[];
+  context_note?: string;
+  drafts_created?: OutreachDraft[];
+  contacts_skipped?: OutreachSkippedContact[];
+  files_processed?: { file: string; type: string; contacts_found: number }[];
+  errors?: { contact?: string; file?: string; error: string }[];
+  summary?: {
+    drafts: number;
+    files: number;
+    skipped: number;
+    errors: number;
+  };
 }
 
 // ──────────────────────────────────────────────────────────
