@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import {
   Settings, Save, CheckCircle2, AlertCircle, LogIn, LogOut,
   Bot, Webhook, User, Loader2, Copy, ExternalLink, Moon, Sun,
-  LayoutDashboard, Sparkles, Wrench, UserCircle2, Database,
+  LayoutDashboard, Sparkles, Wrench, UserCircle2, Database, Mail,
   BarChart3, Building2, RefreshCw, AlertTriangle, RotateCcw,
 } from 'lucide-react';
 
@@ -11,13 +11,14 @@ import SkillsPage from './pages/SkillsPage';
 import SectionDetailPage from './pages/SectionDetailPage';
 import RecordsPage from './pages/RecordsPage';
 import ToolsPage from './pages/ToolsPage';
+import OutreachPage from './pages/OutreachPage';
 import ProfilePage from './pages/ProfilePage';
 import OnboardingWizard from './components/OnboardingWizard';
 import { ActivityProvider } from './components/ActivityDrawer';
 
 // ── Types (preserved auth + onboarding + settings) ─────────────────────────
 
-type Page = 'dashboard' | 'skills' | 'section' | 'records' | 'tools' | 'profile' | 'settings';
+type Page = 'dashboard' | 'skills' | 'section' | 'records' | 'tools' | 'outreach' | 'profile' | 'settings';
 
 type ProfileStage = 'pending' | 'awaiting_confirmation' | 'generating' | 'draft_ready' | 'user_confirmed';
 
@@ -64,6 +65,7 @@ const NAV: { id: Page; label: string; icon: React.ReactNode; color: string }[] =
   { id: 'skills',    label: 'Skills',    icon: <Sparkles size={16} />,        color: 'text-amber-400' },
   { id: 'records',   label: 'Records',   icon: <Database size={16} />,        color: 'text-emerald-400' },
   { id: 'tools',     label: 'Tools',     icon: <Wrench size={16} />,          color: 'text-violet-400' },
+  { id: 'outreach',  label: 'Outreach',  icon: <Mail size={16} />,            color: 'text-cyan-400' },
   { id: 'profile',   label: 'Profile',   icon: <UserCircle2 size={16} />,     color: 'text-rose-400' },
 ];
 
@@ -221,6 +223,7 @@ export default function App() {
         )}
         {page === 'records'   && <RecordsPage />}
         {page === 'tools'     && <ToolsPage />}
+        {page === 'outreach'  && <OutreachPage />}
         {page === 'profile'   && <ProfilePage />}
         {page === 'settings'  && <SettingsPage user={user} />}
       </main>
