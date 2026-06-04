@@ -21,3 +21,6 @@ frontend/.vite/
 
 # OS
 .DS_Store
+
+# local pre-change backups (not committed)
+.backups/

@@ -583,7 +583,8 @@ def _read_json(path: "Path | None") -> dict:
 
 
 def _write_json(path: Path, data: dict) -> None:
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    from src.storage import atomic_write_json
+    atomic_write_json(path, data)
 
 
 def _sync_settings(slug: str, content: str, sett: Path) -> None:

@@ -55,8 +55,8 @@ def _read_json(path: Path, default):
 
 
 def _write_json(path: Path, data) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    from src.storage import atomic_write_json
+    atomic_write_json(path, data)
 
 
 def load_pending(data_dir: Path) -> list[dict]:

@@ -72,14 +72,11 @@ def _read_json(path: Path) -> dict:
         return {}
 
 def _write_json(path: Path, data: dict):
-    """Atomic JSON write: temp + os.replace. Required because the deployment
-    target (Azure Files SMB) can leave stale trailing bytes on plain write_text
-    under concurrent writes — observed as "Extra data" json.loads errors."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-    import os as _os
-    _os.replace(tmp, path)
+    """Atomic, concurrency-safe JSON write — delegates to src/storage.py.
+    (The old tmp+os.replace used a SHARED tmp name, which still raced under
+    concurrent writers on Azure Files SMB → the 2026-06 'Extra data' corruption.)"""
+    from src.storage import atomic_write_json
+    atomic_write_json(path, data)
 
 def _within(iso_ts: str | None, secs: int) -> bool:
     if not iso_ts:
@@ -879,16 +876,17 @@ def bot_auth_poll(session: dict = Depends(require_session)):
             # docs/auth-health-review-findings.md and conversation around
             # commit 2c74f2b for the full root-cause analysis.
             try:
-                _cache = auth._load_cache()
-                _cache.add({
-                    "client_id":      auth.CLIENT_ID,
-                    "scope":          (result.get("scope") or "").split() or list(auth.SCOPES_LOCAL),
-                    "token_endpoint": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
-                    "response":       result,
-                    "data":           {},
-                    "grant_type":     "urn:ietf:params:oauth:grant-type:device_code",
-                })
-                auth._save_cache(_cache)
+                with auth.file_lock(auth._bot_cache_file(bot_uid)):
+                    _cache = auth._load_cache(bot_uid)
+                    _cache.add({
+                        "client_id":      auth.CLIENT_ID,
+                        "scope":          (result.get("scope") or "").split() or list(auth.SCOPES_LOCAL),
+                        "token_endpoint": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                        "response":       result,
+                        "data":           {},
+                        "grant_type":     "urn:ietf:params:oauth:grant-type:device_code",
+                    })
+                    auth._save_cache(_cache, bot_uid)
             except Exception as e:
                 # If injection fails, log loudly. First hour still works on
                 # the access_token we already have; the bot will simply

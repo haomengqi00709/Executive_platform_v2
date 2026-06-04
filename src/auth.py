@@ -15,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 
+from src.storage import atomic_write_text, file_lock
+
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────
@@ -107,10 +109,7 @@ def save_user_tokens(user_id: str, token_data: dict):
     # 4929-byte file = 4928 valid JSON + 1 stray "}" -> json.loads raises
     # "Extra data" -> get_valid_access_token thinks token is missing -> all
     # background pollers fail with "No token found for user").
-    p   = _token_file(user_id)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(token_data, default=str))
-    os.replace(tmp, p)
+    atomic_write_text(_token_file(user_id), json.dumps(token_data, default=str))
 
 def load_user_tokens(user_id: str) -> dict | None:
     f = _token_file(user_id)
@@ -207,30 +206,33 @@ def get_valid_access_token(user_id: str) -> str:
         except Exception as e:
             last_msal_error = {"error": "exception", "error_description": str(e)}
 
-    # Fall back to MSAL cache (works for device-flow accounts like the bot)
+    # Fall back to the per-bot MSAL cache (device-flow accounts like the bot).
+    # Hold the per-bot lock around the whole load→silent-refresh→save so two
+    # concurrent polls for the same bot can't race the refresh-token rotation.
     username = data.get("username", "")
     if username:
-        cache   = _load_cache()
-        app     = _build_legacy_app(cache)
-        matches = [a for a in app.get_accounts() if a.get("username", "").lower() == username.lower()]
-        if matches:
-            try:
-                result = app.acquire_token_silent_with_error(SCOPES_LOCAL, account=matches[0])
-            except Exception as e:
-                result = {"error": "exception", "error_description": str(e)}
-            if result and "access_token" in result:
-                _save_cache(cache)
-                new_data = {
-                    "access_token":  result["access_token"],
-                    "refresh_token": "",
-                    "expiry":        (datetime.now(timezone.utc) + timedelta(seconds=result.get("expires_in", 3600))).isoformat(),
-                    "username":      username,
-                }
-                save_user_tokens(user_id, new_data)
-                _record_auth_success(user_id, op="silent")
-                return new_data["access_token"]
-            if result and "error" in result:
-                last_msal_error = result
+        with file_lock(_bot_cache_file(user_id)):
+            cache   = _load_cache(user_id)
+            app     = _build_legacy_app(cache)
+            matches = [a for a in app.get_accounts() if a.get("username", "").lower() == username.lower()]
+            if matches:
+                try:
+                    result = app.acquire_token_silent_with_error(SCOPES_LOCAL, account=matches[0])
+                except Exception as e:
+                    result = {"error": "exception", "error_description": str(e)}
+                if result and "access_token" in result:
+                    _save_cache(cache, user_id)
+                    new_data = {
+                        "access_token":  result["access_token"],
+                        "refresh_token": "",
+                        "expiry":        (datetime.now(timezone.utc) + timedelta(seconds=result.get("expires_in", 3600))).isoformat(),
+                        "username":      username,
+                    }
+                    save_user_tokens(user_id, new_data)
+                    _record_auth_success(user_id, op="silent")
+                    return new_data["access_token"]
+                if result and "error" in result:
+                    last_msal_error = result
 
     _record_auth_failure(user_id, last_msal_error)
     raise Exception(f"Could not refresh token for {user_id}")
@@ -350,19 +352,88 @@ def get_auth_health(user_id: str) -> dict:
 
 # ── Legacy Device Code Flow (local dev) ───────────────────
 
-def _load_cache() -> msal.SerializableTokenCache:
+def _bot_cache_file(bot_uid: str) -> Path:
+    """Per-bot MSAL cache. Replaces the single shared global cache so one bot's
+    token churn/corruption can't affect another (the 2026-06 incident)."""
+    return user_data_dir(bot_uid) / "msal_cache.json"
+
+
+def _migrate_global_to_bot(bot_uid: str) -> str | None:
+    """Best-effort: pull this bot's entries out of the legacy global cache and
+    return them serialized, to seed the per-bot cache on first read. Filters
+    every cache category by home_account_id prefix == bot_uid; keeps entries
+    with no home_account_id (e.g. AppMetadata — shared, harmless). Returns None
+    if the global cache holds nothing for this bot."""
+    if not CACHE_FILE.exists():
+        return None
+    raw = CACHE_FILE.read_text()
+    try:
+        full = json.loads(raw)
+    except Exception:
+        try:                                   # salvage a corrupted global cache
+            full, _ = json.JSONDecoder().raw_decode(raw)
+        except Exception:
+            return None
+    if not isinstance(full, dict):
+        return None
+    out: dict = {}
+    found = False
+    for category, entries in full.items():
+        if not isinstance(entries, dict):
+            out[category] = entries
+            continue
+        kept = {}
+        for k, v in entries.items():
+            hid = (v.get("home_account_id") or "") if isinstance(v, dict) else ""
+            if (not hid) or hid.lower().startswith(bot_uid.lower()):
+                kept[k] = v
+                if hid:
+                    found = True
+        if kept:
+            out[category] = kept
+    return json.dumps(out) if found else None
+
+
+def _load_cache(bot_uid: str | None = None) -> msal.SerializableTokenCache:
+    """Load the MSAL cache. With bot_uid → that bot's own file, lazily seeded
+    from the legacy global cache on first read, falling back to the global
+    cache if needed (so a bot always finds its token). Without bot_uid → the
+    legacy global cache (local dev / owner device flow)."""
     cache = msal.SerializableTokenCache()
+    if bot_uid:
+        bf = _bot_cache_file(bot_uid)
+        if bf.exists():                         # 1. per-bot file
+            try:
+                cache.deserialize(bf.read_text())
+                return cache
+            except Exception:
+                cache = msal.SerializableTokenCache()
+        migrated = _migrate_global_to_bot(bot_uid)   # 2. lazy migrate from global
+        if migrated:
+            try:
+                cache.deserialize(migrated)
+                atomic_write_text(bf, migrated)
+                print(f"[cache] migrated per-bot cache for {bot_uid}")
+                return cache
+            except Exception as e:
+                print(f"[cache] per-bot migrate failed for {bot_uid}: {e}")
+                cache = msal.SerializableTokenCache()
+        # 3. fall through to the legacy global cache so the bot still works
     if CACHE_FILE.exists():
-        cache.deserialize(CACHE_FILE.read_text())
+        try:
+            cache.deserialize(CACHE_FILE.read_text())
+        except Exception:
+            pass
     return cache
 
-def _save_cache(cache: msal.SerializableTokenCache):
-    if cache.has_state_changed:
-        import os, tempfile
-        data = cache.serialize()
-        tmp = CACHE_FILE.with_suffix(".tmp")
-        tmp.write_text(data)
-        os.replace(tmp, CACHE_FILE)  # atomic on POSIX — prevents partial-write corruption
+
+def _save_cache(cache: msal.SerializableTokenCache, bot_uid: str | None = None):
+    """Persist the cache. With bot_uid → the bot's own file (never the shared
+    global one, which is now a frozen fallback). Concurrency-safe write."""
+    if not cache.has_state_changed:
+        return
+    target = _bot_cache_file(bot_uid) if bot_uid else CACHE_FILE
+    atomic_write_text(target, cache.serialize())
 
 def _build_legacy_app(cache) -> msal.PublicClientApplication:
     # Use /common authority so multi-tenant users (e.g. Audrey@<their-domain>)
