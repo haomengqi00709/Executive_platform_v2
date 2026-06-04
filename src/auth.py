@@ -215,9 +215,13 @@ def get_valid_access_token(user_id: str) -> str:
             cache   = _load_cache(user_id)
             app     = _build_legacy_app(cache)
             matches = [a for a in app.get_accounts() if a.get("username", "").lower() == username.lower()]
-            if matches:
+            # One email can map to several identities (work account + personal
+            # MSA, each with its own home_account_id). Try EACH until one
+            # refreshes — don't blindly trust the first, which may be a stale or
+            # revoked identity (the 2026-06 Audrey dual-identity incident).
+            for acct in matches:
                 try:
-                    result = app.acquire_token_silent_with_error(SCOPES_LOCAL, account=matches[0])
+                    result = app.acquire_token_silent_with_error(SCOPES_LOCAL, account=acct)
                 except Exception as e:
                     result = {"error": "exception", "error_description": str(e)}
                 if result and "access_token" in result:
@@ -359,11 +363,16 @@ def _bot_cache_file(bot_uid: str) -> Path:
 
 
 def _migrate_global_to_bot(bot_uid: str) -> str | None:
-    """Best-effort: pull this bot's entries out of the legacy global cache and
-    return them serialized, to seed the per-bot cache on first read. Filters
-    every cache category by home_account_id prefix == bot_uid; keeps entries
-    with no home_account_id (e.g. AppMetadata — shared, harmless). Returns None
-    if the global cache holds nothing for this bot."""
+    """Best-effort: pull this bot's entries out of the legacy global cache by
+    EMAIL, to seed the per-bot cache on first read. A bot's MSAL home_account_id
+    is NOT always its uid — personal/MSA accounts use opaque ids, and one email
+    can map to several identities (work + personal). So we collect the
+    home_account_ids of every Account whose username == the bot's email, then
+    keep all entries for those ids (+ shared, no-home-id entries like
+    AppMetadata). get_valid_access_token then tries each identity. Returns None
+    if the global cache holds no account for this bot's email.
+    (Filtering by home_account_id prefix == bot_uid was the 2026-06 bug: it
+    missed personal/MSA identities whose id doesn't start with the uid.)"""
     if not CACHE_FILE.exists():
         return None
     raw = CACHE_FILE.read_text()
@@ -376,22 +385,28 @@ def _migrate_global_to_bot(bot_uid: str) -> str | None:
             return None
     if not isinstance(full, dict):
         return None
+    username = ((load_user_tokens(bot_uid) or {}).get("username") or "").lower()
+    if not username:
+        return None
+    hids = {
+        v.get("home_account_id")
+        for v in (full.get("Account") or {}).values()
+        if isinstance(v, dict) and v.get("username", "").lower() == username and v.get("home_account_id")
+    }
+    if not hids:
+        return None
     out: dict = {}
-    found = False
     for category, entries in full.items():
         if not isinstance(entries, dict):
             out[category] = entries
             continue
-        kept = {}
-        for k, v in entries.items():
-            hid = (v.get("home_account_id") or "") if isinstance(v, dict) else ""
-            if (not hid) or hid.lower().startswith(bot_uid.lower()):
-                kept[k] = v
-                if hid:
-                    found = True
+        kept = {
+            k: v for k, v in entries.items()
+            if (not (isinstance(v, dict) and v.get("home_account_id"))) or (v.get("home_account_id") in hids)
+        }
         if kept:
             out[category] = kept
-    return json.dumps(out) if found else None
+    return json.dumps(out)
 
 
 def _load_cache(bot_uid: str | None = None) -> msal.SerializableTokenCache:
