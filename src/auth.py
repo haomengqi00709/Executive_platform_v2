@@ -411,9 +411,10 @@ def _migrate_global_to_bot(bot_uid: str) -> str | None:
 
 def _load_cache(bot_uid: str | None = None) -> msal.SerializableTokenCache:
     """Load the MSAL cache. With bot_uid → that bot's own file, lazily seeded
-    from the legacy global cache on first read, falling back to the global
-    cache if needed (so a bot always finds its token). Without bot_uid → the
-    legacy global cache (local dev / owner device flow)."""
+    from the legacy global cache BY EMAIL on first read; if its email isn't in
+    the global it gets an EMPTY cache — a bot NEVER inherits the whole global
+    pile. Without bot_uid → the legacy global cache (local dev / owner device
+    flow)."""
     cache = msal.SerializableTokenCache()
     if bot_uid:
         bf = _bot_cache_file(bot_uid)
@@ -433,7 +434,14 @@ def _load_cache(bot_uid: str | None = None) -> msal.SerializableTokenCache:
             except Exception as e:
                 print(f"[cache] per-bot migrate failed for {bot_uid}: {e}")
                 cache = msal.SerializableTokenCache()
-        # 3. fall through to the legacy global cache so the bot still works
+        # A bot NEVER falls back to the shared global pile. When its own email
+        # isn't in the (frozen) global, that fallback returns EVERY other bot's
+        # identities, which the device-flow save then writes into this bot's
+        # file — the 2026-06 cross-bot pollution (Max's cache held Audrey /
+        # Edileen / i3d keys). Return its own migrated entries, or an empty
+        # cache; device flow / an existing per-bot file fills it with only this
+        # bot's own identity.
+        return cache
     if CACHE_FILE.exists():
         try:
             cache.deserialize(CACHE_FILE.read_text())

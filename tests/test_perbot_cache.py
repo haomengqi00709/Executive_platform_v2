@@ -49,6 +49,14 @@ def _rt(hid, secret):
     return {"home_account_id": hid, "secret": secret}
 
 
+def _accounts_in(cache):
+    try:
+        o = json.loads(cache.serialize())
+    except Exception:
+        return []
+    return [v.get("username") for v in o.get("Account", {}).values()]
+
+
 # ── concurrency-safe atomic write ────────────────────────────────────────────
 
 def test_atomic_write_no_corruption_under_concurrency(tmp_path):
@@ -173,3 +181,54 @@ def test_refresh_success_saves_to_perbot(monkeypatch):
 
     assert auth.get_valid_access_token("solobot") == "TOK"
     assert saved["bot_uid"] == "solobot"   # saved to the bot's own cache
+
+
+# ── _load_cache never hands a bot the whole global pile (Max-pollution fix) ──
+
+def test_load_cache_unknown_email_returns_empty_not_global_pile():
+    # THE 2026-06 Max regression: a bot whose own email isn't in the (frozen)
+    # global must get an EMPTY cache — NOT every other bot's identities. The old
+    # code fell through and returned the whole pile, which device flow then saved
+    # into the bot's file (5 identities incl. cross-tenant keys).
+    _session("newbot", "new@x.com")
+    _write_global({
+        "Account": {"a": _acct("audrey@x.com", "c3030.tenant"),
+                    "b": _acct("edileen@x.com", "12a0.tenant")},
+        "RefreshToken": {"r1": _rt("c3030.tenant", "RT_A"),
+                         "r2": _rt("12a0.tenant", "RT_E")},
+    })
+    cache = auth._load_cache("newbot")
+    assert _accounts_in(cache) == []                       # empty, not the pile
+    assert "audrey@x.com" not in cache.serialize()         # no foreign identities
+    assert not auth._bot_cache_file("newbot").exists()     # nothing spuriously written
+
+
+def test_load_cache_email_in_global_migrates_only_self():
+    _session("wb", "edileen@x.com")
+    _write_global({
+        "Account": {"a": _acct("edileen@x.com", "12a0.tenant"),
+                    "b": _acct("audrey@x.com", "c3030.tenant")},
+        "RefreshToken": {"r1": _rt("12a0.tenant", "RT_E"),
+                         "r2": _rt("c3030.tenant", "RT_A")},
+    })
+    cache = auth._load_cache("wb")
+    assert _accounts_in(cache) == ["edileen@x.com"]        # only self
+    assert "audrey@x.com" not in cache.serialize()
+    assert auth._bot_cache_file("wb").exists()             # migrated file written
+
+
+def test_load_cache_existing_perbot_file_ignores_global():
+    bf = auth._bot_cache_file("eb")
+    bf.parent.mkdir(parents=True, exist_ok=True)
+    bf.write_text(json.dumps({"Account": {"x": _acct("eb@x.com", "ebhid")}}))
+    _write_global({"Account": {"junk": _acct("audrey@x.com", "c3030.tenant")}})
+    cache = auth._load_cache("eb")
+    assert _accounts_in(cache) == ["eb@x.com"]             # its own file
+    assert "audrey@x.com" not in cache.serialize()         # global ignored
+
+
+def test_load_cache_owner_path_still_reads_global():
+    # The no-bot_uid path (local dev / owner device flow) MUST still use global.
+    _write_global({"Account": {"o": _acct("owner@x.com", "ohid")}})
+    cache = auth._load_cache()
+    assert _accounts_in(cache) == ["owner@x.com"]
