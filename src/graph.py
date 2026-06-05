@@ -8,18 +8,38 @@ BASE = "https://graph.microsoft.com/v1.0"
 
 
 def _fmt_inline(text: str) -> str:
-    """HTML-escape text, convert **bold** and [label](url) links."""
-    # Extract links before escaping to preserve URLs
-    links: list[tuple[str, str]] = _re.findall(r'\[([^\]]+)\]\((https?://[^\)]+)\)', text)
+    """HTML-escape text, convert **bold**, [label](url) markdown links,
+    and preserve pre-formed <a href="..."> HTML anchors.
+
+    Anchors and markdown links are extracted to placeholders BEFORE escape so
+    the URL and tag characters survive html.escape; placeholders are
+    substituted back with safe anchor HTML afterwards. Without this, callers
+    that emit raw `<a href='URL'>text</a>` (e.g. bot.py's "Open draft in
+    Outlook" footer) had the entire tag escaped to `&lt;a href=...&gt;` —
+    Teams rendered the literal escape sequences instead of a clickable link.
+    """
     placeholder_map: dict[str, str] = {}
-    for label, url in links:
-        placeholder = f"\x00LINK{len(placeholder_map)}\x00"
-        placeholder_map[placeholder] = f'<a href="{url}">{_html_mod.escape(label)}</a>'
-        text = text.replace(f"[{label}]({url})", placeholder, 1)
+
+    # 1. Markdown links: [label](url)
+    for label, url in _re.findall(r'\[([^\]]+)\]\((https?://[^\)]+)\)', text):
+        ph = f"\x00LINK{len(placeholder_map)}\x00"
+        placeholder_map[ph] = f'<a href="{url}">{_html_mod.escape(label)}</a>'
+        text = text.replace(f"[{label}]({url})", ph, 1)
+
+    # 2. Pre-formed HTML anchors: <a href='URL'>label</a> or <a href="URL">…</a>
+    #    The backreference (\1) on the closing quote keeps mixed-quote matches
+    #    from latching onto the wrong span. Only the simple form (no nested
+    #    HTML inside the label) is supported — that's all we emit anywhere.
+    for m in _re.finditer(r'''<a\s+href=(['"])([^'"]+)\1\s*>([^<]+)</a>''', text):
+        url, label = m.group(2), m.group(3)
+        ph = f"\x00LINK{len(placeholder_map)}\x00"
+        placeholder_map[ph] = f'<a href="{url}">{_html_mod.escape(label)}</a>'
+        text = text.replace(m.group(0), ph, 1)
+
     text = _html_mod.escape(text)
     text = _re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
-    for placeholder, anchor in placeholder_map.items():
-        text = text.replace(_html_mod.escape(placeholder), anchor)
+    for ph, anchor in placeholder_map.items():
+        text = text.replace(_html_mod.escape(ph), anchor)
     return text
 
 
