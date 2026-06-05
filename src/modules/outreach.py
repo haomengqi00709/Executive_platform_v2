@@ -27,7 +27,7 @@ except ImportError:
 
 from src.graph import GraphClient
 from src.ai import AIClient
-from src.modules.profile import load_profile_context
+from src.modules.profile import load_profile_context, get_user_signature, append_signature_to_body
 
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
@@ -222,22 +222,22 @@ def _extract_from_xlsx(file_bytes: bytes) -> list[dict]:
 
 def _generate_draft(ai: AIClient, contact: dict, context_note: str,
                     display_name: str, business_context: str,
-                    writing_style: str, signoff: str) -> dict | None:
+                    writing_style: str) -> dict | None:
     """Generate subject + body for one contact. Returns None on failure.
 
     business_context already includes the user's Personal Profile, Business Profile,
-    and Market Segments (merged by load_profile_context). Personal Profile is where
-    AI learns the user's name, title, and sign-off preference.
+    and Market Segments (merged by load_profile_context).
+
+    Body comes back WITHOUT a signature — caller appends via
+    profile.append_signature_to_body(body, get_user_signature(settings)).
+    Centralising the append means every draft (this outreach worker, the
+    bot's create_reply_draft, the dashboard's draft_generate) gets the
+    same signature treatment without each path duplicating logic.
     """
     bc_block = f"User profile (personal + business + market):\n{business_context.strip()}\n\n" if business_context.strip() else ""
     style_block = f"Writing style to match:\n{writing_style.strip()}\n\n" if writing_style.strip() else ""
     ctx_block = f"How the user knows this contact:\n{context_note.strip()}\n\n" if context_note.strip() else ""
     notes_block = f"Specific notes from past interaction with this contact:\n{contact.get('notes', '')}\n\n" if (contact.get('notes') or '').strip() else ""
-    signoff_block = (
-        f"\nSign-off: use this exact sign-off:\n{signoff}\n"
-        if signoff.strip()
-        else "\nSign-off: use the sign-off implied by the user's Personal Profile above; if none is specified, close with 'Best regards,' on its own line followed by the user's name from the profile.\n"
-    )
 
     prompt = f"""You are drafting a personal outreach email on behalf of {display_name}.
 
@@ -249,17 +249,19 @@ def _generate_draft(ai: AIClient, contact: dict, context_note: str,
 
 {notes_block}Write a personalized outreach email with these requirements:
 
-1. STRUCTURE — at least 3 short paragraphs:
+1. STRUCTURE — 2-3 short paragraphs:
    • Opening: greeting on its own line, then 1-2 sentences referencing the meeting context (or how you know them).
    • Middle: 1-2 sentences connecting their company/role/notes to what the user offers. If "notes from past interaction" exist, weave them in specifically — that's the most personal hook.
-   • Closing: 1 sentence with a clear next step (a call, a quick chat, a question), then the sign-off.
+   • Closing: 1 sentence with a clear next step (a call, a quick chat, a question).
 
-2. FORMAT — return the body as HTML. Each paragraph wrapped in <p>...</p>. Use <br> only inside a paragraph for the line break between sign-off and signature name. Do NOT use <div>, headers, lists, or styles.
+2. FORMAT — return the body as HTML. Each paragraph wrapped in <p>...</p>. Do NOT use <div>, headers, lists, or styles.
 
 3. TONE — warm but specific. Avoid generic phrases like "great to connect" without a follow-up specific. No marketing jargon.
 
-4. LENGTH — keep total body 60-120 words.
-{signoff_block}
+4. LENGTH — keep total body 60-100 words.
+
+5. DO NOT write a sign-off or signature — the user's real signature (extracted from their actual sent emails) is appended automatically. Anything you write at the end will look like a duplicate.
+
 Return JSON only: {{"subject": "...", "body": "<p>...</p><p>...</p><p>...</p>"}}"""
 
     try:
@@ -299,7 +301,11 @@ def run(graph: GraphClient, ai: AIClient, data_dir: Path, settings: dict,
     display_name     = settings.get("display_name", "the executive")
     business_context = load_profile_context(data_dir) if data_dir else ""
     writing_style    = settings.get("writing_style_note", "")
-    signoff          = settings.get("outreach_default_signoff", "")
+    # Resolved once for the whole run — same signature appended to every
+    # generated draft. Empty string for users who haven't completed
+    # signature extraction yet; append helper passes the body through
+    # unchanged in that case.
+    user_signature   = get_user_signature(settings)
 
     drafts_created = []
     contacts_skipped = []
@@ -319,12 +325,13 @@ def run(graph: GraphClient, ai: AIClient, data_dir: Path, settings: dict,
                 contacts_skipped.append({"reason": "no_email", "contact": contact})
                 continue
             draft = _generate_draft(ai, contact, context_note,
-                                    display_name, business_context, writing_style, signoff)
+                                    display_name, business_context, writing_style)
             if not draft:
                 contacts_skipped.append({"reason": "draft_gen_failed", "contact": contact})
                 continue
+            final_body = append_signature_to_body(draft["body"], user_signature)
             try:
-                gr = graph.create_draft(subject=draft["subject"], body=draft["body"], to=email)
+                gr = graph.create_draft(subject=draft["subject"], body=final_body, to=email)
                 drafts_created.append({
                     "to": email, "name": contact.get("name", ""),
                     "company": contact.get("company", ""),
@@ -423,16 +430,17 @@ def run(graph: GraphClient, ai: AIClient, data_dir: Path, settings: dict,
 
             draft = _generate_draft(
                 ai, contact, context_note,
-                display_name, business_context, writing_style, signoff,
+                display_name, business_context, writing_style,
             )
             if not draft:
                 contacts_skipped.append({"reason": "draft_gen_failed", "file": name, "contact": contact})
                 continue
 
+            final_body = append_signature_to_body(draft["body"], user_signature)
             try:
                 result = graph.create_draft(
                     subject=draft["subject"],
-                    body=draft["body"],
+                    body=final_body,
                     to=email,
                 )
                 drafts_created.append({

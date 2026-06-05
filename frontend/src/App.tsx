@@ -111,6 +111,15 @@ export default function App() {
       setBrandCompany((s?.company_name || '').toString().trim());
       setBrandDisplay((s?.display_name || '').toString().trim());
       setBrandBot((s?.bot_display_name || '').toString().trim() || 'Audrey');
+      // Lazy-fire signature extraction when the field is empty. Avoids
+      // forcing the user through a full Restart Onboarding just to populate
+      // settings.email_signature. Fire-and-forget — the response takes
+      // 3-5s and the user isn't blocked on it; next time they ask Audrey
+      // to draft an email the signature is already there.
+      if (!(s?.email_signature || '').toString().trim()) {
+        fetch('/api/profile/refresh-signature', { method: 'POST', credentials: 'include' })
+          .catch(() => {/* best-effort */});
+      }
     } catch {}
   }, []);
 

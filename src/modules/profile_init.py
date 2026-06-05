@@ -46,8 +46,22 @@ def _strip_html(html: str) -> str:
     return text.strip()
 
 
-def _collect_signatures(graph: GraphClient, log) -> list[str]:
-    """Pull recent sent emails, return the trailing ~600 chars of each body (where signatures live)."""
+def _collect_signature_samples(graph: GraphClient, log) -> dict:
+    """Pull recent sent emails ONCE and return both views the rest of the
+    module needs:
+
+      - "plain": trailing ~600 chars of stripped-text body (for language
+        detection, title-regex extraction, and the personal+segments AI
+        prompt which doesn't need to see HTML noise)
+
+      - "html":  trailing ~3000 chars of the raw HTML body (only for
+        signature extraction — the AI needs <a> and <img> tags intact so
+        the extracted signature is hyperlinked in saved drafts)
+
+    Returns {"plain": [], "html": []} if the Graph call fails; caller code
+    treats both lists as best-effort. Plain-text emails contribute to the
+    plain list only — there's no HTML to keep.
+    """
     try:
         raw = graph.get_messages(
             top=_SIGNATURE_SAMPLES,
@@ -56,18 +70,31 @@ def _collect_signatures(graph: GraphClient, log) -> list[str]:
         )
     except Exception as e:
         log(f"sent-email fetch failed: {e}")
-        return []
+        return {"plain": [], "html": []}
 
-    samples = []
+    plain: list[str] = []
+    html:  list[str] = []
     for msg in raw:
         body = msg.get("body") or {}
         content = body.get("content") or ""
-        if body.get("contentType", "").lower() == "html":
-            content = _strip_html(content)
-        content = content[:_MAX_BODY_CHARS].strip()
-        if content:
-            samples.append(content[-600:])
-    return samples
+        is_html = body.get("contentType", "").lower() == "html"
+        # Plain view — strip tags if needed, take last 600 chars
+        plain_content = _strip_html(content) if is_html else content
+        plain_content = plain_content[:_MAX_BODY_CHARS].strip()
+        if plain_content:
+            plain.append(plain_content[-600:])
+        # HTML view — only for HTML-content emails. More breathing room
+        # (3000) since tags + entities take up bytes.
+        if is_html and content.strip():
+            html.append(content[-3000:].strip())
+    return {"plain": plain, "html": html}
+
+
+def _collect_signatures(graph: GraphClient, log) -> list[str]:
+    """Back-compat alias used by downstream collectors (language detection,
+    title regex, the personal+segments prompt context). Returns the plain
+    text view only — callers needing HTML must use _collect_signature_samples."""
+    return _collect_signature_samples(graph, log)["plain"]
 
 
 def _collect_crm_titles(data_dir: Path) -> list[tuple[str, int]]:
@@ -179,6 +206,83 @@ def _collect_working_hours(graph: GraphClient, log) -> dict:
         "weekend_ratio_pct":    weekend_pct,
         "late_night_ratio_pct": late_pct,
     }
+
+
+def _extract_signature(html_samples: list[str], ai: AIClient, log) -> str:
+    """Identify the user's recurring email-signature block from the HTML
+    trailing portions of their recent sent emails. Returns the canonical
+    signature as HTML — preserves <a href="..."> links and <img src="https://...">
+    external images (logos hosted on a public URL). Strips CID-attached
+    images (<img src="cid:..."> Outlook's default inline-attachment pattern)
+    because those references point at attachments on the ORIGINAL email
+    and would render as broken icons in a new draft. Empty string when no
+    consistent signature emerges.
+
+    Single AI call — adds ~2-5s to onboarding. The HTML approach trades
+    slightly more model context for hyperlinks and logos in the saved
+    drafts, which is the whole reason users notice formatting in the
+    first place.
+    """
+    if not html_samples:
+        return ""
+    blocks = "\n\n===NEXT EMAIL HTML TAIL===\n\n".join(html_samples)
+    prompt = (
+        "Below are the trailing HTML portions of recent emails this person sent. "
+        "Find the SIGNATURE BLOCK — the sign-off line, name, title/company, and "
+        "contact info that recur at the END of most emails.\n\n"
+        "Output rules:\n"
+        "- Preserve <a href=\"...\">link</a> tags verbatim (LinkedIn, email, phone, etc.).\n"
+        "- Preserve <img src=\"https://...\"> or <img src=\"http://...\"> tags (external "
+        "logos hosted on a public URL).\n"
+        "- REMOVE <img src=\"cid:...\"> tags entirely — these reference inline "
+        "attachments on the ORIGINAL email and would show as broken icons in a "
+        "new draft.\n"
+        "- Use <br> for line breaks (not raw \\n). Wrap distinct paragraphs in <p>.\n"
+        "- Strip surrounding email-client wrappers (<html>, <body>, table layout, "
+        "quoted reply text from forwarded threads, mobile-app footers like "
+        "\"Sent from my iPhone\").\n"
+        "- If the signature varies between emails, return the most common one.\n"
+        "- If NO consistent signature exists, return EXACTLY the literal string "
+        "\"NONE\" — do not invent one.\n\n"
+        "Return JSON: {\"signature\": \"<the signature as HTML fragment>\"}\n\n"
+        "Email HTML tails:\n"
+        f"{blocks}"
+    )
+    try:
+        raw = ai.extract_json(prompt)
+        data = json.loads(raw)
+        sig = (data.get("signature") or "").strip()
+        if not sig or sig.upper() == "NONE":
+            return ""
+        # Belt-and-suspenders: even if AI ignored the rule, scrub CID <img>
+        # tags so they don't end up as broken icons in drafts.
+        sig = re.sub(r'<img\s+[^>]*src=["\']cid:[^"\']+["\'][^>]*>', '', sig, flags=re.IGNORECASE)
+        return sig.strip()
+    except Exception as e:
+        log(f"signature extraction failed: {e}")
+        return ""
+
+
+def _synthesize_signature(settings: dict, user_title: str) -> str:
+    """Last-resort signature when AI extraction returns empty (new account,
+    no sent history yet). Built entirely from data we already collected in
+    onboarding — no extra AI call."""
+    name    = (settings.get("display_name")  or "").strip()
+    company = (settings.get("company_name")  or "").strip()
+    email   = (settings.get("report_email")  or "").strip()
+    title   = (user_title or "").strip()
+    lines = ["Best,"]
+    if name:
+        lines.append(name)
+    if title and company:
+        lines.append(f"{title} at {company}")
+    elif title:
+        lines.append(title)
+    elif company:
+        lines.append(company)
+    if email:
+        lines.append(email)
+    return "\n".join(lines) if len(lines) > 1 else ""
 
 
 def _detect_languages(signatures: list[str]) -> list[str]:
@@ -629,7 +733,12 @@ def run_profile_init(
             var.clear() if hasattr(var, "clear") else None  # defensive
 
     # Collect inbox-derived signals once — used by phases 2 and 3.
-    signatures     = _collect_signatures(graph, log)
+    # Single Graph call returns both plain (for prompt context / language
+    # detection / title regex) and HTML (for signature extraction with
+    # hyperlinks + external images preserved).
+    sig_samples    = _collect_signature_samples(graph, log)
+    signatures     = sig_samples["plain"]
+    html_samples   = sig_samples["html"]
     crm_titles     = _collect_crm_titles(data_dir)
     project_topics = _collect_project_topics(data_dir)
     crm_companies  = _collect_crm_companies_by_status(data_dir)
@@ -643,6 +752,29 @@ def run_profile_init(
         f"languages={languages or 'undetected'}")
 
     user_title = _user_title_from_signatures(signatures)
+
+    # ─── Extract user's real email signature for draft sign-offs ──────────
+    # Microsoft Graph doesn't expose the Outlook-configured signature, so we
+    # mine it from recent sent emails (the same samples already collected
+    # above). Result persists to settings.email_signature; downstream draft
+    # paths (bot.py create_reply_draft, server.py draft_generate, outreach,
+    # m03_meeting follow-up) read via profile.get_user_signature().
+    log(f"Extracting email signature from {len(html_samples)} HTML sent emails...")
+    signature = _extract_signature(html_samples, ai, log)
+    if not signature:
+        signature = _synthesize_signature(settings, user_title)
+        log(f"AI couldn't find a consistent signature — synthesised one ({len(signature)} chars)")
+    else:
+        log(f"Extracted HTML signature ({len(signature)} chars)")
+    if signature:
+        settings["email_signature"] = signature  # in-memory for this run
+        settings_path = data_dir / "settings.json"
+        try:
+            on_disk = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+            on_disk["email_signature"] = signature
+            settings_path.write_text(json.dumps(on_disk, indent=2))
+        except Exception as e:
+            log(f"Failed to persist email_signature: {e}")
 
     # ─── Phase 1: business_profile v1 (silent) ────────────────────────────
     log("Phase 1: business_profile v1 (website-only)...")

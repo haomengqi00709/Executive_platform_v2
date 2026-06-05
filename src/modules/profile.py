@@ -126,6 +126,55 @@ def load_personal_profile(data_dir: Path) -> str:
     return _read_or_default(_personal_path(data_dir), _DEFAULT_PERSONAL_PROFILE)
 
 
+def get_user_signature(settings: dict) -> str:
+    """Resolve the user's email signature for AI-generated drafts.
+
+    Priority: settings.email_signature (set by profile_init from real sent
+    emails — typically HTML) > settings.outreach_default_signoff (legacy
+    plain-text key, set via PATCH /api/settings before auto-extract shipped)
+    > empty string.
+
+    Empty return means "no signature configured" — callers MUST skip the
+    sign-off append in that case rather than emitting a literal empty
+    block. Existing users who never re-ran onboarding return "" here and
+    keep the pre-signature behavior (AI writes its own sign-off).
+    """
+    sig = (settings.get("email_signature") or "").strip()
+    if sig:
+        return sig
+    return (settings.get("outreach_default_signoff") or "").strip()
+
+
+import re as _re
+
+
+def append_signature_to_body(body: str, signature: str) -> str:
+    """Concatenate body + signature, handling the HTML/plain-text mismatch
+    that crops up after profile_init learned to extract HTML signatures
+    (with <a> links and <img> logos) while AI-generated bodies are still
+    plain text.
+
+    Detection:
+      - Signature looks like HTML (contains a tag) → caller expects HTML
+        output. Convert the plain-text body to HTML paragraphs first, then
+        join with a paragraph break. graph.create_draft's _ensure_html will
+        recognise the result as already-HTML and pass through verbatim.
+      - Signature is plain text → simple newline join. _ensure_html will
+        wrap the whole thing into paragraphs as before.
+
+    Returns body unchanged when signature is empty (legacy users with no
+    extracted signature keep their existing draft format).
+    """
+    if not signature:
+        return body
+    if _re.search(r"</[a-zA-Z]|<br\s*/?>|<p[\s>]|<a\s+href|<img\s", signature):
+        # HTML signature — convert body to HTML so the mix renders correctly.
+        from src.graph import _ensure_html  # circular-safe: lazy import
+        body_html = _ensure_html(body)
+        return f"{body_html}<p>&nbsp;</p>{signature}"
+    return f"{body}\n\n{signature}"
+
+
 def save_personal_profile(data_dir: Path, text: str) -> None:
     path = _personal_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)

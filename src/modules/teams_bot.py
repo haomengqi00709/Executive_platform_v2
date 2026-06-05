@@ -323,7 +323,7 @@ def _handle_teams_receipt(msg: dict, chat_id: str, graph, ai,
     if doc_type == "business_card":
         from src.modules.crm import add_contacts_bulk
         from src.modules.outreach import _generate_draft
-        from src.modules.profile import load_profile_context
+        from src.modules.profile import load_profile_context, get_user_signature, append_signature_to_body
 
         raw_contacts = result.get("contacts") or []
         skipped_no_email = sum(1 for c in raw_contacts if not (c.get("email") or "").strip())
@@ -340,7 +340,7 @@ def _handle_teams_receipt(msg: dict, chat_id: str, graph, ai,
         display_name     = _settings.get("display_name", "the executive")
         business_context = load_profile_context(data_dir) if data_dir else ""
         writing_style    = _settings.get("writing_style_note", "")
-        signoff          = _settings.get("outreach_default_signoff", "")
+        user_signature   = get_user_signature(_settings)
         # Use any text the user sent alongside the photo as context
         body_text = _strip_html(msg.get("body", {}).get("content", "")).strip()
         context_note = body_text or "Following up from our recent meeting"
@@ -352,11 +352,12 @@ def _handle_teams_receipt(msg: dict, chat_id: str, graph, ai,
                 if bulk_result["by_email"].get(email) != "added":
                     continue  # already in CRM, don't re-draft
                 draft = _generate_draft(ai, c, context_note,
-                                        display_name, business_context, writing_style, signoff)
+                                        display_name, business_context, writing_style)
                 if not draft:
                     continue
+                final_body = append_signature_to_body(draft["body"], user_signature)
                 try:
-                    gr = owner_graph.create_draft(subject=draft["subject"], body=draft["body"], to=email)
+                    gr = owner_graph.create_draft(subject=draft["subject"], body=final_body, to=email)
                     web_link = gr.get("webLink", "")
                     draft_links[email] = web_link
                     # Persist link on the contact

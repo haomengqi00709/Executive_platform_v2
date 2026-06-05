@@ -7,6 +7,33 @@ from typing import Any
 BASE = "https://graph.microsoft.com/v1.0"
 
 
+def _ensure_html(body: str) -> str:
+    """Outlook expects draft bodies as HTML. Callers that hand-author HTML
+    (m03_meeting renders templates, server.py:draft_save calls _plain_to_html
+    upstream) keep their formatting; callers that pass AI-generated plain
+    text with `\\n` newlines (bot.py create_reply_draft, outreach worker,
+    teams_bot bulk-loader) used to get a single squashed paragraph in
+    Outlook because HTML drops raw newlines. This helper bridges both cases.
+
+    Detection: any tag-like sequence (`<tag>` or `</tag>`) signals pre-formed
+    HTML and bypasses conversion. Otherwise treat as plain text — escape,
+    split on blank lines into paragraphs, single newlines inside a paragraph
+    become `<br>`.
+    """
+    if not body:
+        return body
+    # Heuristic — require a CLOSING tag (`</…>`), a self-closing `<br>`/`<hr>`,
+    # or a known structural opening (`<p>`, `<div>`, `<html>`). The naive
+    # check `<[a-zA-Z]` mis-fires on plain-text angle brackets like an AI
+    # writing "send to <client@x.com>" or "if x < 5 then…", which were
+    # silently passed through as HTML and dropped before the rest of the body.
+    if _re.search(r"</[a-zA-Z]|<br\s*/?>|<p[\s>]|<div[\s>]|<html[\s>]", body):
+        return body
+    escaped = _html_mod.escape(body)
+    paras = [p for p in escaped.split("\n\n") if p.strip()]
+    return "".join(f"<p>{p.replace(chr(10), '<br>')}</p>" for p in paras)
+
+
 def _fmt_inline(text: str) -> str:
     """HTML-escape text, convert **bold**, [label](url) markdown links,
     and preserve pre-formed <a href="..."> HTML anchors.
@@ -459,14 +486,17 @@ class GraphClient:
         )
 
     def create_draft(self, subject: str, body: str, to, mailbox: str = None) -> dict:
-        """to can be a single email string or a list of email strings."""
+        """Save a draft in the user's Drafts folder. `to` can be a single
+        email string or a list. `body` may be HTML or plain text — plain
+        text is auto-wrapped into paragraphs (see _ensure_html); pre-formed
+        HTML is forwarded unchanged."""
         base = f"/users/{mailbox}" if mailbox else "/me"
         if isinstance(to, str):
             to = [to]
         recipients = [{"emailAddress": {"address": e}} for e in to if e]
         return self.post(f"{base}/messages", {
             "subject": subject,
-            "body": {"contentType": "HTML", "content": body},
+            "body": {"contentType": "HTML", "content": _ensure_html(body)},
             "toRecipients": recipients,
         })
 

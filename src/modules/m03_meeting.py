@@ -725,7 +725,9 @@ Return only a JSON array of email addresses to include. Example: ["a@x.com", "b@
 
 # ── Follow-up draft + To-Do ───────────────────────────────
 
-def _generate_followup_draft(record: dict) -> str:
+def _generate_followup_draft(record: dict, settings: dict | None = None) -> str:
+    from src.modules.profile import get_user_signature
+
     title   = record.get("title", "our meeting")
     date    = record.get("date", "")
     summary = record.get("summary", "")
@@ -742,7 +744,11 @@ def _generate_followup_draft(record: dict) -> str:
                 lines.append(f"• {owner + ': ' if owner else ''}{task}{due}")
             else:
                 lines.append(f"• {a}")
-    lines += ["", "Best regards"]
+    # Sign off with the user's real signature when available. Falls back to
+    # the original generic "Best regards" for legacy accounts that haven't
+    # re-run onboarding (no email_signature yet) — keeps existing behavior.
+    sig = get_user_signature(settings or {})
+    lines += ["", sig or "Best regards"]
     return "\n".join(lines)
 
 
@@ -980,7 +986,7 @@ def run(
             _align_crm(attendee_emails, record["date"], meeting_id, data_dir)
             _align_projects(project_id, record["date"], meeting_id, data_dir)
 
-            draft_body = _generate_followup_draft(record)
+            draft_body = _generate_followup_draft(record, _s)
             record["followup_draft"] = draft_body
             saved, draft_link = 0, None
             if draft_body and external:
@@ -1125,7 +1131,7 @@ def run(
             _align_crm(attendee_emails, record["date"], meeting_id, data_dir)
             _align_projects(project_id, record["date"], meeting_id, data_dir)
 
-            draft_body = _generate_followup_draft(record)
+            draft_body = _generate_followup_draft(record, _s)
             record["followup_draft"] = draft_body
             saved, draft_link = 0, None
             if draft_body:

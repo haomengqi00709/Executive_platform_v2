@@ -16,7 +16,7 @@ from google.genai import types
 
 from src.ai import DEFAULT_GEMINI_MODEL
 from src.modules.db_helpers import open_sqlite
-from src.modules.profile import load_profile_context
+from src.modules.profile import load_profile_context, get_user_signature, append_signature_to_body
 from src.modules.subject_match import normalize_subject
 from src.modules.wiki import load_index, load_meeting
 
@@ -696,14 +696,17 @@ def reply(
         Call this when the user asks to draft, write, or compose an email reply.
         to: recipient email address
         subject: email subject line (prefix 'Re: ' for replies)
-        body: full plain-text email body in the user's writing style
+        body: email body in the user's writing style — do NOT write a sign-off.
+              A signature (user's real one, extracted from sent history) is
+              appended automatically; writing your own creates a double sign-off.
         IMPORTANT: after this tool succeeds, respond with ONE short sentence only —
         e.g. 'Done, draft saved to your Outlook Drafts.' Do NOT repeat To/Subject/Body.
         Do NOT generate any links or URLs yourself — a link is appended automatically."""
         if owner_graph is None:
             return "Owner account not available."
         try:
-            result = owner_graph.create_draft(to=to, subject=subject, body=body)
+            final_body = append_signature_to_body(body, get_user_signature(settings))
+            result = owner_graph.create_draft(to=to, subject=subject, body=final_body)
             web_link = result.get("webLink", "")
             print(f"[Bot] create_reply_draft saved → '{subject}'")
             if web_link:
@@ -747,10 +750,11 @@ def reply(
         if owner_graph is None:
             return "Owner account not available."
         try:
+            final_body = append_signature_to_body(draft.get("body", ""), get_user_signature(settings))
             result = owner_graph.create_draft(
                 to      = draft.get("to", ""),
                 subject = draft.get("subject", ""),
-                body    = draft.get("body", ""),
+                body    = final_body,
             )
             queue      = list(state.get("pending_queue") or [])
             next_draft = queue[0] if queue else None

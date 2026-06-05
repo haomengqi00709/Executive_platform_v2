@@ -3057,7 +3057,7 @@ def draft_generate(body: dict, session: dict = Depends(require_session)):
         To = original recipient. Tone: polite nudge.
     Both pull the original message via Graph and fuse with profile + writing-
     style + per-item AI hints. Returns plain-text body."""
-    from src.modules.profile import load_profile_context
+    from src.modules.profile import load_profile_context, get_user_signature, append_signature_to_body
     uid     = session["user_id"]
     payload = body or {}
     email_id = (payload.get("email_id") or "").strip()
@@ -3098,8 +3098,9 @@ def draft_generate(body: dict, session: dict = Depends(require_session)):
             f"Suggested opening: {opening or '(none)'}\n\n"
             "Write the COMPLETE reply body. Plain text only — no markdown, no "
             "subject line, no extra commentary. Address the specific question(s) "
-            "in the original email. Do not invent facts not present above. End "
-            "with a natural sign-off."
+            "in the original email. Do not invent facts not present above. Do "
+            "NOT write a sign-off — the user's real signature is appended "
+            "automatically after this body."
         )
     else:  # followup
         instr_path = _udir(uid) / "instructions" / "followup_needed.md"
@@ -3125,7 +3126,8 @@ def draft_generate(body: dict, session: dict = Depends(require_session)):
             "- Make it easy for them to respond — ask a specific question or "
             "offer to help unblock them.\n"
             "- Tone: friendly but professional. Never aggressive or guilt-tripping.\n"
-            "- Plain text only, no markdown, no subject line. End with a sign-off."
+            "- Plain text only, no markdown, no subject line. Do NOT write a sign-off — "
+            "the user's real signature is appended automatically."
         )
 
     if not to_addr or "@" not in to_addr:
@@ -3140,6 +3142,12 @@ def draft_generate(body: dict, session: dict = Depends(require_session)):
     except Exception as e:
         raise HTTPException(500, f"AI generation failed: {e}")
     body_text = body_text.strip('"').strip("'").strip()
+
+    # Append the user's real signature (extracted from sent emails during
+    # onboarding). Empty string for legacy users → body unchanged. Helper
+    # handles HTML-vs-plain detection so an HTML signature with links and
+    # external logos doesn't break the plain-text body format.
+    body_text = append_signature_to_body(body_text, get_user_signature(settings))
 
     return {
         "subject": reply_subject,
@@ -3681,6 +3689,56 @@ def confirm_profile(session: dict = Depends(require_session)):
     from src.modules.profile import save_init_status
     save_init_status(_udir(session["user_id"]), "user_confirmed")
     return {"ok": True}
+
+
+@app.post("/api/profile/refresh-signature")
+def refresh_signature(session: dict = Depends(require_session)):
+    """Run ONLY the signature-extraction step from profile_init — pull the
+    user's recent sent emails, AI-extract the recurring HTML signature
+    block, persist to settings.email_signature.
+
+    This is the same logic run_profile_init does inline, lifted out so the
+    frontend can trigger it lazily (on first app load when the field is
+    missing) without forcing the user through a full Restart Onboarding
+    (which re-scans 12 months of inbox, rebuilds CRM, etc.). Fast: one
+    Graph fetch + one AI call, typically 3-5 seconds total.
+
+    Returns the resolved signature (helpful for the caller to confirm it
+    wrote something usable). Synthesises a fallback from existing
+    settings (display_name + title + company + email) when AI can't find
+    a consistent block — so a brand-new account with no sent history still
+    gets a usable signature."""
+    from src.modules.profile_init import (
+        _collect_signature_samples, _extract_signature,
+        _synthesize_signature, _user_title_from_signatures,
+    )
+
+    uid      = session["user_id"]
+    token    = auth.get_valid_access_token(uid)
+    graph    = GraphClient(token)
+    ai       = AIClient()
+    settings = _read_json(_user_settings(uid))
+
+    samples = _collect_signature_samples(graph, log=lambda m: print(f"[RefreshSig] {m}"))
+    html_samples  = samples.get("html", [])
+    plain_samples = samples.get("plain", [])
+    user_title    = _user_title_from_signatures(plain_samples)
+    signature     = _extract_signature(html_samples, ai, log=lambda m: print(f"[RefreshSig] {m}"))
+    fallback      = False
+    if not signature:
+        signature = _synthesize_signature(settings, user_title)
+        fallback  = True
+
+    if signature:
+        settings["email_signature"] = signature
+        _write_json(_user_settings(uid), settings)
+        print(f"[RefreshSig] {uid}: stored {'synthesised' if fallback else 'extracted'} "
+              f"signature ({len(signature)} chars)")
+    return {
+        "signature": signature,
+        "source":    "fallback" if fallback else "extracted",
+        "html":      "<" in signature,
+    }
 
 
 @app.post("/api/init/start")
