@@ -185,10 +185,33 @@ def run(
     )
     context_block = f"Business context: {business_context}\n\n" if business_context else ""
 
-    search_prompt = f"""You are a market intelligence analyst. Today is {date_str}.
+    # Split the broad market search into focused topic batches. One big
+    # open-ended grounding search blows the 60s Gemini timeout (the 2026-06
+    # regression after the shared timeout was tightened to prevent hangs
+    # elsewhere); company_intelligence never hit this because it searches in
+    # small per-company batches. Mirror that here: each topic is a narrower
+    # search that returns within 60s, and a per-topic try/except means one slow
+    # topic can't wipe out the whole section.
+    topics = [
+        ("regulatory & macro",
+         "regulatory or policy changes affecting the industry, plus macroeconomic "
+         "signals (supply chain, commodity prices, workforce trends, trade policy)"),
+        ("funding & M&A",
+         "funding rounds, M&A activity, and capital movement in relevant sectors"),
+        ("technology & competitive",
+         "technology / AI shifts with competitive implications, competitor moves, "
+         "new market entrants, pricing changes, and strategic pivots"),
+    ]
+
+    all_raw_items: list[dict] = []
+    ok_batches = 0
+    for idx, (topic_label, topic_focus) in enumerate(topics, 1):
+        _p(f"Searching topic {idx}/{len(topics)}: {topic_label}")
+        search_prompt = f"""You are a market intelligence analyst. Today is {date_str}.
 {context_block}{skill_filled}
 
-Search Google for current market signals. Return ONLY a JSON array — no markdown, no preamble. Example:
+Search Google (last 14 days) for current market signals, focused ONLY on: {topic_focus}.
+Return the 3-5 most relevant items as a JSON array — no markdown, no preamble. Example:
 [
   {{
     "headline": "Alberta announces $2B infrastructure tender for highway expansion",
@@ -201,20 +224,28 @@ Search Google for current market signals. Return ONLY a JSON array — no markdo
     "priority": "high"
   }}
 ]"""
+        try:
+            raw = ai.generate_with_search(search_prompt)
+            batch_items = _parse_raw(raw, ai)
+            all_raw_items.extend(batch_items)
+            ok_batches += 1
+            _p(f"  → {len(batch_items)} items from '{topic_label}'")
+        except Exception as e:
+            _p(f"  → topic '{topic_label}' failed: {e}")
 
-    _p("Searching for market intelligence signals...")
-    try:
-        raw = ai.generate_with_search(search_prompt)
-    except Exception as e:
-        _p(f"Search failed: {e}")
+    # Hard error only if EVERY topic failed — partial results are fine (mirrors
+    # company_intelligence, which keeps whatever batches succeeded).
+    if ok_batches == 0:
+        _p("All topic searches failed")
         return {
-            "id": _RESULT_ID, "status": "error", "error": str(e),
+            "id": _RESULT_ID, "status": "error",
+            "error": "all market-intelligence topic searches failed (timeout/grounding)",
             "items": [], "count": 0, "empty": True,
             "last_run": datetime.now(timezone.utc).isoformat(),
         }
 
     _p("Parsing results...")
-    items = _normalise(_parse_raw(raw, ai))
+    items = _normalise(all_raw_items)
     items = _resolve_urls(items, _p)
 
     if not items:
