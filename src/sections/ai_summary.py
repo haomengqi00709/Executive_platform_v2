@@ -145,7 +145,14 @@ def _recency(iso: str | None) -> float:
 
 def _format_atom(sid: str, idx: int, item: dict) -> str:
     if sid == "meetings_today":
-        time = item.get("time") or item.get("start") or ""
+        # `start_time` is the user-local "HH:MM" computed by meetings_today's
+        # _build_item via format_local_time(); `start` is the raw UTC ISO.
+        # The skill prompt already tells the AI to order by start_time, but
+        # falling through to `start` here fed it UTC strings (so a 10:30 ET
+        # meeting surfaced as "14:30" in the agenda). Prefer the formatted
+        # local field first; legacy "time" / raw `start` are last-resort
+        # fallbacks for cached items predating the start_time field.
+        time = item.get("start_time") or item.get("time") or item.get("start") or ""
         return f"  [{idx}] {time} — {item.get('subject') or item.get('title') or '(no title)'}"
     if sid == "reply_needed":
         pri = item.get("priority", "medium")
