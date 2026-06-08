@@ -1689,9 +1689,9 @@ def _format_section_for_teams(result: dict, tz: "ZoneInfo | None" = None) -> str
     if section_id == "business_insights":
         narrative = result.get("narrative") or ""
         items = result.get("items", [])
-        week_of = result.get("week_of", "")
+        period_label = result.get("period_label") or result.get("week_of", "")
         if not narrative and not items:
-            return f"📊 **Weekly Brief** — quiet week, nothing notable to report." + (f" (week of {week_of})" if week_of else "")
+            return "📊 **Weekly Brief** — quiet week, nothing notable to report." + (f" ({period_label})" if period_label else "")
         cat_tag = {
             "pipeline":   "🟢 Pipeline",
             "engagement": "🟡 Engagement",
@@ -1699,25 +1699,35 @@ def _format_section_for_teams(result: dict, tz: "ZoneInfo | None" = None) -> str
             "intel":      "📡 Intel",
         }
         pri_tag = {"high": "🔴", "medium": "🟡", "low": "🟢"}
-        header = f"**Weekly Brief** — week of {week_of}" if week_of else "**Weekly Brief**"
+        header = f"📊 **Weekly Brief** · {period_label}" if period_label else "📊 **Weekly Brief**"
         lines = [header]
         if narrative:
             lines.append("")
             lines.append(narrative)
-        if items:
+
+        # Group headlines by timeframe: last week (retrospective) / now (current
+        # backlog) / coming up (next 7 days). Old results without a timeframe
+        # field fall back to "now".
+        def _fmt_headline(it):
+            cat = cat_tag.get(it.get("category", ""), it.get("category", "").title())
+            pri = pri_tag.get(it.get("priority", ""), "")
+            out = [f"{pri} {cat} — **{it.get('title', '')}**"]
+            detail = (it.get("detail") or "")[:240]
+            if detail:
+                out.append(detail)
+            return out
+
+        for tf, label in (("past", "📋 Last week"),
+                          ("now", "📌 Now"),
+                          ("ahead", "📅 Coming up (next 7 days)")):
+            group = [it for it in items if (it.get("timeframe") or "now") == tf]
+            if not group:
+                continue
             lines.append("")
-            lines.append(f"**Headlines ({len(items)})**")
-            for it in items[:8]:
-                cat = cat_tag.get(it.get("category", ""), it.get("category", "").title())
-                pri = pri_tag.get(it.get("priority", ""), "")
-                title = it.get("title", "")
-                detail = (it.get("detail") or "")[:240]
+            lines.append(f"**{label}**")
+            for it in group[:8]:
                 lines.append("")
-                lines.append(f"{pri} {cat} — **{title}**")
-                if detail:
-                    lines.append(detail)
-            if len(items) > 8:
-                lines.append(f"\n+{len(items) - 8} more")
+                lines.extend(_fmt_headline(it))
         # Deltas snippet
         deltas = (result.get("stats") or {}).get("deltas") or {}
         notable_deltas = [

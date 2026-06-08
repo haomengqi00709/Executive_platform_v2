@@ -23,6 +23,7 @@ from pathlib import Path
 from src.ai import AIClient
 from src.graph import GraphClient
 from src.modules.profile import load_profile_context
+from src.modules.tz import now_local
 
 _SKILLS_DIR = Path(__file__).parent.parent / "skills" / "business_insights"
 _RESULT_ID = "business_insights"
@@ -90,10 +91,47 @@ def _read_json(path: Path) -> dict:
         return {}
 
 
-def _week_of(today: date) -> str:
-    """Sunday-anchored week label (YYYY-MM-DD of the most recent Sunday)."""
-    sunday = today - timedelta(days=(today.weekday() + 1) % 7)
-    return sunday.isoformat()
+def _last_complete_week(data_dir: Path) -> tuple[date, date]:
+    """(Monday, Sunday) of the most recently COMPLETED week, in the user's
+    timezone. period_end = the most recent Sunday STRICTLY before today;
+    period_start = that Monday. Run Monday morning → the week that just ended
+    (e.g. run Mon Jun 8 → Jun 1–7). A mid-week run still returns the last fully
+    ended week, so the report is never a half-finished current week."""
+    today = now_local(data_dir).date()
+    period_end = today - timedelta(days=today.weekday() + 1)   # last Sunday < today
+    period_start = period_end - timedelta(days=6)              # that Monday
+    return period_start, period_end
+
+
+def _period_label(start: date, end: date) -> str:
+    if start.year == end.year:
+        return f"{start:%b %-d} – {end:%b %-d, %Y}"
+    return f"{start:%b %-d, %Y} – {end:%b %-d, %Y}"
+
+
+def _filter_by_period(items: list, start: date, end: date, date_field: str) -> list:
+    """Items whose date_field (YYYY-MM-DD or ISO datetime) is in [start, end]."""
+    s, e = start.isoformat(), end.isoformat()
+    return [it for it in (items or []) if s <= (it.get(date_field) or "")[:10] <= e]
+
+
+def _meetings_in_period(sources: dict, start: date, end: date) -> list[dict]:
+    """Meetings held in [start, end]. Prefer the recent_meetings result; if it's
+    missing/empty (its cache file is intermittently not regenerated), derive the
+    distinct meetings from meeting_action_items — both are views of the SAME wiki
+    meeting DB, so this is not a cross-source fallback."""
+    rm = _filter_by_period(sources.get("recent_meetings", {}).get("items", []), start, end, "date")
+    if rm:
+        return rm
+    seen, derived = set(), []
+    for it in _filter_by_period(sources.get("meeting_action_items", {}).get("items", []),
+                                start, end, "meeting_date"):
+        key = it.get("meeting_id") or (it.get("meeting_title"), it.get("meeting_date"))
+        if key in seen:
+            continue
+        seen.add(key)
+        derived.append({"title": it.get("meeting_title") or "", "date": it.get("meeting_date") or ""})
+    return derived
 
 
 def _count_open_commitments(commitments_extract: dict) -> int:
@@ -151,21 +189,21 @@ def _projects_stats(projects_data: dict) -> dict:
     return out
 
 
-def _new_crm_this_week(crm: dict, today: date) -> int:
-    """Contacts whose updated_at is within last 7 days AND status is client/prospect/partner."""
-    cutoff = (today - timedelta(days=7)).isoformat()
+def _new_crm_in_period(crm: dict, start: date, end: date) -> int:
+    """Contacts updated within [start, end] AND status client/prospect/partner/investor."""
+    s, e = start.isoformat(), end.isoformat()
     n = 0
     for c in crm.get("contacts", {}).values():
         if c.get("ignore") or c.get("archived"):
             continue
         if c.get("status") not in ("client", "prospect", "partner", "investor"):
             continue
-        if (c.get("updated_at") or "") >= cutoff:
+        if s <= (c.get("updated_at") or "")[:10] <= e:
             n += 1
     return n
 
 
-def _compute_this_week_stats(data_dir: Path, today: date) -> dict:
+def _compute_this_week_stats(data_dir: Path, period_start: date, period_end: date, today: date) -> dict:
     sources = {sid: _read_section(data_dir, sid) for sid in _SOURCE_SECTIONS}
     crm = _read_json(data_dir / "crm.json")
     projects = _read_json(data_dir / "projects.json")
@@ -177,18 +215,25 @@ def _compute_this_week_stats(data_dir: Path, today: date) -> dict:
     market_items = sources["market_intelligence"].get("items", [])
     company_items = sources["company_intelligence"].get("items", [])
 
+    # Retrospective metrics — filtered to the report's week [period_start,
+    # period_end], NOT each source's own 14/21-day window. This is the fix for
+    # "the weekly report shows last week's meetings": meetings/action items/
+    # expenses/new contacts now match the labeled week exactly.
+    meetings_period = _meetings_in_period(sources, period_start, period_end)
+    actions_period  = _filter_by_period(sources["meeting_action_items"].get("items", []),
+                                        period_start, period_end, "meeting_date")
+    expenses_period = _filter_by_period(sources["expenses"].get("items", []),
+                                        period_start, period_end, "date")
+
     return {
+        # ── current state (point-in-time backlog / snapshot, NOT week-filtered) ──
         "emails_reply_needed":      sources["reply_needed"].get("count", 0),
         "emails_followup_needed":   sources["followup_needed"].get("count", 0),
         "commitments_open":         _count_open_commitments(sources["commitments_extract"]),
-        "commitments_due_this_week": _count_due_this_week(sources["upcoming_commitments"], today),
         "relationships_at_risk":    _count_health(rh, "at_risk"),
         "relationships_cooling":    _count_health(rh, "cooling"),
         "relationships_stalled":    _count_health(rh, "stalled"),
         "relationships_new":        _count_health(rh, "new"),
-        "meetings_recent":          sources["recent_meetings"].get("count", 0),
-        "action_items_open":        sources["meeting_action_items"].get("count", 0),
-        "expenses_captured":        sources["expenses"].get("count", 0),
         "market_signals":           len(market_items),
         "market_signals_high":      _count_priority(market_items, "high"),
         "company_signals":          len(company_items),
@@ -196,11 +241,17 @@ def _compute_this_week_stats(data_dir: Path, today: date) -> dict:
         "crm_clients":              crm_counts.get("client", 0),
         "crm_prospects":            crm_counts.get("prospect", 0),
         "crm_partners":             crm_counts.get("partner", 0),
-        "crm_new_this_week":        _new_crm_this_week(crm, today),
         "projects_ongoing":         proj_counts.get("ongoing", 0),
         "projects_needs_attention": proj_counts.get("needs_attention", 0),
         "projects_paused":          proj_counts.get("paused", 0),
         "projects_early_stage":     proj_counts.get("early_stage", 0),
+        # ── last week (retrospective, filtered to [period_start, period_end]) ──
+        "meetings_recent":          len(meetings_period),
+        "action_items_open":        len(actions_period),
+        "expenses_captured":        len(expenses_period),
+        "crm_new_this_week":        _new_crm_in_period(crm, period_start, period_end),
+        # ── week ahead (forward 7 days from today) ──
+        "commitments_due_this_week": _count_due_this_week(sources["upcoming_commitments"], today),
     }
 
 
@@ -243,13 +294,18 @@ def _build_headlines(
     stats: dict,
     deltas: dict,
     sources: dict,
+    period_start: date,
+    period_end: date,
 ) -> list[dict]:
-    """Rule-driven: returns 3-7 structured headlines. No AI."""
+    """Rule-driven: returns 3-7 structured headlines. No AI. Each is tagged with
+    a `timeframe`: 'past' (last week's activity), 'now' (current backlog/state),
+    or 'ahead' (next 7 days) — the formatter groups by these."""
     headlines: list[dict] = []
 
-    def add(category: str, title: str, detail: str, priority: str, evidence: list[str]):
+    def add(category, title, detail, priority, evidence, timeframe="now"):
         headlines.append({
             "category": category,
+            "timeframe": timeframe,
             "title": title,
             "detail": detail,
             "priority": priority,
@@ -260,30 +316,31 @@ def _build_headlines(
     rh_items = sources.get("relationship_health", {}).get("items", [])
     rep_items = sources.get("reply_needed", {}).get("items", [])
     fup_items = sources.get("followup_needed", {}).get("items", [])
-    com_items = sources.get("commitments_extract", {}).get("items", [])
     up_items = sources.get("upcoming_commitments", {}).get("items", [])
     mk_items = sources.get("market_intelligence", {}).get("items", [])
     co_items = sources.get("company_intelligence", {}).get("items", [])
-    rm_items = sources.get("recent_meetings", {}).get("items", [])
-    mai_items = sources.get("meeting_action_items", {}).get("items", [])
-    exp_items = sources.get("expenses", {}).get("items", [])
+    rm_items = _meetings_in_period(sources, period_start, period_end)
+    exp_items = _filter_by_period(sources.get("expenses", {}).get("items", []),
+                                  period_start, period_end, "date")
 
     # ── pipeline ────────────────────────────────────────────
     if stats.get("crm_new_this_week", 0) > 0:
         add("pipeline",
-            f"{stats['crm_new_this_week']} new contact(s) added this week",
-            "New client / prospect / partner contacts in CRM during the last 7 days.",
+            f"{stats['crm_new_this_week']} new contact(s) added",
+            "New client / prospect / partner contacts in CRM during the week.",
             "medium",
-            ["crm.json"])
+            ["crm.json"],
+            "past")
 
     if stats.get("crm_prospects", 0) > 0:
         add("pipeline",
             f"{stats['crm_prospects']} active prospect(s) in CRM",
             f"Across {stats.get('crm_clients', 0)} clients and {stats.get('crm_partners', 0)} partners.",
             "low",
-            ["crm.json"])
+            ["crm.json"],
+            "now")
 
-    # ── engagement ──────────────────────────────────────────
+    # ── engagement (current backlog / relationship state) ───
     at_risk = [it for it in rh_items if it.get("health") == "at_risk"]
     if at_risk:
         top = at_risk[0]
@@ -292,7 +349,8 @@ def _build_headlines(
             f"{len(at_risk)} client relationship(s) at risk",
             detail,
             "high",
-            ["relationship_health"])
+            ["relationship_health"],
+            "now")
 
     cooling = [it for it in rh_items if it.get("health") == "cooling"]
     if cooling:
@@ -315,7 +373,8 @@ def _build_headlines(
             f"{len(cooling)} contact(s) cooling{trend}",
             f"Top: {first_names}." if first_names else "",
             "medium",
-            ["relationship_health"])
+            ["relationship_health"],
+            "now")
 
     if rep_items:
         top = rep_items[0]
@@ -323,16 +382,18 @@ def _build_headlines(
             f"{len(rep_items)} email(s) awaiting your reply",
             f"Top: \"{(top.get('subject') or '')[:80]}\" from {top.get('from_name') or top.get('from_email') or '—'}.",
             "high" if any(it.get("priority") == "high" for it in rep_items) else "medium",
-            ["reply_needed"])
+            ["reply_needed"],
+            "now")
 
     if fup_items:
         add("engagement",
             f"{len(fup_items)} email(s) you sent without a reply",
             f"Top: \"{(fup_items[0].get('subject') or '')[:80]}\" to {fup_items[0].get('to_name') or fup_items[0].get('to_email') or '—'}.",
             "medium",
-            ["followup_needed"])
+            ["followup_needed"],
+            "now")
 
-    # ── execution ───────────────────────────────────────────
+    # ── week ahead (next 7 days) ─────────────────────────────
     due_soon = stats.get("commitments_due_this_week", 0)
     if due_soon > 0:
         sample_titles = [
@@ -344,29 +405,33 @@ def _build_headlines(
             f"{due_soon} commitment(s) due in the next 7 days",
             sample_block or "See upcoming_commitments for details.",
             "high",
-            ["upcoming_commitments"])
+            ["upcoming_commitments"],
+            "ahead")
 
+    # ── last week's execution (meetings / expenses) ──────────
     if stats.get("meetings_recent", 0) > 0:
         ai_count = stats.get("action_items_open", 0)
         recent_subjects = [
             (m.get("subject") or m.get("title") or "")[:60]
-            for m in rm_items[:2]
+            for m in rm_items[:3]
         ]
         recent_block = "; ".join(s for s in recent_subjects if s)
         add("execution",
-            f"{stats['meetings_recent']} meeting(s) recently captured — {ai_count} action item(s) extracted",
+            f"{stats['meetings_recent']} meeting(s) this week — {ai_count} action item(s)",
             recent_block or "See recent_meetings for details.",
             "low",
-            ["recent_meetings", "meeting_action_items"])
+            ["recent_meetings", "meeting_action_items"],
+            "past")
 
     if stats.get("expenses_captured", 0) > 0:
         add("execution",
-            f"{stats['expenses_captured']} receipt(s) captured this run",
+            f"{stats['expenses_captured']} receipt(s) captured",
             f"Latest: {(exp_items[0].get('vendor') or '?') if exp_items else '?'}.",
             "low",
-            ["expenses"])
+            ["expenses"],
+            "past")
 
-    # ── intel ───────────────────────────────────────────────
+    # ── intel (current signals) ─────────────────────────────
     if stats.get("company_signals_high", 0) > 0:
         top = next((it for it in co_items if it.get("priority") == "high"), None)
         if top:
@@ -374,7 +439,8 @@ def _build_headlines(
                 f"{stats['company_signals_high']} high-priority company signal(s)",
                 f"Top: {top.get('company', '')} — {(top.get('headline') or '')[:160]}",
                 "high",
-                ["company_intelligence"])
+                ["company_intelligence"],
+                "now")
 
     if stats.get("market_signals_high", 0) > 0:
         top = next((it for it in mk_items if it.get("priority") == "high"), None)
@@ -383,7 +449,8 @@ def _build_headlines(
                 f"{stats['market_signals_high']} high-priority market signal(s)",
                 f"Top: {(top.get('headline') or '')[:160]}",
                 "high",
-                ["market_intelligence"])
+                ["market_intelligence"],
+                "now")
 
     headlines.sort(key=lambda h: _PRIORITY_RANK.get(h["priority"], 9))
 
@@ -446,7 +513,8 @@ def _generate_narrative(
 
     prompt = (
         f"You are writing a 3-5 sentence weekly executive brief for {display_name}.\n"
-        f"Today is {date_str}. This covers the week of {week_of}.\n\n"
+        f"Today is {date_str}. This is a retrospective of the week of {week_of} that\n"
+        f"just ended (what happened last week), plus a short note on what's coming up.\n\n"
         f"{context_block}{skill_filled}\n\n"
         f"--- USER INSTRUCTION ---\n{user_instruction}\n--- END ---\n\n"
         f"{summary}\n\n"
@@ -485,18 +553,20 @@ def run(
 
     display_name = settings.get("display_name") or "the executive"
     business_context = load_profile_context(data_dir)
-    today = date.today()
-    week_of = _week_of(today)
-    date_str = datetime.now().strftime("%A, %B %d, %Y")
+    today = now_local(data_dir).date()
+    period_start, period_end = _last_complete_week(data_dir)
+    period_label = _period_label(period_start, period_end)
+    week_of = period_start.isoformat()   # back-compat key for history dedup
+    date_str = now_local(data_dir).strftime("%A, %B %d, %Y")
     now = datetime.now(timezone.utc)
 
     skill_doc = _load_skill_doc()
     user_instruction = _load_user_instruction(data_dir)
 
-    _p(f"Aggregating weekly stats (week of {week_of})")
+    _p(f"Aggregating weekly brief for {period_label}")
 
     sources = {sid: _read_section(data_dir, sid) for sid in _SOURCE_SECTIONS}
-    this_week = _compute_this_week_stats(data_dir, today)
+    this_week = _compute_this_week_stats(data_dir, period_start, period_end, today)
 
     total_signal = sum(v for v in this_week.values() if isinstance(v, int))
     if total_signal == 0:
@@ -505,6 +575,9 @@ def run(
             "status": "not_run",
             "last_run": now.isoformat(),
             "week_of": week_of,
+            "period_start": period_start.isoformat(),
+            "period_end": period_end.isoformat(),
+            "period_label": period_label,
             "narrative": "",
             "stats": {"this_week": this_week, "prev_week": None, "deltas": {}},
             "items": [],
@@ -523,18 +596,20 @@ def run(
     deltas = _compute_deltas(this_week, prev_week_stats)
     _p(f"Computed {len(deltas)} delta(s) vs week of {prev_snapshot.get('week_of') if prev_snapshot else 'n/a'}")
 
-    headlines = _build_headlines(this_week, deltas, sources)
+    headlines = _build_headlines(this_week, deltas, sources, period_start, period_end)
     _p(f"Surfaced {len(headlines)} headline(s)")
 
     _p("Generating narrative...")
     narrative = _generate_narrative(
         this_week, deltas, headlines, ai,
         skill_doc, user_instruction,
-        display_name, date_str, week_of, business_context,
+        display_name, date_str, period_label, business_context,
     )
 
     history.append({
         "week_of": week_of,
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
         "captured_at": now.isoformat(),
         "stats": this_week,
     })
@@ -545,6 +620,9 @@ def run(
         "status": "fresh",
         "last_run": now.isoformat(),
         "week_of": week_of,
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "period_label": period_label,
         "narrative": narrative,
         "stats": {
             "this_week": this_week,
