@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
+from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -1116,6 +1116,131 @@ def admin_unbind_bot(bot_uid: str, session: dict = Depends(require_session)):
     if prev_owner:
         _user_bot_link_path(prev_owner).unlink(missing_ok=True)
     return {"ok": True, "bot_uid": bot_uid, "message": "Bot unbound and disabled"}
+
+
+def _build_user_health_snapshot(uid: str) -> dict:
+    """Aggregate per-user health for the ops dashboard. Read-only — no
+    side effects. Returns flat dict that the dashboard can render directly.
+    Every disk read is guarded; a single corrupt file should not break the
+    whole snapshot."""
+    tokens = auth.load_user_tokens(uid) or {}
+    health = auth.get_auth_health(uid)
+
+    bot_state = None
+    bot_state_path = auth.DATA_DIR / uid / "teams_bot.json"
+    if bot_state_path.exists():
+        try:
+            bot_state = json.loads(bot_state_path.read_text())
+        except Exception:
+            bot_state = None
+
+    is_bot = bool(bot_state and bot_state.get("is_registered_bot"))
+    role = "bot" if is_bot else "user"
+
+    linked_bot_uid = None
+    linked_bot_email = None
+    if not is_bot:
+        link_path = _user_bot_link_path(uid)
+        if link_path.exists():
+            try:
+                link = json.loads(link_path.read_text())
+                linked_bot_uid = link.get("bot_uid")
+                if linked_bot_uid:
+                    bt = auth.load_user_tokens(linked_bot_uid) or {}
+                    linked_bot_email = bt.get("username", "")
+            except Exception:
+                pass
+
+    owner_email = None
+    if is_bot:
+        owner_uid = bot_state.get("owner_uid") if bot_state else None
+        if owner_uid:
+            ot = auth.load_user_tokens(owner_uid) or {}
+            owner_email = ot.get("username", "")
+
+    briefings_enabled = 0
+    briefings_total = 0
+    try:
+        sched_path = auth.DATA_DIR / uid / "schedules.json"
+        if sched_path.exists():
+            sched = json.loads(sched_path.read_text())
+            briefings = sched.get("briefings") or []
+            briefings_total = len(briefings)
+            briefings_enabled = sum(1 for b in briefings if b.get("enabled"))
+    except Exception:
+        pass
+
+    last_briefing_run = None
+    try:
+        ai_summary_path = auth.DATA_DIR / uid / "results" / "ai_summary.json"
+        if ai_summary_path.exists():
+            r = json.loads(ai_summary_path.read_text())
+            last_briefing_run = r.get("last_run")
+    except Exception:
+        pass
+
+    diag_tail = _tail_file(auth.DATA_DIR / uid / ".auth_diag.log", 5)
+
+    return {
+        "uid":               uid,
+        "username":          tokens.get("username", ""),
+        "role":              role,
+        "owner_email":       owner_email,
+        "linked_bot_uid":    linked_bot_uid,
+        "linked_bot_email":  linked_bot_email,
+        "health": {
+            "status":               health.get("status"),
+            "consecutive_failures": health.get("consecutive_failures", 0),
+            "last_success_at":      health.get("last_success_at"),
+            "last_failure_at":      health.get("last_failure_at"),
+            "last_error":           health.get("last_error"),
+            "broken_since":         health.get("broken_since"),
+        },
+        "bot": {
+            "enabled":      bool(bot_state and bot_state.get("enabled")),
+            "is_bot":       is_bot,
+            "chat_id":      (bot_state or {}).get("chat_id"),
+            "last_seen_ts": (bot_state or {}).get("last_seen_ts"),
+        } if bot_state else None,
+        "briefings": {
+            "total":            briefings_total,
+            "enabled":          briefings_enabled,
+            "last_summary_run": last_briefing_run,
+        },
+        "diag_log_tail": diag_tail,
+    }
+
+
+@app.get("/api/admin/fleet-health")
+def admin_fleet_health(x_admin_token: str | None = Header(None, alias="X-Admin-Token")):
+    """Aggregated health snapshot for the ops dashboard. Single call returns
+    every user/bot so the ops poller doesn't hit N endpoints. Auth: shared
+    secret in env var OPS_ADMIN_TOKEN sent as X-Admin-Token header — this
+    endpoint is bot-to-bot, not browser-facing, so no session cookie."""
+    expected = os.getenv("OPS_ADMIN_TOKEN")
+    if not expected:
+        raise HTTPException(503, "OPS_ADMIN_TOKEN not configured on this server")
+    if not x_admin_token or not secrets.compare_digest(x_admin_token, expected):
+        raise HTTPException(401, "invalid admin token")
+
+    sessions_dir = auth.DATA_DIR / "_sessions"
+    users = []
+    if sessions_dir.exists():
+        for sf in sorted(sessions_dir.glob("*.json")):
+            try:
+                users.append(_build_user_health_snapshot(sf.stem))
+            except Exception as e:
+                users.append({"uid": sf.stem, "error": str(e)})
+
+    healthy = sum(1 for u in users if (u.get("health") or {}).get("status") == "healthy")
+    broken  = sum(1 for u in users if (u.get("health") or {}).get("status") == "broken")
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "user_count":   len(users),
+        "healthy":      healthy,
+        "broken":       broken,
+        "users":        users,
+    }
 
 
 @app.get("/api/test/graph")
