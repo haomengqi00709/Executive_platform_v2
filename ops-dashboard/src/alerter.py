@@ -48,14 +48,6 @@ def _summary(t: dict) -> tuple[str, str, str]:
         title = f"Auth recovered: {who}"
         body  = f"User '{who}' is healthy again."
         color = "good"
-    elif typ == "bot_stalled":
-        title = f"Bot stalled: {who}"
-        body  = f"Bot '{who}' last polled at {t.get('last_seen_ts')}."
-        color = "attention"
-    elif typ == "bot_recovered":
-        title = f"Bot recovered: {who}"
-        body  = f"Bot '{who}' is polling again."
-        color = "good"
     else:
         title = f"Event: {typ}"
         body  = f"{who}: {typ}"

@@ -18,10 +18,11 @@ from pathlib import Path
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 
-# Bot is considered stalled if main backend's snapshot shows last_seen_ts
-# older than this. Bots poll Teams every 10s; 10 min of silence = real outage,
-# not a transient blip.
-BOT_STALL_SECS = 600
+# NOTE: We deliberately do not monitor bot last_seen_ts for stall detection.
+# That field tracks "last inbound message from owner", NOT polling heartbeat,
+# so a bot the owner hasn't messaged for days reads as "stalled" while being
+# perfectly healthy. Real bot polling outages surface via auth_health (token
+# expiry is the dominant failure mode); we monitor that instead.
 
 
 def _ensure_data_dir():
@@ -77,25 +78,8 @@ def _parse_iso(ts):
         return None
 
 
-def _user_status(rec):
-    """Distill a user record into (auth_state, bot_state) we monitor.
-    Returning None for bot_state means there's no enabled bot to watch."""
-    auth_state = (rec.get("health") or {}).get("status") or "unknown"
-
-    bot = rec.get("bot")
-    if not bot or not bot.get("enabled"):
-        return (auth_state, None)
-
-    last_seen = bot.get("last_seen_ts")
-    if not last_seen:
-        return (auth_state, "never_seen")
-
-    ts = _parse_iso(last_seen)
-    if not ts:
-        return (auth_state, "unknown")
-
-    age = (datetime.now(timezone.utc) - ts).total_seconds()
-    return (auth_state, "stalled" if age > BOT_STALL_SECS else "active")
+def _auth_status(rec) -> str:
+    return (rec.get("health") or {}).get("status") or "unknown"
 
 
 def diff(prev, current):
@@ -115,10 +99,9 @@ def diff(prev, current):
         if not prev_rec:
             continue  # new user, no baseline — skip alert this round
 
-        prev_auth, prev_bot = _user_status(prev_rec)
-        cur_auth,  cur_bot  = _user_status(cur)
-
-        username = cur.get("username") or uid[:8]
+        prev_auth = _auth_status(prev_rec)
+        cur_auth  = _auth_status(cur)
+        username  = cur.get("username") or uid[:8]
 
         if prev_auth == "healthy" and cur_auth == "broken":
             transitions.append({
@@ -136,26 +119,6 @@ def diff(prev, current):
                 "key":      f"auth_recovered:{uid}",
                 "username": username,
                 "clears":   f"auth_broken:{uid}",
-            })
-
-        # Only fire bot transitions on the active↔stalled edge.
-        # never_seen / unknown are skipped to avoid false alerts during startup
-        # or after a session is wiped — those don't represent an active outage.
-        if prev_bot == "active" and cur_bot == "stalled":
-            transitions.append({
-                "type":         "bot_stalled",
-                "uid":          uid,
-                "key":          f"bot_stalled:{uid}",
-                "username":     username,
-                "last_seen_ts": (cur.get("bot") or {}).get("last_seen_ts"),
-            })
-        elif prev_bot == "stalled" and cur_bot == "active":
-            transitions.append({
-                "type":     "bot_recovered",
-                "uid":      uid,
-                "key":      f"bot_recovered:{uid}",
-                "username": username,
-                "clears":   f"bot_stalled:{uid}",
             })
 
     return transitions

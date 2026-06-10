@@ -7,7 +7,7 @@
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-  .dot { display:inline-block; width:.6rem; height:.6rem; border-radius:9999px; vertical-align:middle; }
+  .dot { display:inline-block; width:.55rem; height:.55rem; border-radius:9999px; vertical-align:middle; margin-right:.25rem; }
   .row-expand { display:none; }
   tr.expanded + .row-expand { display:table-row; }
 </style>
@@ -15,46 +15,72 @@
 <body class="bg-slate-50 text-slate-800">
 
 <header class="bg-white border-b border-slate-200 px-6 py-4 sticky top-0 z-10">
-  <div class="flex items-center justify-between">
+  <div class="flex items-center justify-between flex-wrap gap-4">
     <div>
       <h1 class="text-xl font-semibold">CEO Platform Ops</h1>
       <p class="text-xs text-slate-500" id="generated">loading…</p>
     </div>
     <div class="flex gap-6 text-sm">
-      <div class="text-center">
-        <div class="text-2xl font-bold" id="cnt-total">—</div>
-        <div class="text-slate-500">total</div>
-      </div>
-      <div class="text-center">
-        <div class="text-2xl font-bold text-emerald-600" id="cnt-healthy">—</div>
-        <div class="text-slate-500">healthy</div>
-      </div>
-      <div class="text-center">
-        <div class="text-2xl font-bold text-rose-600" id="cnt-broken">—</div>
-        <div class="text-slate-500">broken</div>
-      </div>
+      <div class="text-center"><div class="text-2xl font-bold" id="cnt-users">—</div><div class="text-slate-500">users</div></div>
+      <div class="text-center"><div class="text-2xl font-bold" id="cnt-bots">—</div><div class="text-slate-500">bots</div></div>
+      <div class="text-center"><div class="text-2xl font-bold text-emerald-600" id="cnt-healthy">—</div><div class="text-slate-500">healthy</div></div>
+      <div class="text-center"><div class="text-2xl font-bold text-rose-600" id="cnt-broken">—</div><div class="text-slate-500">broken</div></div>
+      <div class="text-center"><div class="text-2xl font-bold text-amber-600" id="cnt-unbound">—</div><div class="text-slate-500">unbound</div></div>
     </div>
+  </div>
+  <div class="mt-3 flex gap-4 text-sm">
+    <label class="flex items-center gap-2 cursor-pointer">
+      <input type="checkbox" id="show-users" checked class="rounded">
+      <span>Users (paired view)</span>
+    </label>
+    <label class="flex items-center gap-2 cursor-pointer">
+      <input type="checkbox" id="show-bots" checked class="rounded">
+      <span>Bots (debug view)</span>
+    </label>
   </div>
 </header>
 
-<main class="p-6">
+<main class="p-6 space-y-6">
   <div id="msg" class="hidden mb-4 p-3 rounded bg-amber-50 border border-amber-200 text-amber-900 text-sm"></div>
 
-  <div class="bg-white rounded shadow-sm border border-slate-200 overflow-hidden">
+  <!-- TABLE 1: USERS -->
+  <section id="sec-users" class="bg-white rounded shadow-sm border border-slate-200 overflow-hidden">
+    <div class="px-4 py-2 bg-slate-100 border-b border-slate-200 text-sm font-semibold text-slate-700">
+      Users — one row per client account
+    </div>
     <table class="w-full text-sm">
-      <thead class="bg-slate-100 text-slate-600">
+      <thead class="bg-slate-50 text-slate-600">
         <tr>
           <th class="px-3 py-2 text-left">User</th>
-          <th class="px-3 py-2 text-left">Role</th>
-          <th class="px-3 py-2 text-left">Auth</th>
-          <th class="px-3 py-2 text-left">Last refresh</th>
           <th class="px-3 py-2 text-left">Bot</th>
+          <th class="px-3 py-2 text-left">User auth</th>
+          <th class="px-3 py-2 text-left">Bot auth</th>
           <th class="px-3 py-2 text-left">Briefings</th>
+          <th class="px-3 py-2 text-left">Last user msg → bot</th>
         </tr>
       </thead>
-      <tbody id="rows"></tbody>
+      <tbody id="rows-users"></tbody>
     </table>
-  </div>
+  </section>
+
+  <!-- TABLE 2: BOTS -->
+  <section id="sec-bots" class="bg-white rounded shadow-sm border border-slate-200 overflow-hidden">
+    <div class="px-4 py-2 bg-slate-100 border-b border-slate-200 text-sm font-semibold text-slate-700">
+      Bots — one row per assistant account
+    </div>
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-600">
+        <tr>
+          <th class="px-3 py-2 text-left">Bot</th>
+          <th class="px-3 py-2 text-left">Owner</th>
+          <th class="px-3 py-2 text-left">Auth</th>
+          <th class="px-3 py-2 text-left">Enabled</th>
+          <th class="px-3 py-2 text-left">Last user msg</th>
+        </tr>
+      </thead>
+      <tbody id="rows-bots"></tbody>
+    </table>
+  </section>
 </main>
 
 <script>
@@ -63,92 +89,135 @@ const fmtTs = iso => {
   const d = new Date(iso);
   if (isNaN(d)) return iso;
   const diff = (Date.now() - d.getTime()) / 1000;
-  if (diff < 60)        return Math.floor(diff) + "s ago";
-  if (diff < 3600)      return Math.floor(diff/60) + "m ago";
-  if (diff < 86400)     return Math.floor(diff/3600) + "h ago";
+  if (diff < 60)    return Math.floor(diff) + "s ago";
+  if (diff < 3600)  return Math.floor(diff/60) + "m ago";
+  if (diff < 86400) return Math.floor(diff/3600) + "h ago";
   return Math.floor(diff/86400) + "d ago";
 };
 
-const authDot = status => {
-  if (status === "healthy") return '<span class="dot bg-emerald-500"></span> healthy';
-  if (status === "broken")  return '<span class="dot bg-rose-500"></span> broken';
-  return '<span class="dot bg-slate-300"></span> ' + (status || "—");
-};
-
-const botCell = b => {
-  if (!b) return '<span class="text-slate-400">—</span>';
-  if (!b.enabled) return '<span class="text-slate-400">disabled</span>';
-  if (!b.last_seen_ts) return '<span class="dot bg-slate-300"></span> never seen';
-  const age = (Date.now() - new Date(b.last_seen_ts).getTime()) / 1000;
-  if (age > 600) return '<span class="dot bg-rose-500"></span> stalled ' + fmtTs(b.last_seen_ts);
-  return '<span class="dot bg-emerald-500"></span> ' + fmtTs(b.last_seen_ts);
+const authPill = (status, extra) => {
+  if (status === "healthy") {
+    return '<span class="dot bg-emerald-500"></span><span>healthy</span>';
+  }
+  if (status === "broken") {
+    return '<span class="dot bg-rose-500"></span><span class="text-rose-700 font-medium">broken</span>' +
+      (extra ? ' <span class="text-rose-600 text-xs">×' + extra + '</span>' : '');
+  }
+  return '<span class="dot bg-slate-300"></span><span class="text-slate-500">' + (status || "—") + '</span>';
 };
 
 const briefingsCell = br => {
   if (!br) return "—";
   const sched = (br.enabled || 0) + "/" + (br.total || 0);
-  const last = br.last_summary_run ? "ran " + fmtTs(br.last_summary_run) : "never ran";
+  const last  = br.last_summary_run ? "ran " + fmtTs(br.last_summary_run) : "never ran";
   return sched + " enabled · " + last;
 };
 
-const roleCell = u => {
-  if (u.role === "bot") {
-    return 'bot → <span class="text-slate-500">' + (u.owner_email || "?") + '</span>';
-  }
-  if (u.linked_bot_email) {
-    return 'user · bot: <span class="text-slate-500">' + u.linked_bot_email + '</span>';
-  }
-  return 'user';
+const userCellName = u =>
+  '<div class="font-medium">' + (u.username || "?") + '</div>' +
+  '<div class="text-xs text-slate-400">' + u.uid.slice(0,8) + '</div>';
+
+const expandRow = (cols, h, diagTail) => {
+  const tr = document.createElement("tr");
+  tr.className = "row-expand bg-slate-50";
+  tr.innerHTML = '<td colspan="' + cols + '" class="px-6 py-3">' +
+    (h && h.last_error ? '<div class="mb-2 text-rose-700 text-xs"><b>last error:</b> ' +
+       (typeof h.last_error === "string" ? h.last_error : JSON.stringify(h.last_error)) + '</div>' : '') +
+    (h && h.broken_since ? '<div class="mb-2 text-rose-700 text-xs"><b>broken since:</b> ' + h.broken_since + '</div>' : '') +
+    '<pre class="text-xs text-slate-600 bg-white p-2 rounded border border-slate-200 whitespace-pre-wrap">' +
+      ((diagTail || []).join("\n") || '(no diag log)') + '</pre></td>';
+  return tr;
 };
 
 const render = data => {
+  const users = (data.users || []);
+
+  const userRecords = users.filter(u => u.role === "user");
+  const botRecords  = users.filter(u => u.role === "bot");
+  const botsByUid   = Object.fromEntries(botRecords.map(b => [b.uid, b]));
+
+  const unbound = userRecords.filter(u => !u.linked_bot_uid).length;
+
   document.getElementById("generated").textContent =
     "polled " + fmtTs(data.generated_at) + " · " + data.user_count + " accounts";
-  document.getElementById("cnt-total").textContent   = data.user_count || 0;
+  document.getElementById("cnt-users").textContent   = userRecords.length;
+  document.getElementById("cnt-bots").textContent    = botRecords.length;
   document.getElementById("cnt-healthy").textContent = data.healthy || 0;
   document.getElementById("cnt-broken").textContent  = data.broken || 0;
+  document.getElementById("cnt-unbound").textContent = unbound;
 
-  const rows = document.getElementById("rows");
-  rows.innerHTML = "";
-  for (const u of (data.users || [])) {
+  // ── TABLE 1: USERS (paired with their bot) ─────────────
+  const rowsU = document.getElementById("rows-users");
+  rowsU.innerHTML = "";
+  for (const u of userRecords) {
     if (u.error) {
       const er = document.createElement("tr");
       er.className = "border-t border-slate-100";
-      er.innerHTML = '<td colspan="6" class="px-3 py-2 text-rose-600">' +
-        u.uid + ": " + u.error + '</td>';
-      rows.appendChild(er);
+      er.innerHTML = '<td colspan="6" class="px-3 py-2 text-rose-600">' + u.uid + ": " + u.error + '</td>';
+      rowsU.appendChild(er);
       continue;
     }
-    const h = u.health || {};
+    const uh = u.health || {};
+    const bot = u.linked_bot_uid ? botsByUid[u.linked_bot_uid] : null;
+    const bh = bot ? (bot.health || {}) : null;
+    const botCell = bot
+      ? '<div class="font-medium text-slate-700">' + (bot.username || "?") + '</div>' +
+        '<div class="text-xs text-slate-400">' + bot.uid.slice(0,8) + '</div>'
+      : '<span class="text-amber-600 font-medium">⚠️ not bound</span>';
+    const lastMsg = bot && bot.bot && bot.bot.last_seen_ts
+      ? '<span class="text-slate-600">' + fmtTs(bot.bot.last_seen_ts) + '</span>'
+      : (bot ? '<span class="text-slate-400">never used</span>' : '<span class="text-slate-300">—</span>');
+
     const tr = document.createElement("tr");
     tr.className = "border-t border-slate-100 cursor-pointer hover:bg-slate-50";
     tr.innerHTML =
-      '<td class="px-3 py-2"><div class="font-medium">' + (u.username || "?") + '</div>' +
-        '<div class="text-xs text-slate-400">' + u.uid.slice(0,8) + '</div></td>' +
-      '<td class="px-3 py-2 text-xs">' + roleCell(u) + '</td>' +
-      '<td class="px-3 py-2">' + authDot(h.status) +
-        (h.consecutive_failures ? ' <span class="text-rose-600 text-xs">×' +
-          h.consecutive_failures + '</span>' : '') + '</td>' +
-      '<td class="px-3 py-2 text-xs text-slate-600">' + fmtTs(h.last_success_at) + '</td>' +
-      '<td class="px-3 py-2 text-xs">' + botCell(u.bot) + '</td>' +
-      '<td class="px-3 py-2 text-xs text-slate-600">' + briefingsCell(u.briefings) + '</td>';
-
-    const tail = (u.diag_log_tail || []).join("\n");
-    const expand = document.createElement("tr");
-    expand.className = "row-expand bg-slate-50";
-    expand.innerHTML = '<td colspan="6" class="px-6 py-3">' +
-      (h.last_error ? '<div class="mb-2 text-rose-700 text-xs"><b>last error:</b> ' +
-        h.last_error + '</div>' : '') +
-      (h.broken_since ? '<div class="mb-2 text-rose-700 text-xs"><b>broken since:</b> ' +
-        h.broken_since + '</div>' : '') +
-      '<pre class="text-xs text-slate-600 bg-white p-2 rounded border border-slate-200 whitespace-pre-wrap">' +
-        (tail || '(no diag log)') + '</pre></td>';
+      '<td class="px-3 py-2">' + userCellName(u) + '</td>' +
+      '<td class="px-3 py-2 text-xs">' + botCell + '</td>' +
+      '<td class="px-3 py-2 text-xs">' + authPill(uh.status, uh.consecutive_failures) +
+        '<div class="text-slate-400 mt-1">refresh ' + fmtTs(uh.last_success_at) + '</div></td>' +
+      '<td class="px-3 py-2 text-xs">' +
+        (bh ? authPill(bh.status, bh.consecutive_failures) +
+              '<div class="text-slate-400 mt-1">refresh ' + fmtTs(bh.last_success_at) + '</div>'
+            : '<span class="text-slate-300">—</span>') + '</td>' +
+      '<td class="px-3 py-2 text-xs text-slate-600">' + briefingsCell(u.briefings) + '</td>' +
+      '<td class="px-3 py-2 text-xs">' + lastMsg + '</td>';
 
     tr.onclick = () => tr.classList.toggle("expanded");
-    rows.appendChild(tr);
-    rows.appendChild(expand);
+    rowsU.appendChild(tr);
+    rowsU.appendChild(expandRow(6, uh, u.diag_log_tail));
+  }
+
+  // ── TABLE 2: BOTS (debug view) ──────────────────────────
+  const rowsB = document.getElementById("rows-bots");
+  rowsB.innerHTML = "";
+  for (const b of botRecords) {
+    if (b.error) continue;
+    const bh = b.health || {};
+    const bs = b.bot || {};
+    const tr = document.createElement("tr");
+    tr.className = "border-t border-slate-100 cursor-pointer hover:bg-slate-50";
+    tr.innerHTML =
+      '<td class="px-3 py-2">' + userCellName(b) + '</td>' +
+      '<td class="px-3 py-2 text-xs text-slate-600">' + (b.owner_email || '<span class="text-amber-600">unbound</span>') + '</td>' +
+      '<td class="px-3 py-2 text-xs">' + authPill(bh.status, bh.consecutive_failures) + '</td>' +
+      '<td class="px-3 py-2 text-xs">' + (bs.enabled ? '<span class="text-emerald-700">true</span>' : '<span class="text-slate-400">false</span>') + '</td>' +
+      '<td class="px-3 py-2 text-xs">' +
+        (bs.last_seen_ts
+          ? '<span class="text-slate-600">' + fmtTs(bs.last_seen_ts) + '</span>'
+          : '<span class="text-slate-400">never used</span>') + '</td>';
+
+    tr.onclick = () => tr.classList.toggle("expanded");
+    rowsB.appendChild(tr);
+    rowsB.appendChild(expandRow(5, bh, b.diag_log_tail));
   }
 };
+
+const applyToggles = () => {
+  document.getElementById("sec-users").style.display = document.getElementById("show-users").checked ? "" : "none";
+  document.getElementById("sec-bots").style.display  = document.getElementById("show-bots").checked  ? "" : "none";
+};
+document.getElementById("show-users").addEventListener("change", applyToggles);
+document.getElementById("show-bots").addEventListener("change", applyToggles);
 
 const load = async () => {
   try {
