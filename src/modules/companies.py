@@ -24,6 +24,8 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.modules.crm import _FREE_EMAIL_DOMAINS, _guess_company
+
 
 # Ordered by importance — first match wins when deriving a company's status
 # from a mixed bag of its contacts' statuses.
@@ -83,6 +85,70 @@ def _derive_status(contacts: list[dict]) -> str:
         if s in statuses:
             return s
     return "other"
+
+
+# ── Domain-based identity ─────────────────────────────────
+# A company is identified by its email DOMAIN, not its name. Same domain = same
+# company, regardless of how the name was written ("DPS Group" vs domain-fallback
+# "Dps"). Personal-email contacts have no business domain and fall back to name.
+
+
+def _domain_of(email: str) -> str:
+    """Business email domain (lowercased), or '' for free-email / no-domain."""
+    e = (email or "").lower().strip()
+    if "@" not in e:
+        return ""
+    dom = e.split("@", 1)[1].strip()
+    if not dom or dom in _FREE_EMAIL_DOMAINS:
+        return ""
+    return dom
+
+
+def _prettify_domain(domain: str) -> str:
+    """Last-resort display name from a domain when no real name exists:
+    'dps.group' -> 'DPS' (short label as acronym), 'acme.com' -> 'Acme'."""
+    label = (domain or "").split(".")[0]
+    if not label:
+        return domain
+    return label.upper() if len(label) <= 4 else label.title()
+
+
+def _pick_display_name(name_candidates, domain: str, user_name: str = "") -> str:
+    """Best display name for a bucket: user edit > a real signature name (one that
+    isn't the ugly domain-fallback) > prettified domain > any candidate."""
+    if user_name and user_name.strip():
+        return user_name.strip()
+    fallback = _guess_company("x@" + domain).lower() if domain else ""
+    reals = [n.strip() for n in name_candidates
+             if n and n.strip() and n.strip().lower() != fallback]
+    if reals:
+        return max(reals, key=len)            # most complete real name
+    if domain:
+        return _prettify_domain(domain)
+    cands = [n.strip() for n in name_candidates if n and n.strip()]
+    return cands[0] if cands else ""
+
+
+def _merge_company_user_fields(a: dict, b: dict) -> dict:
+    """When two old name-keyed records collapse onto one domain key, merge their
+    user-editable fields (keep the most-engaged settings)."""
+    rank = {"high": 2, "medium": 1, "low": 0}
+    names = [x for x in (a.get("name", ""), b.get("name", "")) if (x or "").strip()]
+    notes = "\n".join(x for x in (a.get("notes", ""), b.get("notes", "")) if (x or "").strip())
+    adds  = [x for x in (a.get("added_at"), b.get("added_at")) if x]
+    a_prio, b_prio = a.get("priority", "medium"), b.get("priority", "medium")
+    return {
+        "name":                 max(names, key=len) if names else "",
+        "notes":                notes,
+        "priority":             a_prio if rank.get(a_prio, 1) >= rank.get(b_prio, 1) else b_prio,
+        # An explicit edit always wins over the other side's default:
+        #   monitor default=True  → AND keeps an explicit False
+        #   ignore  default=False → OR  keeps an explicit True
+        "monitor_intelligence": bool(a.get("monitor_intelligence", True) and b.get("monitor_intelligence", True)),
+        "ignore":               bool(a.get("ignore") or b.get("ignore")),
+        "manual":               bool(a.get("manual") or b.get("manual")),
+        "added_at":             min(adds) if adds else None,
+    }
 
 
 # ── IO ────────────────────────────────────────────────────
@@ -151,10 +217,10 @@ def build_companies(data_dir: Path, progress=None) -> dict:
 
     aggregated: dict[str, dict] = {}
 
-    def bucket(raw_name: str) -> dict | None:
-        """Get-or-create the aggregation bucket for a company name. Returns
-        None when the name normalizes to empty (e.g. just punctuation)."""
-        key = _normalize_name(raw_name)
+    def bucket(key: str, name_candidate: str = "") -> dict | None:
+        """Get-or-create the aggregation bucket for a company KEY (an email
+        domain, or a normalized name for personal-email / manual entries).
+        name_candidate (a raw company-name string) feeds display-name picking."""
         if not key:
             return None
         bkt = aggregated.get(key)
@@ -169,20 +235,23 @@ def build_companies(data_dir: Path, progress=None) -> dict:
                 "_from_watchlist": False,
             }
             aggregated[key] = bkt
-        bkt["raw_names"].add(raw_name.strip())
+        if name_candidate and name_candidate.strip():
+            bkt["raw_names"].add(name_candidate.strip())
         return bkt
 
-    # ── Pass 1: CRM contacts ──────────────────────────────
+    # ── Pass 1: CRM contacts (keyed by email DOMAIN) ──────
     for email, contact in (crm.get("contacts") or {}).items():
         if contact.get("ignore") or contact.get("archived"):
             continue
+        addr = email.lower()
         company = (contact.get("company") or "").strip()
-        if not company:
+        # Business domain → company identity; personal email → fall back to name.
+        key = _domain_of(addr) or _normalize_name(company)
+        if not key:
             continue
-        bkt = bucket(company)
+        bkt = bucket(key, company)
         if bkt is None:
             continue
-        addr = email.lower()
         if addr in bkt["_contact_keys"]:
             continue
         bkt["_contact_keys"].add(addr)
@@ -197,23 +266,22 @@ def build_companies(data_dir: Path, progress=None) -> dict:
 
     log(f"  After CRM pass: {len(aggregated)} unique companies")
 
-    # ── Pass 2: Projects (linked through participant emails) ──
+    # ── Pass 2: Projects (participant email DOMAIN → company) ──
     for proj_id, proj in (projects.get("projects") or {}).items():
         if proj.get("ignore") or proj.get("archived"):
             continue
         seen_in_project: set[str] = set()
         for email in (proj.get("participants") or []):
-            contact = contacts_by_email.get(email.lower())
+            addr = email.lower()
+            contact = contacts_by_email.get(addr)
             if not contact:
                 continue
             company = (contact.get("company") or "").strip()
-            if not company:
-                continue
-            key = _normalize_name(company)
+            key = _domain_of(addr) or _normalize_name(company)
             if not key or key in seen_in_project:
                 continue
             seen_in_project.add(key)
-            bkt = bucket(company)
+            bkt = bucket(key, company)
             if bkt is None:
                 continue
             if proj_id in bkt["_project_keys"]:
@@ -239,7 +307,7 @@ def build_companies(data_dir: Path, progress=None) -> dict:
                     name = str(name).strip()
                     if not name:
                         continue
-                    bkt = bucket(name)
+                    bkt = bucket(_normalize_name(name), name)
                     if bkt is None:
                         continue
                     bkt["_from_watchlist"] = True
@@ -247,6 +315,25 @@ def build_companies(data_dir: Path, progress=None) -> dict:
                 log(f"  Migrated {migrated} entries from market_watchlist.json")
             except Exception as e:
                 log(f"  Watchlist migration failed (skipping): {e}")
+
+    # ── Migrate existing user-edits from name-keys to domain-keys ──
+    # The key scheme changed (name → domain). Re-map each existing record to its
+    # new domain key (from its contacts' emails); records that collapse onto the
+    # same domain merge their user fields, so notes / priority / ignore / manual /
+    # name survive the migration. Idempotent: already-domain-keyed records map to
+    # themselves. Manual / no-business-domain records keep their (name) key.
+    migrated: dict[str, dict] = {}
+    for old_key, old_rec in existing_by_key.items():
+        nk = ""
+        for c in (old_rec.get("contacts") or []):
+            d = _domain_of(c.get("email", ""))
+            if d:
+                nk = d
+                break
+        nk = nk or old_key
+        migrated[nk] = (_merge_company_user_fields(migrated[nk], old_rec)
+                        if nk in migrated else dict(old_rec))
+    existing_by_key = migrated
 
     # ── Materialize ───────────────────────────────────────
     today   = datetime.now().strftime("%Y-%m-%d")
@@ -262,13 +349,11 @@ def build_companies(data_dir: Path, progress=None) -> dict:
 
         thread_count_total = sum(c.get("thread_count", 0) for c in bkt["contacts"])
 
-        # Display name precedence: user-edited > longest raw alias > key
-        if old.get("name"):
-            display_name = old["name"]
-        elif bkt["raw_names"]:
-            display_name = max(bkt["raw_names"], key=len)
-        else:
-            display_name = key
+        # Display name: user-edited > best real (non-domain-fallback) name >
+        # prettified domain. A key containing "." is a domain (normalized names
+        # have their dots stripped), so we can tell domain-keys from name-keys.
+        domain = key if "." in key else ""
+        display_name = _pick_display_name(bkt["raw_names"], domain, old.get("name", "")) or key
 
         # `manual` is sticky — once True (via watchlist migration or
         # user-added through API) it stays True even if derived data later
