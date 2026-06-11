@@ -21,8 +21,21 @@ from src.modules.subject_match import normalize_subject
 from src.modules.wiki import load_index, load_meeting
 
 MODEL        = DEFAULT_GEMINI_MODEL
-MAX_ROUNDS   = 8
+MAX_ROUNDS   = 12          # was 8; with 27 tools the model needs room to research AND act
 HISTORY_LIMIT = 20
+BUDGET_NUDGE_AT = 2        # rounds-remaining threshold to push the model to act instead of read
+HONEST_FALLBACK = "I looked into that but didn't finish — want me to try again?"
+
+# Tools that DO something (mutate state / create a resource) vs. read tools. Mirrors the
+# `# Action` block of all_tools in reply() (list_pending_drafts is read-only, so excluded).
+# Keep in sync when adding an action tool — used only for per-turn success telemetry.
+ACTION_TOOLS = frozenset({
+    "mark_commitment_done", "snooze_commitment", "dismiss_commitment",
+    "create_reply_draft", "approve_draft", "skip_draft",
+    "confirm_expense", "discard_expense", "dismiss_email_followup",
+    "update_crm_contact", "create_calendar_event", "run_outreach",
+    "tag_recent_contacts",
+})
 
 
 def _with_indices(items: list[dict]) -> list[dict]:
@@ -276,8 +289,11 @@ def reply(
         f"  dismiss_commitment         → 'skip 2', 'skip 3 4', 'skip 2 3 4' — skip means permanent dismiss\n"
         f"  snooze_commitment          → 'snooze 2', 'remind me in 3 days about 3', 'snooze 2 3 4 for 5 days'\n"
         f"  create_reply_draft         → 'draft a reply to X', 'write an email to Y', 'compose a response'\n"
-        f"                               First call get_recent_emails to find the email, compose the full body, then save.\n"
-        f"                               Draft is saved immediately to Outlook — no approval step needed.\n"
+        f"                               The target email is usually ALREADY in your context (the Reply-needed\n"
+        f"                               list, your most recent get_recent_emails output, or a pending draft shown\n"
+        f"                               above) — use it directly. Call AT MOST one read tool to find the email if\n"
+        f"                               it isn't already visible, then compose the full body and save. Do NOT chain\n"
+        f"                               several read tools before drafting. Draft saves immediately — no approval.\n"
         f"  approve_draft / skip_draft → only when a pending draft is shown above\n"
         f"  confirm_expense / discard_expense → only when a pending expense is shown above\n"
         f"  update_crm_contact         → 'mark X as high priority', 'add note to Sarah', 'set company for John'\n"
@@ -294,7 +310,10 @@ def reply(
         + (
             f"\nHONESTY RULE: When a tool returns an error or an unexpected result, "
             f"REPORT IT honestly to the user. Do NOT reply 'Done' or pretend success "
-            f"when the tool failed. Show what went wrong and what you did/didn't do."
+            f"when the tool failed. Show what went wrong and what you did/didn't do. "
+            f"If you did NOT successfully call the action tool the user asked for "
+            f"(create_reply_draft / create_calendar_event / update_crm_contact / etc.), do NOT "
+            f"claim you performed the action — say it is not done yet."
         )
         + f"{user_ctx}"
         + f"{session_ctx}"
@@ -1184,8 +1203,13 @@ def reply(
     contents = list(history) + [types.Content(role="user", parts=[types.Part(text=text)])]
     fn_map   = {f.__name__: f for f in all_tools}
 
-    final_text = ""
-    for _ in range(MAX_ROUNDS):
+    final_text     = ""
+    rounds_used    = 0
+    tools_called   = []
+    action_results = {}          # action tool name -> succeeded at least once this turn
+    finish_mode    = "normal"    # normal | forced | fallback
+    for i in range(MAX_ROUNDS):
+        rounds_used = i + 1
         response = client.models.generate_content(
             model   = MODEL,
             contents= contents,
@@ -1216,6 +1240,12 @@ def reply(
             except Exception as e:
                 result = f"Tool error: {e}"
             print(f"[Bot] ← {str(result)[:150]}")
+            tools_called.append(fc.name)
+            if fc.name in ACTION_TOOLS:
+                ok = isinstance(result, str) and not result.startswith(
+                    ("Error", "⚠️", "Owner account", "No pending",
+                     "Unknown tool", "Tool error", "Couldn't"))
+                action_results[fc.name] = action_results.get(fc.name, False) or ok
             response_parts.append(
                 types.Part(function_response=types.FunctionResponse(
                     name=fc.name,
@@ -1223,17 +1253,59 @@ def reply(
                 ))
             )
 
+        # Budget pressure: when few rounds remain, push the model to ACT rather than research
+        # forever (the cause of the hollow "Done." — it burned every round on read tools). The
+        # text part rides alongside the function responses, so every function_call is still
+        # answered (Gemini's protocol requirement stays intact).
+        rounds_left = MAX_ROUNDS - (i + 1)
+        if 0 < rounds_left <= BUDGET_NUDGE_AT:
+            response_parts.append(types.Part(text=(
+                f"[system] You have {rounds_left} tool call(s) left this turn. "
+                f"If the user asked you to DO something (draft/reply/schedule/update/tag/run), "
+                f"call that action tool NOW with the info you already have — the target "
+                f"email/contact is usually already in the context above. Stop gathering information."
+            )))
+
         contents.append(types.Content(role="model", parts=parts))
         contents.append(types.Content(role="user",  parts=response_parts))
 
+    # Loop ran out of rounds without the model producing a final text answer. Do NOT fake
+    # "Done." — force one tool-free turn so the model must honestly state what it did/didn't do.
     if not final_text:
-        final_text = "Done."
+        finish_mode = "forced"
+        force_note = (
+            "\n\nYou have run out of tool calls for this turn. Do NOT call any function. "
+            "In 1-3 sentences, tell the user plainly what you actually accomplished and what is "
+            "still incomplete. If you did NOT successfully save a draft / create an event / make "
+            "the change, say so explicitly and offer to continue — never imply success you did "
+            "not achieve."
+        )
+        try:
+            forced = client.models.generate_content(
+                model   = MODEL,
+                contents= contents,
+                config  = types.GenerateContentConfig(system_instruction=system + force_note),
+            )
+            fcand  = forced.candidates[0] if forced.candidates else None
+            fparts = (fcand.content.parts if fcand and fcand.content else None) or []
+            final_text = "\n".join(p.text for p in fparts if p.text).strip()
+        except Exception as e:
+            print(f"[Bot] forced-finish call failed: {e}")
+            final_text = ""
+        if not final_text:
+            finish_mode = "fallback"
+            final_text = HONEST_FALLBACK
 
     # Append Outlook draft link if create_reply_draft saved one this turn
     web_link = state.pop("_last_draft_web_link", None)
     if web_link:
         from src.modules.links import wrap_draft_link
         final_text += f"\n\n<a href='{wrap_draft_link(web_link)}'>📬 Open draft in Outlook</a>"
+
+    actions_ok   = [n for n, ok in action_results.items() if ok]
+    actions_fail = [n for n, ok in action_results.items() if not ok]
+    print(f"[Bot] turn done — rounds={rounds_used}/{MAX_ROUNDS} finish={finish_mode} "
+          f"tools={tools_called} actions_ok={actions_ok} actions_failed={actions_fail}")
 
     _save_turn(db_path, text, final_text)
     return final_text, state
