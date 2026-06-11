@@ -2933,6 +2933,24 @@ def export_projects_xlsx(session: dict = Depends(require_session)):
     return _xlsx_response("Projects", headers, rows, "projects")
 
 
+@app.get("/api/expenses/export.xlsx")
+def export_expenses_xlsx(session: dict = Depends(require_session)):
+    """Stream the user's expenses_master.xlsx directly. Unlike the other
+    export endpoints (which build a fresh sheet from JSON), the expenses
+    ledger IS already an .xlsx file written incrementally by m05_expense
+    and the edit-row endpoints — so this just hands the live file back."""
+    uid  = session["user_id"]
+    path = _udir(uid) / "expenses" / "expenses_master.xlsx"
+    if not path.exists():
+        raise HTTPException(404, "No expense ledger yet")
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        path=path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename="expenses.xlsx",
+    )
+
+
 @app.get("/api/companies/export.xlsx")
 def export_companies_xlsx(session: dict = Depends(require_session)):
     uid = session["user_id"]

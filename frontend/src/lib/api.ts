@@ -407,6 +407,7 @@ export function scanCompanies(): Promise<{ ok: boolean }> {
 export const crmExportXlsxUrl       = '/api/crm/export.xlsx';
 export const projectsExportXlsxUrl  = '/api/projects/export.xlsx';
 export const companiesExportXlsxUrl = '/api/companies/export.xlsx';
+export const expensesExportXlsxUrl  = '/api/expenses/export.xlsx';
 
 // ── DB Cleanup (manual direct actions) ────────────────────
 

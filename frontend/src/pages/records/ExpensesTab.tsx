@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Loader2, Search, Trash2, Check, X, Pencil, Plus, Image as ImageIcon,
-  History, RefreshCw,
+  History, RefreshCw, Download,
 } from 'lucide-react';
 import {
   getAllExpenses, patchExpense, deleteExpense, createExpense, expensePhotoUrl,
-  scanHistoricalExpenses,
+  scanHistoricalExpenses, expensesExportXlsxUrl,
 } from '../../lib/api';
 import type { ExpenseRow } from '../../lib/api';
 import { useActivity } from '../../components/ActivityDrawer';
@@ -135,6 +135,14 @@ export default function ExpensesTab() {
             <option value="all">All categories</option>
             {CATEGORY_OPTIONS.map(c => <option key={c} value={c}>{c}</option>)}
           </select>
+          <a
+            href={expensesExportXlsxUrl}
+            download
+            className="flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg border border-executive-border text-executive-muted hover:text-executive-text hover:bg-executive-border/40"
+            title="Download expenses as Excel"
+          >
+            <Download size={12} /> Excel
+          </a>
           <button
             onClick={() => setAdding(true)}
             className="flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg bg-executive-accent text-white hover:opacity-90"

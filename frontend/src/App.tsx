@@ -69,7 +69,7 @@ interface DeviceCode {
 const NAV: { id: Page; label: string; icon: React.ReactNode; color: string }[] = [
   { id: 'dashboard', label: 'Dashboard', icon: <LayoutDashboard size={16} />, color: 'text-executive-accent' },
   { id: 'skills',    label: 'Skills',    icon: <Sparkles size={16} />,        color: 'text-amber-400' },
-  { id: 'records',   label: 'Records',   icon: <Database size={16} />,        color: 'text-emerald-400' },
+  { id: 'records',   label: 'Data',      icon: <Database size={16} />,        color: 'text-emerald-400' },
   { id: 'tools',     label: 'Tools',     icon: <Wrench size={16} />,          color: 'text-violet-400' },
   { id: 'profile',   label: 'Profile',   icon: <UserCircle2 size={16} />,     color: 'text-rose-400' },
 ];
