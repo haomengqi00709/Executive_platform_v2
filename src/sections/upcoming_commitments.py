@@ -17,6 +17,7 @@ from src.graph import GraphClient
 from src.ai import AIClient
 from src.modules.commitments_state import load_state, should_show, expire_asked, save_state
 from src.modules.tz import now_local
+from src.modules.text_utils import is_attendance_action_item
 
 
 def _save_result(data_dir: Path, result: dict) -> None:
@@ -124,6 +125,12 @@ def run(
             continue
         # Include if overdue OR within window
         if due > cutoff_str:
+            continue
+
+        # A past-due attendance item ("Attend the Thursday call") is a calendar
+        # event that already happened — nothing left to do, so it must not read
+        # as overdue. Future attend-items fall through and stay as reminders.
+        if due < today_str and is_attendance_action_item(c.get("description", "")):
             continue
 
         item = {**c, "source": c.get("source", "email")}
