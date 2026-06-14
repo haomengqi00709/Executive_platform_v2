@@ -36,6 +36,52 @@ def _summary(t: dict) -> tuple[str, str, str]:
     """Returns (title, body, color) for a transition."""
     who = t.get("username") or t.get("uid", "")[:8]
     typ = t["type"]
+    if typ == "backend_unreachable":
+        title = "⚠️ Main backend unreachable"
+        n = t.get("consecutive", "?")
+        body = (f"The ops poller has failed to reach the CEO platform backend {n}× "
+                "in a row — scheduled briefings, email monitor, and the bot may all be down.")
+        if t.get("since"):
+            body += f" Down since {t['since']}."
+        if t.get("error"):
+            body += f"\nLast error: {t['error']}"
+        return title, body, "attention"
+    if typ == "backend_recovered":
+        title = "✅ Main backend recovered"
+        body  = "The ops poller is reaching the CEO platform backend again."
+        if t.get("down_since"):
+            body += f" Was down since {t['down_since']}."
+        return title, body, "good"
+    if typ == "job_stale":
+        jid = t.get("job_id", "?")
+        if jid == "canary_probe":
+            title = "⚠️ Canary probe failing"
+            body  = ("The end-to-end health probe (token → Graph) is failing for the "
+                     "canary account — real customers may be affected.")
+        else:
+            title = f"⚠️ Scheduled job stalled: {jid}"
+            body  = (f"Job '{jid}' is stalled or failing — that scheduled work "
+                     "(briefings, email monitor, etc.) may not be running.")
+        if t.get("consecutive"):
+            body += f" {t['consecutive']} consecutive failure(s)."
+        if t.get("last_success"):
+            body += f" Last success {t['last_success']}."
+        if t.get("error"):
+            body += f"\nLast error: {t['error']}"
+        return title, body, "attention"
+    if typ == "job_recovered":
+        jid = t.get("job_id", "?")
+        return (f"✅ Job recovered: {jid}",
+                f"Scheduled job '{jid}' is succeeding again.", "good")
+    if typ == "pushqa_low":
+        secs = ", ".join(t.get("sections") or []) or "one or more sections"
+        title = f"⚠️ Push quality low: {who}"
+        body  = (f"{t.get('fail', 0)} section(s) failed the quality spot-check for "
+                 f"'{who}' ({secs}) — possible empty/fabricated/off output reaching the user.")
+        return title, body, "attention"
+    if typ == "pushqa_recovered":
+        return (f"✅ Push quality recovered: {who}",
+                f"'{who}' pushes are passing the quality spot-check again.", "good")
     if typ == "auth_broken":
         title = f"Auth broken: {who}"
         body  = f"User '{who}' is failing token refresh."
@@ -63,18 +109,21 @@ def _send_teams(t: dict) -> bool:
 
     title, body, color = _summary(t)
 
+    body_blocks = [
+        {"type": "TextBlock", "text": title, "weight": "Bolder",
+         "size": "Medium", "color": color, "wrap": True},
+        {"type": "TextBlock", "text": body, "wrap": True, "spacing": "Small"},
+    ]
+    if t.get("uid"):
+        body_blocks.append(
+            {"type": "TextBlock", "text": f"uid: {t.get('uid','')}",
+             "isSubtle": True, "size": "Small", "spacing": "Small"})
+
     card = {
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type":    "AdaptiveCard",
         "version": "1.4",
-        "body": [
-            {"type": "TextBlock", "text": title, "weight": "Bolder",
-             "size": "Medium", "color": color, "wrap": True},
-            {"type": "TextBlock", "text": body, "wrap": True,
-             "spacing": "Small"},
-            {"type": "TextBlock", "text": f"uid: {t.get('uid','')}",
-             "isSubtle": True, "size": "Small", "spacing": "Small"},
-        ],
+        "body": body_blocks,
     }
     payload = {
         "type": "message",

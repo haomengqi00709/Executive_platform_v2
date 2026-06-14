@@ -9,6 +9,27 @@ the result, and pushes Teams + email alerts whenever a user/bot transitions
 from healthy → broken (or back). A minimal HTML dashboard at `/` shows the
 current state.
 
+It monitors four things, each fail-safe and deduped to one page per
+`ALERT_REPEAT_HOURS`:
+
+1. **Auth health** — per-user/bot MS token refresh (healthy ↔ broken edges).
+2. **Backend liveness** — whether the poller can reach the backend at all
+   (one fleet-level alert, never N per-user — see below).
+3. **Scheduled jobs** — whether each background job (briefings, email monitor,
+   the canary probe, …) is actually succeeding, via `last_success` age and
+   consecutive-failure count surfaced in `fleet-health.jobs`.
+4. **Push quality** — when the backend's `PUSH_QA_ENABLED` sampler is on, the
+   per-user quality verdicts (`fleet-health.push_qa`) are shown and a `fail`
+   pages ops. Quality scoring itself lives in the main backend
+   (`src/modules/push_qa.py`); the dashboard only displays + alerts on it.
+
+It also watches its own poll: if the main backend is unreachable for
+`POLL_FAIL_THRESHOLD` consecutive polls (default 3 ≈ 3 min), it fires ONE
+fleet-level `backend_unreachable` alert (not one per account) and a
+`backend_recovered` alert when it comes back. A heartbeat banner on the
+dashboard shows backend liveness. This closes the fail-silent gap where a
+total backend outage would otherwise produce no signal at all.
+
 ## Architecture
 
 ```
@@ -16,6 +37,7 @@ ops-dashboard ── 60s poll ──▶ main backend /api/admin/fleet-health
       │
       ├── data/fleet_summary.json    (latest snapshot, served to /api/state)
       ├── data/fleet_summary_prev.json (previous, for diffing)
+      ├── data/poll_health.json     (backend liveness: failure streak, last success)
       └── data/alert_history.json   (dedup so the same break doesn't spam every 60s)
 ```
 
@@ -25,6 +47,7 @@ ops-dashboard ── 60s poll ──▶ main backend /api/admin/fleet-health
 |---|---|---|
 | `GET /` | HTTP Basic | Dashboard HTML |
 | `GET /api/state` | HTTP Basic | Latest snapshot JSON |
+| `GET /api/poll-health` | HTTP Basic | Backend liveness (drives the heartbeat banner) |
 | `POST /webhook/event` | `X-Admin-Token` | Inbound event receiver (scaffolded, unused) |
 | `GET /health` | none | Healthcheck for Railway/Azure |
 

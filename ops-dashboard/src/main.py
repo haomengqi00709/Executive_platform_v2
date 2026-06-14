@@ -64,6 +64,19 @@ scheduler = BackgroundScheduler(timezone="UTC")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Durability sanity check: alert_history.json + poll_health.json live in
+    # DATA_DIR. If it's the ephemeral default, a redeploy wipes dedup state and
+    # the 6h re-alert suppression resets — warn loudly so prod mounts a volume.
+    data_dir = state.DATA_DIR
+    if not data_dir.is_absolute() or str(data_dir) in ("./data", "data"):
+        log.warning(
+            "DATA_DIR=%s looks ephemeral — mount a persistent volume in prod "
+            "(Railway volume / Azure Files), else alert dedup + heartbeat state "
+            "reset on every redeploy", data_dir,
+        )
+    else:
+        log.info("DATA_DIR=%s (persistent)", data_dir)
+
     scheduler.add_job(
         poller.run,
         "interval",
@@ -71,7 +84,10 @@ async def lifespan(app: FastAPI):
         id="fleet_poll",
         max_instances=1,
         coalesce=True,
-        next_run_time=None,  # APScheduler picks "now"; we also kick off a manual first run below
+        # NOTE: do NOT pass next_run_time=None here — in APScheduler that adds the
+        # job PAUSED (next_run_time stays None) so the interval never fires and the
+        # monitor goes silent after the one eager poll below. Omitting it lets the
+        # scheduler compute the normal first fire time (now + interval).
     )
     scheduler.start()
     log.info("scheduler started — polling every %ds", POLL_INTERVAL_SECS)
@@ -101,7 +117,9 @@ def root(_: str = Depends(require_admin)):
     index = STATIC_DIR / "index.html"
     if not index.exists():
         return JSONResponse({"error": "dashboard html missing"}, status_code=500)
-    return FileResponse(index)
+    # Never cache the dashboard shell — an ops view must always reflect the
+    # latest deploy, not a stale copy the browser cached on a prior visit.
+    return FileResponse(index, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/state")
@@ -110,6 +128,13 @@ def api_state(_: str = Depends(require_admin)):
     if not snapshot:
         return {"empty": True, "message": "no poll has completed yet"}
     return snapshot
+
+
+@app.get("/api/poll-health")
+def api_poll_health(_: str = Depends(require_admin)):
+    """Backend liveness — whether the poller can reach the main backend.
+    Drives the heartbeat banner so a backend outage isn't silent."""
+    return state.load_poll_health()
 
 
 @app.post("/webhook/event")

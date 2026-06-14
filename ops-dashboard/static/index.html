@@ -28,59 +28,69 @@
       <div class="text-center"><div class="text-2xl font-bold text-amber-600" id="cnt-unbound">—</div><div class="text-slate-500">unbound</div></div>
     </div>
   </div>
-  <div class="mt-3 flex gap-4 text-sm">
-    <label class="flex items-center gap-2 cursor-pointer">
-      <input type="checkbox" id="show-users" checked class="rounded">
-      <span>Users (paired view)</span>
-    </label>
-    <label class="flex items-center gap-2 cursor-pointer">
-      <input type="checkbox" id="show-bots" checked class="rounded">
-      <span>Bots (debug view)</span>
-    </label>
+  <div class="mt-3 flex gap-1 text-sm">
+    <button id="tab-btn-overview" class="px-4 py-1.5 rounded-t font-medium border-b-2 border-sky-500 text-sky-700">
+      Overview <span id="tab-badge" class="ml-1"></span>
+    </button>
+    <button id="tab-btn-details" class="px-4 py-1.5 rounded-t font-medium border-b-2 border-transparent text-slate-500 hover:text-slate-700">
+      Details
+    </button>
   </div>
 </header>
 
 <main class="p-6 space-y-6">
+  <div id="backend-banner" class="hidden mb-4 p-3 rounded text-sm"></div>
   <div id="msg" class="hidden mb-4 p-3 rounded bg-amber-50 border border-amber-200 text-amber-900 text-sm"></div>
 
-  <!-- TABLE 1: USERS -->
-  <section id="sec-users" class="bg-white rounded shadow-sm border border-slate-200 overflow-hidden">
+  <!-- ═══════ TAB 1 · OVERVIEW (clean, triage-first) ═══════ -->
+  <div id="tab-overview" class="space-y-6">
+    <section id="sec-issues" class="bg-white rounded shadow-sm border border-slate-200 overflow-hidden">
+      <div id="issues-head" class="px-4 py-2 border-b border-slate-200 text-sm font-semibold bg-slate-100 text-slate-700">Issues</div>
+      <table class="w-full text-sm"><tbody id="rows-issues"></tbody></table>
+    </section>
+  </div>
+
+  <!-- ═══════ TAB 2 · DETAILS (data-heavy deep-dive) ═══════ -->
+  <div id="tab-details" class="space-y-6 hidden">
+
+  <!-- ACCOUNTS: one row per client — collapsed = summary, expand = detail -->
+  <section id="sec-accounts" class="bg-white rounded shadow-sm border border-slate-200 overflow-hidden">
     <div class="px-4 py-2 bg-slate-100 border-b border-slate-200 text-sm font-semibold text-slate-700">
-      Users — one row per client account
+      Accounts — one row per client · click a row to expand
     </div>
     <table class="w-full text-sm">
       <thead class="bg-slate-50 text-slate-600">
         <tr>
-          <th class="px-3 py-2 text-left">User</th>
+          <th class="px-3 py-2 text-left">Account</th>
+          <th class="px-3 py-2 text-left">Auth</th>
           <th class="px-3 py-2 text-left">Bot</th>
-          <th class="px-3 py-2 text-left">User auth</th>
-          <th class="px-3 py-2 text-left">Bot auth</th>
           <th class="px-3 py-2 text-left">Briefings</th>
-          <th class="px-3 py-2 text-left">Last user msg → bot</th>
+          <th class="px-3 py-2 text-left">Push quality</th>
         </tr>
       </thead>
-      <tbody id="rows-users"></tbody>
+      <tbody id="rows-accounts"></tbody>
     </table>
   </section>
 
-  <!-- TABLE 2: BOTS -->
-  <section id="sec-bots" class="bg-white rounded shadow-sm border border-slate-200 overflow-hidden">
+  <!-- SCHEDULED JOBS (fleet-level) -->
+  <section id="sec-jobs" class="bg-white rounded shadow-sm border border-slate-200 overflow-hidden">
     <div class="px-4 py-2 bg-slate-100 border-b border-slate-200 text-sm font-semibold text-slate-700">
-      Bots — one row per assistant account
+      Scheduled jobs — is the background work actually running?
     </div>
     <table class="w-full text-sm">
       <thead class="bg-slate-50 text-slate-600">
         <tr>
-          <th class="px-3 py-2 text-left">Bot</th>
-          <th class="px-3 py-2 text-left">Owner</th>
-          <th class="px-3 py-2 text-left">Auth</th>
-          <th class="px-3 py-2 text-left">Enabled</th>
-          <th class="px-3 py-2 text-left">Last user msg</th>
+          <th class="px-3 py-2 text-left">Job</th>
+          <th class="px-3 py-2 text-left">Status</th>
+          <th class="px-3 py-2 text-left">Last success</th>
+          <th class="px-3 py-2 text-left">Last run</th>
+          <th class="px-3 py-2 text-left">Last error</th>
         </tr>
       </thead>
-      <tbody id="rows-bots"></tbody>
+      <tbody id="rows-jobs"></tbody>
     </table>
   </section>
+  </div><!-- /tab-details -->
 </main>
 
 <script>
@@ -146,78 +156,227 @@ const render = data => {
   document.getElementById("cnt-broken").textContent  = data.broken || 0;
   document.getElementById("cnt-unbound").textContent = unbound;
 
-  // ── TABLE 1: USERS (paired with their bot) ─────────────
-  const rowsU = document.getElementById("rows-users");
-  rowsU.innerHTML = "";
+  // ── ACCOUNTS: one row per client (bot + quality folded in) ─────────────
+  const pq = data.push_qa;
+  const pqByUid = {};
+  if (pq) for (const pu of (pq.users || [])) pqByUid[pu.uid] = pu;
+
+  const verdictPill = v =>
+      v === "fail" ? '<span class="text-rose-700 font-medium">fail</span>'
+    : v === "warn" ? '<span class="text-amber-600">warn</span>'
+    : v === "ok"   ? '<span class="text-emerald-700">ok</span>'
+    : '<span class="text-slate-400">' + (v || "—") + '</span>';
+
+  const qualitySummary = pu => {
+    if (!pu || !(pu.sections || []).length) return '<span class="text-slate-300">—</span>';
+    const parts = [];
+    if (pu.fail) parts.push('<span class="text-rose-700 font-medium">✗' + pu.fail + '</span>');
+    if (pu.warn) parts.push('<span class="text-amber-600">⚠' + pu.warn + '</span>');
+    if (pu.ok)   parts.push('<span class="text-emerald-700">✓' + pu.ok + '</span>');
+    return parts.join(' ') || '<span class="text-slate-300">—</span>';
+  };
+
+  const accountExpand = (u, uh, bot, bh, pu) => {
+    const tr = document.createElement("tr");
+    tr.className = "row-expand bg-slate-50";
+    let html = '<td colspan="5" class="px-6 py-3 space-y-3">';
+    html += '<div><div class="text-xs font-semibold text-slate-500 mb-1">AUTH</div>';
+    if (uh.last_error)  html += '<div class="text-rose-700 text-xs"><b>last error:</b> ' + (typeof uh.last_error === "string" ? uh.last_error : JSON.stringify(uh.last_error)) + '</div>';
+    if (uh.broken_since) html += '<div class="text-rose-700 text-xs"><b>broken since:</b> ' + uh.broken_since + '</div>';
+    html += '<pre class="text-xs text-slate-600 bg-white p-2 rounded border border-slate-200 whitespace-pre-wrap mt-1">' + ((u.diag_log_tail || []).join("\n") || '(no diag log)') + '</pre></div>';
+    if (bot) {
+      const bs = bot.bot || {};
+      html += '<div><div class="text-xs font-semibold text-slate-500 mb-1">BOT · ' + (bot.username || "?") + '</div>' +
+        '<div class="text-xs text-slate-600">auth ' + authPill(bh.status, bh.consecutive_failures) +
+        ' · enabled ' + (bs.enabled ? 'true' : 'false') +
+        ' · last user msg ' + (bs.last_seen_ts ? fmtTs(bs.last_seen_ts) : 'never') + '</div></div>';
+    }
+    if (pu && (pu.sections || []).length) {
+      html += '<div><div class="text-xs font-semibold text-slate-500 mb-1">PUSH QUALITY · checked ' + fmtTs(pq.generated_at) + '</div><div class="text-xs space-y-0.5">';
+      for (const s of pu.sections) {
+        html += '<div>' + s.section_id + ': ' + verdictPill(s.verdict) +
+          (s.score != null ? ' <span class="text-slate-400">(' + s.score + '/5)</span>' : '') +
+          (s.ai_checked === false ? ' <span class="text-slate-300">· heuristics only</span>' : '') + '</div>';
+      }
+      html += '</div></div>';
+    }
+    html += '</td>';
+    tr.innerHTML = html;
+    return tr;
+  };
+
+  const rowsA = document.getElementById("rows-accounts");
+  rowsA.innerHTML = "";
+  const linkedBotUids = new Set(userRecords.map(u => u.linked_bot_uid).filter(Boolean));
   for (const u of userRecords) {
     if (u.error) {
       const er = document.createElement("tr");
       er.className = "border-t border-slate-100";
-      er.innerHTML = '<td colspan="6" class="px-3 py-2 text-rose-600">' + u.uid + ": " + u.error + '</td>';
-      rowsU.appendChild(er);
+      er.innerHTML = '<td colspan="5" class="px-3 py-2 text-rose-600">' + u.uid + ": " + u.error + '</td>';
+      rowsA.appendChild(er);
       continue;
     }
     const uh = u.health || {};
     const bot = u.linked_bot_uid ? botsByUid[u.linked_bot_uid] : null;
     const bh = bot ? (bot.health || {}) : null;
+    const pu = pqByUid[u.uid];
     const botCell = bot
-      ? '<div class="font-medium text-slate-700">' + (bot.username || "?") + '</div>' +
-        '<div class="text-xs text-slate-400">' + bot.uid.slice(0,8) + '</div>'
+      ? authPill(bh.status, bh.consecutive_failures) + ' <span class="text-slate-400">' + (bot.username || "") + '</span>'
       : '<span class="text-amber-600 font-medium">⚠️ not bound</span>';
-    const lastMsg = bot && bot.bot && bot.bot.last_seen_ts
-      ? '<span class="text-slate-600">' + fmtTs(bot.bot.last_seen_ts) + '</span>'
-      : (bot ? '<span class="text-slate-400">never used</span>' : '<span class="text-slate-300">—</span>');
-
     const tr = document.createElement("tr");
-    tr.className = "border-t border-slate-100 cursor-pointer hover:bg-slate-50";
+    tr.className = "border-t border-slate-100 cursor-pointer hover:bg-slate-50" +
+      ((uh.status === "broken" || (pu && pu.fail)) ? " bg-rose-50" : "");
     tr.innerHTML =
       '<td class="px-3 py-2">' + userCellName(u) + '</td>' +
-      '<td class="px-3 py-2 text-xs">' + botCell + '</td>' +
       '<td class="px-3 py-2 text-xs">' + authPill(uh.status, uh.consecutive_failures) +
-        '<div class="text-slate-400 mt-1">refresh ' + fmtTs(uh.last_success_at) + '</div></td>' +
-      '<td class="px-3 py-2 text-xs">' +
-        (bh ? authPill(bh.status, bh.consecutive_failures) +
-              '<div class="text-slate-400 mt-1">refresh ' + fmtTs(bh.last_success_at) + '</div>'
-            : '<span class="text-slate-300">—</span>') + '</td>' +
+        '<div class="text-slate-400 mt-0.5">refresh ' + fmtTs(uh.last_success_at) + '</div></td>' +
+      '<td class="px-3 py-2 text-xs">' + botCell + '</td>' +
       '<td class="px-3 py-2 text-xs text-slate-600">' + briefingsCell(u.briefings) + '</td>' +
-      '<td class="px-3 py-2 text-xs">' + lastMsg + '</td>';
-
+      '<td class="px-3 py-2 text-xs">' + qualitySummary(pu) + '</td>';
     tr.onclick = () => tr.classList.toggle("expanded");
-    rowsU.appendChild(tr);
-    rowsU.appendChild(expandRow(6, uh, u.diag_log_tail));
+    rowsA.appendChild(tr);
+    rowsA.appendChild(accountExpand(u, uh, bot, bh, pu));
   }
-
-  // ── TABLE 2: BOTS (debug view) ──────────────────────────
-  const rowsB = document.getElementById("rows-bots");
-  rowsB.innerHTML = "";
+  // Orphan bots: registered bot accounts whose owner isn't in the user list
   for (const b of botRecords) {
-    if (b.error) continue;
+    if (b.error || linkedBotUids.has(b.uid)) continue;
     const bh = b.health || {};
-    const bs = b.bot || {};
     const tr = document.createElement("tr");
     tr.className = "border-t border-slate-100 cursor-pointer hover:bg-slate-50";
     tr.innerHTML =
-      '<td class="px-3 py-2">' + userCellName(b) + '</td>' +
-      '<td class="px-3 py-2 text-xs text-slate-600">' + (b.owner_email || '<span class="text-amber-600">unbound</span>') + '</td>' +
-      '<td class="px-3 py-2 text-xs">' + authPill(bh.status, bh.consecutive_failures) + '</td>' +
-      '<td class="px-3 py-2 text-xs">' + (bs.enabled ? '<span class="text-emerald-700">true</span>' : '<span class="text-slate-400">false</span>') + '</td>' +
-      '<td class="px-3 py-2 text-xs">' +
-        (bs.last_seen_ts
-          ? '<span class="text-slate-600">' + fmtTs(bs.last_seen_ts) + '</span>'
-          : '<span class="text-slate-400">never used</span>') + '</td>';
-
+      '<td class="px-3 py-2">' + userCellName(b) + '<div class="text-xs text-amber-600">bot · no owner</div></td>' +
+      '<td class="px-3 py-2 text-xs">' + authPill(bh.status, bh.consecutive_failures) +
+        '<div class="text-slate-400 mt-0.5">refresh ' + fmtTs(bh.last_success_at) + '</div></td>' +
+      '<td class="px-3 py-2 text-xs text-slate-300">—</td>' +
+      '<td class="px-3 py-2 text-xs text-slate-300">—</td>' +
+      '<td class="px-3 py-2 text-xs text-slate-300">—</td>';
     tr.onclick = () => tr.classList.toggle("expanded");
-    rowsB.appendChild(tr);
-    rowsB.appendChild(expandRow(5, bh, b.diag_log_tail));
+    rowsA.appendChild(tr);
+    rowsA.appendChild(expandRow(5, bh, b.diag_log_tail));
+  }
+
+  // ── SCHEDULED JOBS (fleet-level) ─────────────────────────
+  const jobStale = j => {
+    const exp = j.expected_interval_secs;
+    if ((j.consecutive_failures || 0) >= 5) return true;
+    if (!exp) return false;
+    const ref = j.last_success || j.last_run;
+    if (!ref) return false;
+    const age = (Date.now() - new Date(ref).getTime()) / 1000;
+    return age > Math.max(exp * 3, 300);
+  };
+  const rowsJ = document.getElementById("rows-jobs");
+  rowsJ.innerHTML = "";
+  for (const j of (data.jobs || [])) {
+    const stale = jobStale(j);
+    const tr = document.createElement("tr");
+    tr.className = "border-t border-slate-100";
+    const statusCell = stale
+      ? '<span class="dot bg-rose-500"></span><span class="text-rose-700 font-medium">stalled/failing</span>'
+        + ((j.consecutive_failures || 0) ? ' <span class="text-rose-600 text-xs">×' + j.consecutive_failures + '</span>' : '')
+      : '<span class="dot bg-emerald-500"></span><span>ok</span>';
+    tr.innerHTML =
+      '<td class="px-3 py-2 font-mono text-xs">' + (j.job_id || "?") + '</td>' +
+      '<td class="px-3 py-2 text-xs">' + statusCell + '</td>' +
+      '<td class="px-3 py-2 text-xs text-slate-600">' + fmtTs(j.last_success) + '</td>' +
+      '<td class="px-3 py-2 text-xs text-slate-500">' + fmtTs(j.last_run) + '</td>' +
+      '<td class="px-3 py-2 text-xs text-rose-600">' + (j.last_error ? String(j.last_error).slice(0,120) : "—") + '</td>';
+    rowsJ.appendChild(tr);
+  }
+  if (!(data.jobs || []).length) {
+    rowsJ.innerHTML = '<tr><td colspan="5" class="px-3 py-3 text-slate-400">no job-health data yet</td></tr>';
+  }
+
+  // ── ISSUES: aggregate every non-green signal into one triage list ───
+  const issues = [];
+  for (const u of users) {                       // broken auth (users + bots)
+    if (u.error) continue;
+    const h = u.health || {};
+    if (h.status === "broken") {
+      issues.push({ sev: "high", entity: (u.username || u.uid.slice(0,8)),
+        kind: u.role === "bot" ? "bot auth" : "auth",
+        detail: "broken" + (h.consecutive_failures ? " ×" + h.consecutive_failures : ""),
+        lines: [
+          h.last_error ? "last error: " + (typeof h.last_error === "string" ? h.last_error : JSON.stringify(h.last_error)) : "",
+          h.broken_since ? "broken since: " + h.broken_since : "",
+          ...(u.diag_log_tail || []),
+        ].filter(Boolean) });
+    }
+  }
+  for (const u of userRecords) {                 // user with no bot bound (warn)
+    if (!u.error && !u.linked_bot_uid)
+      issues.push({ sev: "warn", entity: (u.username || u.uid.slice(0,8)), kind: "no bot",
+        detail: "no assistant bound",
+        lines: ["This user has no assistant bot linked — scheduled briefings and email pushes have nowhere to go."] });
+  }
+  for (const j of (data.jobs || [])) {           // stalled / failing scheduled jobs
+    if (jobStale(j))
+      issues.push({ sev: "high", entity: (j.job_id || "?"), kind: "job",
+        detail: "stalled/failing" + (j.consecutive_failures ? " ×" + j.consecutive_failures : ""),
+        lines: [
+          j.last_success ? "last success: " + fmtTs(j.last_success) : "never succeeded",
+          j.last_error ? "error: " + j.last_error : "",
+        ].filter(Boolean) });
+  }
+  if (pq) for (const u of (pq.users || [])) {     // push-quality fails
+    for (const s of (u.sections || [])) {
+      if (s.verdict === "fail")
+        issues.push({ sev: "high", entity: (u.username || u.uid.slice(0,8)), kind: "quality",
+          detail: s.section_id + " " + (s.score != null ? s.score + "/5 " : "") + "fail",
+          lines: ["This section's last push failed the quality spot-check (empty / fabricated / off-target output reaching the user)."] });
+    }
+  }
+
+  const sevRank = { high: 0, warn: 1 };
+  issues.sort((a, b) => sevRank[a.sev] - sevRank[b.sev]);
+  const head  = document.getElementById("issues-head");
+  const rowsI = document.getElementById("rows-issues");
+  const badge = document.getElementById("tab-badge");
+  rowsI.innerHTML = "";
+  const highCount = issues.filter(i => i.sev === "high").length;
+  badge.textContent = issues.length || "";
+  badge.className = !issues.length ? "ml-1"
+    : "ml-1 inline-block min-w-[1.25rem] px-1.5 rounded-full text-xs text-white text-center " + (highCount ? "bg-rose-500" : "bg-amber-500");
+  if (!issues.length) {
+    head.className = "px-4 py-2 border-b border-slate-200 text-sm font-semibold bg-emerald-50 text-emerald-800";
+    head.innerHTML = "✅ No active issues";
+  } else {
+    const high = highCount;
+    head.className = "px-4 py-2 border-b border-slate-200 text-sm font-semibold bg-rose-50 text-rose-800";
+    head.innerHTML = "⚠️ Issues (" + issues.length + ")" + (high ? " · " + high + " critical" : "");
+    for (const it of issues) {
+      const dot = it.sev === "high" ? "bg-rose-500" : "bg-amber-500";
+      const tr = document.createElement("tr");
+      tr.className = "border-t border-slate-100 cursor-pointer hover:bg-slate-50";
+      tr.innerHTML =
+        '<td class="px-3 py-2 w-6"><span class="dot ' + dot + '"></span></td>' +
+        '<td class="px-3 py-2 font-medium">' + it.entity + '</td>' +
+        '<td class="px-3 py-2 text-xs text-slate-500 uppercase">' + it.kind + '</td>' +
+        '<td class="px-3 py-2 text-xs ' + (it.sev === "high" ? "text-rose-700" : "text-amber-700") + '">' + it.detail + '</td>' +
+        '<td class="px-3 py-2 text-xs text-slate-300 text-right">▸</td>';
+      const ex = document.createElement("tr");
+      ex.className = "row-expand bg-slate-50";
+      ex.innerHTML = '<td colspan="5" class="px-6 py-3"><pre class="text-xs text-slate-600 bg-white p-2 rounded border border-slate-200 whitespace-pre-wrap">' +
+        ((it.lines || []).join("\n") || "(no detail)") + '</pre></td>';
+      tr.onclick = () => tr.classList.toggle("expanded");
+      rowsI.appendChild(tr);
+      rowsI.appendChild(ex);
+    }
   }
 };
 
-const applyToggles = () => {
-  document.getElementById("sec-users").style.display = document.getElementById("show-users").checked ? "" : "none";
-  document.getElementById("sec-bots").style.display  = document.getElementById("show-bots").checked  ? "" : "none";
+// ── Tabs: Overview (clean triage) vs Details (data-heavy) ──
+const TAB_ON  = "px-4 py-1.5 rounded-t font-medium border-b-2 border-sky-500 text-sky-700";
+const TAB_OFF = "px-4 py-1.5 rounded-t font-medium border-b-2 border-transparent text-slate-500 hover:text-slate-700";
+const setTab = name => {
+  document.getElementById("tab-overview").classList.toggle("hidden", name !== "overview");
+  document.getElementById("tab-details").classList.toggle("hidden", name !== "details");
+  document.getElementById("tab-btn-overview").className = (name === "overview" ? TAB_ON : TAB_OFF) + " inline-flex items-center";
+  document.getElementById("tab-btn-details").className  = name === "details"  ? TAB_ON : TAB_OFF;
 };
-document.getElementById("show-users").addEventListener("change", applyToggles);
-document.getElementById("show-bots").addEventListener("change", applyToggles);
+document.getElementById("tab-btn-overview").addEventListener("click", () => setTab("overview"));
+document.getElementById("tab-btn-details").addEventListener("click", () => setTab("details"));
+setTab("overview");
 
 const load = async () => {
   try {
@@ -237,8 +396,29 @@ const load = async () => {
   }
 };
 
+const loadBackendHealth = async () => {
+  const banner = document.getElementById("backend-banner");
+  try {
+    const r = await fetch("/api/poll-health", { credentials: "same-origin" });
+    if (!r.ok) return;
+    const h = await r.json();
+    banner.classList.remove("hidden");
+    if (h.status === "down") {
+      banner.className = "mb-4 p-3 rounded text-sm bg-rose-50 border border-rose-300 text-rose-900";
+      banner.innerHTML = "<b>⚠️ Main backend unreachable</b> — " +
+        (h.consecutive_failures || 0) + " consecutive poll failure(s)" +
+        (h.down_since ? ", down since " + fmtTs(h.down_since) : "") +
+        (h.last_error ? "<div class='text-xs mt-1 text-rose-700'>" + h.last_error + "</div>" : "");
+    } else {
+      banner.className = "mb-4 p-3 rounded text-sm bg-emerald-50 border border-emerald-200 text-emerald-800";
+      banner.innerHTML = "✅ Backend healthy — last reached " + fmtTs(h.last_success_at);
+    }
+  } catch (e) { /* leave banner as-is on fetch error */ }
+};
+
 load();
-setInterval(load, 30000);
+loadBackendHealth();
+setInterval(() => { load(); loadBackendHealth(); }, 30000);
 </script>
 
 </body>
