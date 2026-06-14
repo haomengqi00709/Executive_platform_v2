@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR
 
 from src import auth
 from src.graph import GraphClient
@@ -97,6 +98,122 @@ def _user_settings(user_id: str) -> Path:
 
 def _user_bot_link_path(user_id: str) -> Path:
     return _udir(user_id) / "bot_link.json"
+
+
+# ── Ops: scheduler job health (stream 2) ──────────────────
+# An APScheduler listener records last_run / last_success / last_error per job id
+# to a fleet-global file, so the ops dashboard can tell whether scheduled work is
+# actually running — auth can read "healthy" while a dead job means no briefings
+# go out. Recording is best-effort and never raises into the scheduler.
+
+_OPS_DIR = auth.DATA_DIR / "_ops"
+_JOB_HEALTH_PATH = _OPS_DIR / "job_health.json"
+
+# Expected cadence per job (seconds), so the ops side can flag staleness
+# sensibly — a 10s bot poll and a weekly cleanup need very different thresholds.
+_JOB_EXPECTED_INTERVAL_SECS = {
+    "teams_bot_poll":          10,
+    "email_monitor_poll":      60,
+    "expense_scan_poll":       60,
+    "meeting_prep_poll":       300,
+    "meeting_recordings_poll": 1200,
+    "init_stuck_detector":     60,
+    "crm_daily_refresh":       86400,
+    "projects_daily_refresh":  86400,
+    "companies_daily_refresh": 86400,
+    "db_cleanup_weekly":       604800,
+    "canary_probe":            900,
+    "push_qa_poll":            3600,
+}
+
+
+def _record_job_event(event) -> None:
+    """APScheduler listener — records success/failure timing per job id.
+    Best-effort: any error here must never disturb the scheduler."""
+    try:
+        job_id = getattr(event, "job_id", None)
+        if not job_id:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        all_health = _read_json(_JOB_HEALTH_PATH)
+        rec = all_health.get(job_id) or {}
+        rec["last_run"] = now
+        if getattr(event, "exception", None):
+            rec["last_error"] = str(event.exception)[:500]
+            rec["last_error_at"] = now
+            rec["consecutive_failures"] = rec.get("consecutive_failures", 0) + 1
+        else:
+            rec["last_success"] = now
+            rec["last_error"] = None
+            rec["consecutive_failures"] = 0
+        exp = _JOB_EXPECTED_INTERVAL_SECS.get(job_id)
+        if exp:
+            rec["expected_interval_secs"] = exp
+        all_health[job_id] = rec
+        _write_json(_JOB_HEALTH_PATH, all_health)
+    except Exception:
+        pass
+
+
+def _run_canary_probe() -> None:
+    """Synthetic end-to-end probe: exercises the critical path (token refresh →
+    Graph reach) for a designated canary account, so breakage surfaces before a
+    real customer hits it. No-op unless CANARY_UID names an existing account.
+    Raises on failure so the job-health listener records it uniformly — a failing
+    canary then shows up as a stalled `canary_probe` job and pages ops."""
+    uid = (os.getenv("CANARY_UID") or "").strip()
+    if not uid:
+        return  # canary not configured — opt-in via env
+    token = auth.get_valid_access_token(uid)   # raises if auth is broken
+    GraphClient(token).get_me()                # raises if Graph is unreachable
+
+
+def _poll_push_qa_all_users() -> None:
+    """Sample recent section pushes per user and score quality (stream 4).
+    Gated OFF by default — set PUSH_QA_ENABLED=true to run. Writes a fleet
+    roll-up to _ops/push_qa.json that the ops dashboard surfaces. Best-effort:
+    never raises into the scheduler."""
+    if (os.getenv("PUSH_QA_ENABLED") or "").strip().lower() not in ("1", "true", "yes", "on"):
+        return  # not enabled — makes Gemini calls, so opt-in only
+    from src.modules import push_qa
+
+    sessions_dir = auth.DATA_DIR / "_sessions"
+    if not sessions_dir.exists():
+        return
+    ai = AIClient()
+    roll_up = {"generated_at": datetime.now(timezone.utc).isoformat(), "users": []}
+    for token_file in sessions_dir.glob("*.json"):
+        uid = token_file.stem
+        bot_path = _bot_state_path(uid)
+        if bot_path.exists() and _is_bound_bot(_read_json(bot_path)):
+            continue  # QA the human owner's pushes, not the bot account
+        try:
+            graph = GraphClient(auth.get_valid_access_token(uid))
+        except Exception:
+            graph = None  # auth broken — heuristics/judge still run, grounding skips
+        try:
+            settings = _read_json(_user_settings(uid))
+            display_name = settings.get("display_name") or "the executive"
+            summary = push_qa.run_for_user(_udir(uid), ai, graph, display_name)
+            roll_up["users"].append({
+                "uid":      uid,
+                "username": (auth.load_user_tokens(uid) or {}).get("username", ""),
+                "fail":     summary.get("fail", 0),
+                "warn":     summary.get("warn", 0),
+                "ok":       summary.get("ok", 0),
+                "sections": [
+                    {"section_id": s.get("section_id"), "verdict": s.get("verdict"),
+                     "score": (s.get("judge") or {}).get("overall"),
+                     "ai_checked": s.get("ai_checked", False)}
+                    for s in summary.get("sections", [])
+                ],
+            })
+        except Exception as e:
+            print(f"[PushQA] Error for {uid}: {e}")
+    try:
+        _write_json(_OPS_DIR / "push_qa.json", roll_up)
+    except Exception:
+        pass
 
 
 def _get_bot_display_name(user_id: str) -> str:
@@ -1234,12 +1351,33 @@ def admin_fleet_health(x_admin_token: str | None = Header(None, alias="X-Admin-T
 
     healthy = sum(1 for u in users if (u.get("health") or {}).get("status") == "healthy")
     broken  = sum(1 for u in users if (u.get("health") or {}).get("status") == "broken")
+
+    # Scheduler job health (stream 2) — flat list the ops side checks for staleness.
+    jobs = []
+    try:
+        jh = _read_json(_JOB_HEALTH_PATH)
+        for jid, rec in sorted(jh.items()):
+            jobs.append({"job_id": jid, **(rec if isinstance(rec, dict) else {})})
+    except Exception:
+        pass
+
+    # Push-quality roll-up (stream 4) — present only once push_qa has run.
+    push_qa = None
+    try:
+        pq = _read_json(_OPS_DIR / "push_qa.json")
+        if pq:
+            push_qa = pq
+    except Exception:
+        pass
+
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "user_count":   len(users),
         "healthy":      healthy,
         "broken":       broken,
         "users":        users,
+        "jobs":         jobs,
+        "push_qa":      push_qa,
     }
 
 
@@ -4872,6 +5010,8 @@ def startup_event():
     # clean state.
     _reset_stuck_running_results()
     _scheduler.start()
+    # Ops: record per-job success/failure timing for the fleet-health endpoint.
+    _scheduler.add_listener(_record_job_event, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
     _scheduler.add_job(
         _detect_stuck_init_chains,
         trigger="interval",
@@ -4953,6 +5093,28 @@ def startup_event():
         trigger="interval",
         minutes=20,
         id="meeting_recordings_poll",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    # Ops: synthetic canary probe (no-op unless CANARY_UID is set) — exercises
+    # token→Graph for one account every 15 min so breakage surfaces end-to-end.
+    _scheduler.add_job(
+        _run_canary_probe,
+        trigger="interval",
+        minutes=15,
+        id="canary_probe",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    # Ops: push-quality spot-check (gated OFF by default — set PUSH_QA_ENABLED=true
+    # to turn on; it makes Gemini judge/grounding calls and costs quota).
+    _scheduler.add_job(
+        _poll_push_qa_all_users,
+        trigger="interval",
+        minutes=60,
+        id="push_qa_poll",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
