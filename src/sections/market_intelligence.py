@@ -81,6 +81,8 @@ def _load_user_instruction(data_dir: Path) -> str:
 
 def _parse_raw(raw: str, ai: AIClient) -> list[dict]:
     clean = raw.strip()
+    if not clean:
+        return []  # empty search result = "no news" — don't fire an AI repair call on nothing
     if clean.startswith("```"):
         clean = clean.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
     try:

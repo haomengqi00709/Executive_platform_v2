@@ -15,6 +15,7 @@ import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -135,6 +136,35 @@ def api_poll_health(_: str = Depends(require_admin)):
     """Backend liveness — whether the poller can reach the main backend.
     Drives the heartbeat banner so a backend outage isn't silent."""
     return state.load_poll_health()
+
+
+@app.post("/api/budget/unblock")
+async def budget_unblock(request: Request, _: str = Depends(require_admin)):
+    """Lift a user's daily block — PROXIED to the main backend so the admin token stays
+    server-side (the browser only ever talks to this Basic-Auth'd dashboard). Body {uid, extra_usd?}.
+    The mutation is done by the main app (system-of-record); this service never writes .data."""
+    return _proxy_to_main("/api/admin/budget/unblock", await request.json())
+
+
+@app.post("/api/budget/plan")
+async def budget_plan(request: Request, _: str = Depends(require_admin)):
+    """Change a user's plan/limit — proxied to the main backend. Body {uid, plan|daily_budget_usd}."""
+    return _proxy_to_main("/api/admin/budget/plan", await request.json())
+
+
+def _proxy_to_main(path: str, body: dict):
+    main_url = (os.getenv("MAIN_BACKEND_URL") or "").rstrip("/")
+    token = os.getenv("OPS_ADMIN_TOKEN")
+    if not main_url or not token:
+        raise HTTPException(503, "MAIN_BACKEND_URL/OPS_ADMIN_TOKEN not configured")
+    try:
+        r = requests.post(f"{main_url}{path}", json=body,
+                          headers={"X-Admin-Token": token}, timeout=30)
+    except Exception as e:
+        raise HTTPException(502, f"main backend unreachable: {e}")
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, r.text[:200])
+    return r.json()
 
 
 @app.post("/webhook/event")

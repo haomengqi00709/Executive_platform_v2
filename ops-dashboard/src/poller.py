@@ -68,6 +68,7 @@ def run() -> None:
     transitions = state.diff(prev, snapshot)            # auth healthy↔broken (edges)
     transitions += state.detect_job_transitions(snapshot)   # stalled/failing jobs (level)
     transitions += state.detect_pushqa_transitions(snapshot) # low push quality (level)
+    transitions += state.detect_budget_transitions(snapshot)  # per-user daily budget hit
     if transitions:
         log.info("detected %d transitions: %s", len(transitions),
                  [t["key"] for t in transitions])

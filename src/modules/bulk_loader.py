@@ -226,6 +226,7 @@ def _run_ai_on_pdf(ai: AIClient, file_bytes: bytes, prompt_builder) -> list[dict
                 prompt,
             ],
         )
+        ai.record_external_usage(response)
         return _parse_json_array(response.text or "")
     finally:
         Path(tmp).unlink(missing_ok=True)

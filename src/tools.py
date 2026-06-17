@@ -172,14 +172,20 @@ def search_web(query: str, user_context: str = "") -> str:
         preamble += f"User context: {user_context}\n"
 
     try:
+        from src.ai import _record_usage
+        # Kept on 2.5-flash ON PURPOSE: grounded search there is billed per REQUEST and has a
+        # free daily tier, so it avoids 3.x's per-QUERY fan-out billing. We do NOT switch this
+        # to the 3.x default. (Previously this call was also completely unmetered.)
+        _SEARCH_MODEL = "gemini-2.5-flash"
         gc     = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
         result = gc.models.generate_content(
-            model   = "gemini-2.5-flash",
+            model   = _SEARCH_MODEL,
             contents= preamble + "\n" + query,
             config  = types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())],
             ),
         )
+        _record_usage(result, is_search=True, model=_SEARCH_MODEL)
         return result.text or "No results found."
     except Exception as e:
         return f"Search failed: {e}"

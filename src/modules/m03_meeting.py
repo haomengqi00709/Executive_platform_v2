@@ -687,6 +687,7 @@ def _transcribe_video_fallback(video_bytes: bytes, filename: str, ai: AIClient) 
                             "Transcribe only the FIRST 20 MINUTES of speech. Include speaker labels and timestamps.",
                         ]
                     )
+                    ai.record_external_usage(response)
                     return (response.text or "") + \
                         "\n\n[NOTE: Transcript truncated — first 20 minutes only.]"
                 finally:

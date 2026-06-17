@@ -73,6 +73,14 @@ def _summary(t: dict) -> tuple[str, str, str]:
         jid = t.get("job_id", "?")
         return (f"✅ Job recovered: {jid}",
                 f"Scheduled job '{jid}' is succeeding again.", "good")
+    if typ == "budget_capped":
+        title = f"💸 Daily budget hit: {who}"
+        body  = (f"User '{who}' reached their daily AI budget "
+                 f"(${t.get('spent','?')}/${t.get('budget','?')}, plan {t.get('plan','?')}). "
+                 f"Expensive features (e.g. {t.get('feature','?')}) are paused for the rest of "
+                 "today; cheap features (bot chat, drafts) still run. Unblock in the ops dashboard "
+                 "if this user needs more today.")
+        return title, body, "warning"
     if typ == "pushqa_low":
         secs = ", ".join(t.get("sections") or []) or "one or more sections"
         title = f"⚠️ Push quality low: {who}"
