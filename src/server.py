@@ -22,7 +22,7 @@ from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR
 
 from src import auth
 from src.graph import GraphClient
-from src.ai import AIClient
+from src.ai import AIClient, usage_context
 from src.modules.tz import get_user_tz, now_local, today_local_str
 from src.sections import ai_summary, expenses, reply_needed, followup_needed, commitments_extract, upcoming_commitments
 from src.sections import recent_meetings, meeting_action_items
@@ -734,7 +734,8 @@ def _poll_expense_scan_all_users():
         try:
             owner_graph = GraphClient(auth.get_valid_access_token(uid))
             ai          = AIClient()
-            result      = expenses.run(owner_graph, ai, _udir(uid), days=1)
+            with usage_context("expenses", uid):
+                result  = expenses.run(owner_graph, ai, _udir(uid), days=1)
             new_items   = result.get("items", [])
             if not new_items:
                 continue
@@ -1370,6 +1371,34 @@ def admin_fleet_health(x_admin_token: str | None = Header(None, alias="X-Admin-T
     except Exception:
         pass
 
+    # Per-feature Gemini token usage (P0 cost visibility).
+    token_usage_summary = None
+    try:
+        from src.modules import token_usage
+        token_usage_summary = token_usage.summary()
+    except Exception:
+        pass
+
+    # Per-user daily budget: each user's spend ($ + tokens, per-feature), who's over, and
+    # recent block events. The ops dashboard renders this + offers unblock (→ endpoints below).
+    budget_block = None
+    try:
+        from src.modules import budget as _budget
+        b_users = []
+        if sessions_dir.exists():
+            for sf in sorted(sessions_dir.glob("*.json")):
+                try:
+                    b_users.append(_budget.status(sf.stem))
+                except Exception:
+                    pass
+        budget_block = {
+            "plans": _budget.PLAN_DAILY_USD,
+            "users": b_users,
+            "block_events_24h": _budget.recent_block_events(24),
+        }
+    except Exception:
+        pass
+
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "user_count":   len(users),
@@ -1378,7 +1407,52 @@ def admin_fleet_health(x_admin_token: str | None = Header(None, alias="X-Admin-T
         "users":        users,
         "jobs":         jobs,
         "push_qa":      push_qa,
+        "token_usage":  token_usage_summary,
+        "budget":       budget_block,
     }
+
+
+def _require_admin_token(x_admin_token: str | None) -> None:
+    """Shared-secret auth for ops endpoints (OPS_ADMIN_TOKEN via X-Admin-Token header)."""
+    expected = os.getenv("OPS_ADMIN_TOKEN")
+    if not expected:
+        raise HTTPException(503, "OPS_ADMIN_TOKEN not configured on this server")
+    if not x_admin_token or not secrets.compare_digest(x_admin_token, expected):
+        raise HTTPException(401, "invalid admin token")
+
+
+@app.post("/api/admin/budget/unblock")
+async def admin_budget_unblock(request: Request,
+                               x_admin_token: str | None = Header(None, alias="X-Admin-Token")):
+    """Admin (ops dashboard): lift a user's daily block. Body {uid, extra_usd?}.
+    No extra_usd → effectively unlimited for the rest of today; a number → top-up."""
+    _require_admin_token(x_admin_token)
+    body = await request.json()
+    uid = (body.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(400, "uid required")
+    from src.modules import budget
+    extra = body.get("extra_usd")
+    return budget.unblock_today(uid, float(extra) if extra is not None else None)
+
+
+@app.post("/api/admin/budget/plan")
+async def admin_budget_plan(request: Request,
+                            x_admin_token: str | None = Header(None, alias="X-Admin-Token")):
+    """Admin (ops dashboard): durably change a user's plan/limit. Body {uid, plan} or
+    {uid, daily_budget_usd}."""
+    _require_admin_token(x_admin_token)
+    body = await request.json()
+    uid = (body.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(400, "uid required")
+    from src.modules import budget
+    if body.get("daily_budget_usd") is not None:
+        return budget.set_daily_budget(uid, float(body["daily_budget_usd"]))
+    plan = (body.get("plan") or "").strip().lower()
+    if plan not in budget.PLAN_DAILY_USD:
+        raise HTTPException(400, f"plan must be one of {list(budget.PLAN_DAILY_USD)}")
+    return budget.set_plan(uid, plan)
 
 
 @app.get("/api/test/graph")
@@ -1730,9 +1804,10 @@ def _refresh_crm_for_user(uid: str) -> None:
         graph  = GraphClient(token)
         ai     = AIClient()
         seg, biz = _get_crm_ai_context(uid)
-        result = refresh_crm(graph, ai, _udir(uid),
-                             market_segments_content=seg,
-                             business_context=biz)
+        with usage_context("crm_refresh", uid):
+            result = refresh_crm(graph, ai, _udir(uid),
+                                 market_segments_content=seg,
+                                 business_context=biz)
         save_crm(_udir(uid), result)
         print(f"[CRM] Daily refresh done for {uid}")
     except Exception as e:
@@ -1756,7 +1831,8 @@ def _build_projects_for_user(uid: str) -> None:
         graph    = GraphClient(token)
         ai       = AIClient()
         settings = _read_json(_user_settings(uid))
-        result   = build_projects(graph, ai, _udir(uid), settings=settings)
+        with usage_context("projects_build", uid):
+            result   = build_projects(graph, ai, _udir(uid), settings=settings)
         save_projects(_udir(uid), result)
         print(f"[Projects] Initial build done for {uid} — {len(result.get('projects', {}))} projects")
     except Exception as e:
@@ -1772,7 +1848,8 @@ def _refresh_projects_for_user(uid: str) -> None:
         graph    = GraphClient(token)
         ai       = AIClient()
         settings = _read_json(_user_settings(uid))
-        result   = refresh_projects(graph, ai, _udir(uid), settings=settings)
+        with usage_context("projects_refresh", uid):
+            result   = refresh_projects(graph, ai, _udir(uid), settings=settings)
         save_projects(_udir(uid), result)
         print(f"[Projects] Daily refresh done for {uid}")
     except Exception as e:
@@ -2528,9 +2605,10 @@ def run_section(section_id: str, background_tasks: BackgroundTasks,
             ai       = AIClient()
             settings = _read_json(_user_settings(uid))
 
-            result = _SECTION_RUNNERS[section_id](
-                graph, ai, _udir(uid), settings, _progress,
-            )
+            with usage_context(section_id, uid):
+                result = _SECTION_RUNNERS[section_id](
+                    graph, ai, _udir(uid), settings, _progress,
+                )
             result["logs"] = logs
             _write_json(results_dir / f"{section_id}.json", result)
             _send_to_bot(uid, result)
@@ -2609,7 +2687,8 @@ def _run_section_for_user(uid: str, section_id: str) -> None:
         graph    = GraphClient(token)
         ai       = AIClient()
         settings = _read_json(_user_settings(uid))
-        result   = _SECTION_RUNNERS[section_id](graph, ai, _udir(uid), settings, None)
+        with usage_context(section_id, uid):
+            result   = _SECTION_RUNNERS[section_id](graph, ai, _udir(uid), settings, None)
         _write_json(results_dir / f"{section_id}.json", result)
         _send_to_bot(uid, result)
         print(f"[Section:{section_id}] Done (bot-triggered) for {uid}")
@@ -3137,7 +3216,8 @@ def trigger_m03_scan(background_tasks: BackgroundTasks,
             graph    = GraphClient(token)
             ai       = AIClient()
             settings = _read_json(_user_settings(uid))
-            result   = m03_run(graph, ai, _udir(uid), settings=settings, force=force, use_mock=use_mock)
+            with usage_context("m03_meeting", uid):
+                result = m03_run(graph, ai, _udir(uid), settings=settings, force=force, use_mock=use_mock)
             # Refresh read sections from the newly populated Meeting DB
             recent_meetings.run(_udir(uid))
             meeting_action_items.run(_udir(uid))
@@ -3853,6 +3933,78 @@ def get_last_outreach(session: dict = Depends(require_session)):
         return {"status": "not_run"}
 
 
+@app.post("/api/outreach/bulk")
+async def trigger_bulk_email(request: Request, background_tasks: BackgroundTasks,
+                             session: dict = Depends(require_session)):
+    """Bulk email to an explicit list of CRM contacts (the CRM multi-select UI).
+
+    Body: {emails:[], subject, body, personalize, send, context_note}.
+      personalize=True  → AI writes per contact in their stored tone.
+      personalize=False → fixed subject/body template ({name}/{company}…).
+      send=False (default) → save to Outlook Drafts. send=True → real send, capped.
+
+    Runs in the background; poll GET /api/outreach/last for progress/result.
+    """
+    uid  = session["user_id"]
+    body = await request.json()
+    emails       = [e for e in (body.get("emails") or []) if isinstance(e, str) and "@" in e]
+    subject      = (body.get("subject") or "").strip()
+    msg_body     = (body.get("body") or "").strip()
+    personalize  = bool(body.get("personalize", True))
+    send         = bool(body.get("send", False))
+    context_note = (body.get("context_note") or "").strip()
+
+    if not emails:
+        return JSONResponse(status_code=400, content={"error": "No valid recipients."})
+    if not personalize and (not subject or not msg_body):
+        return JSONResponse(status_code=400, content={
+            "error": "Subject and body are required when personalization is off."})
+
+    from src.modules.outreach import BULK_SEND_CAP
+    if send and len(emails) > BULK_SEND_CAP:
+        return JSONResponse(status_code=400, content={
+            "error": (f"Send batch too large: {len(emails)} recipients > cap "
+                      f"{BULK_SEND_CAP}. Reduce the selection or save as drafts.")})
+
+    # Initial "running" placeholder so the frontend poll has immediate state
+    # (overwritten incrementally by outreach.run as it works through the batch).
+    out_dir = _udir(uid) / "outreach"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "results.json").write_text(json.dumps({
+        "status": "running", "mode": "bulk", "send": send,
+        "personalize": personalize, "total": len(emails),
+        "drafts_created": [], "contacts_skipped": [], "errors": [],
+        "summary": {"drafts": 0, "sent": 0, "files": 0, "skipped": 0, "errors": 0},
+    }, ensure_ascii=False))
+
+    def _run():
+        try:
+            from src.modules.outreach import run as _run_outreach
+            token    = auth.get_valid_access_token(uid)
+            graph    = GraphClient(token)
+            ai       = AIClient()
+            settings = _read_json(_user_settings(uid))
+            _run_outreach(
+                graph=graph, ai=ai, data_dir=_udir(uid), settings=settings,
+                emails=emails, subject=subject, body=msg_body,
+                personalize=personalize, send=send, context_note=context_note,
+            )
+        except Exception as e:
+            print(f"[Outreach] Bulk email failed for {uid}: {e}")
+            try:
+                (out_dir / "results.json").write_text(json.dumps({
+                    "status": "error", "mode": "bulk", "error": str(e),
+                    "drafts_created": [], "contacts_skipped": [], "errors": [],
+                    "summary": {"drafts": 0, "sent": 0, "files": 0, "skipped": 0, "errors": 0},
+                }, ensure_ascii=False))
+            except Exception:
+                pass
+
+    background_tasks.add_task(_run)
+    return {"ok": True, "total": len(emails),
+            "message": f"Bulk email started for {len(emails)} recipient(s)"}
+
+
 @app.get("/api/contacts/list")
 def list_contacts(session: dict = Depends(require_session),
                   source: str = "",
@@ -4515,7 +4667,8 @@ def _run_briefing_for_user(uid: str, briefing_id: str, force: bool = False) -> N
                 graph    = GraphClient(token)
                 ai       = AIClient()
                 settings = _read_json(_user_settings(uid))
-                result   = _SECTION_RUNNERS[sid](graph, ai, _udir(uid), settings, None)
+                with usage_context(sid, uid):
+                    result   = _SECTION_RUNNERS[sid](graph, ai, _udir(uid), settings, None)
                 _write_json(results_dir / f"{sid}.json", result)
             msg = _format_section_for_teams(result, get_user_tz(_udir(uid)))
             if msg:
@@ -5009,6 +5162,12 @@ def startup_event():
     # — must run before scheduler starts so a fresh scheduled fire sees a
     # clean state.
     _reset_stuck_running_results()
+    # Local/dev safety: DISABLE_SCHEDULER=1 runs the API ONLY — no background jobs
+    # (no Teams polling, email monitor, briefings, CRM/projects crons). Lets you test
+    # endpoints locally without the scheduler firing against real accounts / spending.
+    if os.getenv("DISABLE_SCHEDULER", "").strip().lower() in ("1", "true", "yes"):
+        print("[startup] DISABLE_SCHEDULER set — background scheduler NOT started (API-only mode)")
+        return
     _scheduler.start()
     # Ops: record per-job success/failure timing for the fleet-health endpoint.
     _scheduler.add_listener(_record_job_event, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)

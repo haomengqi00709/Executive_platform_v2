@@ -21,6 +21,23 @@ from src.modules.subject_match import normalize_subject
 from src.modules.wiki import load_index, load_meeting
 
 MODEL        = DEFAULT_GEMINI_MODEL
+
+
+def _record_bot_usage(response, feature: str, is_search: bool = False) -> None:
+    """Token accounting for the bot's raw genai calls (P0) — bot bypasses AIClient."""
+    try:
+        from src.modules import token_usage
+        um = getattr(response, "usage_metadata", None)
+        if um is None:
+            return
+        p = getattr(um, "prompt_token_count", 0) or 0
+        o = getattr(um, "candidates_token_count", 0) or 0
+        t = getattr(um, "total_token_count", 0) or (p + o)
+        token_usage.record(feature, "bot", p, o, t, is_search=is_search, model=MODEL)
+    except Exception:
+        pass
+
+
 MAX_ROUNDS   = 12          # was 8; with 27 tools the model needs room to research AND act
 HISTORY_LIMIT = 20
 BUDGET_NUDGE_AT = 2        # rounds-remaining threshold to push the model to act instead of read
@@ -497,6 +514,7 @@ def reply(
                     tools=[types.Tool(google_search=types.GoogleSearch())],
                 ),
             )
+            _record_bot_usage(resp, "bot_search", is_search=True)
             result = resp.text or "No results found."
             print(f"[Bot] search_web → {len(result)} chars")
             return result
@@ -1219,6 +1237,7 @@ def reply(
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
             ),
         )
+        _record_bot_usage(response, "bot")
 
         candidate  = response.candidates[0] if response.candidates else None
         parts      = (candidate.content.parts if candidate and candidate.content else None) or []
@@ -1286,6 +1305,7 @@ def reply(
                 contents= contents,
                 config  = types.GenerateContentConfig(system_instruction=system + force_note),
             )
+            _record_bot_usage(forced, "bot")
             fcand  = forced.candidates[0] if forced.candidates else None
             fparts = (fcand.content.parts if fcand and fcand.content else None) or []
             final_text = "\n".join(p.text for p in fparts if p.text).strip()

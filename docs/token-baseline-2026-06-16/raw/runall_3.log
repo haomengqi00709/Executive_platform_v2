@@ -1,0 +1,189 @@
+[Auth WARNING] CLIENT_ID not set — using dev default. Set explicitly in production.
+[measure] DATA_DIR = /Users/jasonhao/Desktop/Trust AI Advisory/daniel's/CEO_platform/CEO_platform_v2/.data  (exists=True)
+
+########## reply_needed ##########
+Running 'reply_needed' for cd2162aa (tagged for accounting)...
+[ai.usage] feature=reply_needed uid=cd2162aa in=4597 out=451 total=7972 search=0
+[ai.usage] feature=reply_needed uid=cd2162aa in=8566 out=1041 total=14482 search=0
+  → 0 items, status=fresh
+Done.
+>>> 累计 $0.05  (跑完 reply_needed)
+
+########## followup_needed ##########
+Running 'followup_needed' for cd2162aa (tagged for accounting)...
+[ai.usage] feature=followup_needed uid=cd2162aa in=1381 out=1 total=2547 search=0
+[ai.usage] feature=followup_needed uid=cd2162aa in=1475 out=118 total=2630 search=0
+[Validator:followup_needed] Removed [1]: This is a meeting request or scheduling email, which is excluded under the validator rules.
+[Validator:followup_needed] Removed [2]: This email was sent to yourself (Hao Jason), which is explicitly excluded by the user instructions.
+[Validator:followup_needed] 2 → 0 items after review
+  → 0 items, status=fresh
+Done.
+>>> 累计 $0.05  (跑完 followup_needed)
+
+########## commitments_extract ##########
+Running 'commitments_extract' for cd2162aa (tagged for accounting)...
+[ai.usage] feature=commitments_extract uid=cd2162aa in=5255 out=533 total=9324 search=0
+[ai.usage] feature=commitments_extract uid=cd2162aa in=1991 out=312 total=5620 search=0
+[Validator:commitments_extract] Removed [1]: Nonsensical commitment: ME (Jason Hao) cannot be committed to paying money to Hao Jason.
+[Validator:commitments_extract] Removed [6]: Description is too vague and grammatically incomplete ('onboarding the 5').
+[Validator:commitments_extract] 7 → 5 items after review
+  → 5 items, status=fresh
+Done.
+>>> 累计 $0.08  (跑完 commitments_extract)
+
+########## ai_summary ##########
+Running 'ai_summary' for cd2162aa (tagged for accounting)...
+[ai.usage] feature=ai_summary uid=cd2162aa in=1901 out=154 total=8042 search=0
+  → 0 items, status=fresh
+Done.
+>>> 累计 $0.08  (跑完 ai_summary)
+
+########## yesterday_recap ##########
+Running 'yesterday_recap' for cd2162aa (tagged for accounting)...
+[yesterday_recap] Fetching yesterday's inbox metadata...
+[yesterday_recap] Screening 3 inbound email(s)...
+[ai.usage] feature=yesterday_recap uid=cd2162aa in=1975 out=63 total=2837 search=0
+[yesterday_recap] Fetching yesterday's sent items...
+[yesterday_recap] Fetching yesterday's calendar...
+[yesterday_recap] 0 item(s) before user-preference review
+[yesterday_recap] Done — 0 in / 0 out / 0 meeting(s) / 0 commitment(s)
+  → 0 items, status=fresh
+Done.
+>>> 累计 $0.09  (跑完 yesterday_recap)
+
+########## relationship_health ##########
+Running 'relationship_health' for cd2162aa (tagged for accounting)...
+[relationship_health] Evaluating 28 CRM contact(s) (last 90d)
+[relationship_health] Fetching inbox metadata...
+[relationship_health] Fetching sent metadata...
+[relationship_health] 15 contact(s) need attention (filtered out 13 healthy)
+[ai.usage] feature=relationship_health uid=cd2162aa in=2399 out=495 total=4746 search=0
+[ai.usage] feature=relationship_health uid=cd2162aa in=2382 out=476 total=4450 search=0
+[ai.usage] feature=relationship_health uid=cd2162aa in=2403 out=466 total=4539 search=0
+[ai.usage] feature=relationship_health uid=cd2162aa in=1557 out=594 total=3547 search=0
+[Validator:relationship_health] 15 → 15 items after review
+[relationship_health] Done — 15 item(s) saved
+  → 15 items, status=fresh
+Done.
+>>> 累计 $0.13  (跑完 relationship_health)
+
+########## business_insights ##########
+Running 'business_insights' for cd2162aa (tagged for accounting)...
+[business_insights] Aggregating weekly brief for Jun 8 – Jun 14, 2026
+[business_insights] Computed 23 delta(s) vs week of 2026-06-08
+[business_insights] Surfaced 3 headline(s)
+[business_insights] Generating narrative...
+[ai.usage] feature=business_insights uid=cd2162aa in=1776 out=121 total=3974 search=0
+[business_insights] Done — 3 headline(s) saved
+  → 3 items, status=fresh
+Done.
+>>> 累计 $0.14  (跑完 business_insights)
+
+########## market_intelligence ##########
+Running 'market_intelligence' for cd2162aa (tagged for accounting)...
+[market_intelligence] Searching topic 1/3: regulatory & macro
+[ai.usage] feature=market_intelligence uid=cd2162aa in=1629 out=848 total=8529 search=1
+[market_intelligence]   → 4 items from 'regulatory & macro'
+[market_intelligence] Searching topic 2/3: funding & M&A
+[ai.usage] feature=market_intelligence uid=cd2162aa in=1620 out=1096 total=9800 search=1
+[market_intelligence]   → 4 items from 'funding & M&A'
+[market_intelligence] Searching topic 3/3: technology & competitive
+[ai.usage] feature=market_intelligence uid=cd2162aa in=1627 out=1205 total=8985 search=1
+[market_intelligence]   → 5 items from 'technology & competitive'
+[market_intelligence] Parsing results...
+[market_intelligence] URLs: 10 resolved · 3 kept · 0 fallback · 0 empty
+[market_intelligence] 13 items before dedup
+[market_intelligence] 13 new items after md5 dedup
+[ai.usage] feature=market_intelligence uid=cd2162aa in=5670 out=808 total=10402 search=0
+[Validator:market_intelligence] Removed [1]: Duplicate of the Natural Resources Canada Forward Regulatory Plan item from the June 13, 2026 briefing.
+[Validator:market_intelligence] Removed [2]: Duplicate of the Sourcing IQ manufacturing supply chain/copper shortages report from the June 16, 2026 briefing.
+[Validator:market_intelligence] Removed [4]: Irrelevant and out of scope. This is a generic manufacturing growth forecast piece that does not specifically feature developments in the water pump sector.
+[Validator:market_intelligence] Removed [5]: Duplicate of the United Flow Technologies/Peak Group acquisition from the June 16, 2026 briefing.
+[Validator:market_intelligence] Removed [6]: Duplicate of the USDA Rural Development revolving fund grants announcement from the June 15, 2026 briefing.
+[Validator:market_intelligence] Removed [7]: Duplicate of the Delta Bravo AI municipal water infrastructure deployment from the June 16, 2026 briefing.
+[Validator:market_intelligence] Removed [8]: Duplicate of the Xylem Vue / WATER AI 2026 report regarding generative AI in municipal water utilities from the June 15, 2026 briefing.
+[Validator:market_intelligence] Removed [9]: Duplicate of the Walrus Pump AI liquid cooling pivot covered in the June 13 and June 15, 2026 briefings.
+[Validator:market_intelligence] Removed [10]: Duplicate of the NOVAPUMP industrial pump sector predictive maintenance shift item from the June 16, 2026 briefing.
+[Validator:market_intelligence] Removed [12]: Duplicate of the Arizona State University pool pump scheduling study from the June 16, 2026 briefing.
+[Validator:market_intelligence] Removed [13]: Duplicate of the City of Holland, Michigan storm water pump procurement tender from the June 16, 2026 briefing.
+[Validator:market_intelligence] 13 → 2 items after review
+[market_intelligence] Done — 2 items saved
+  → 2 items, status=fresh
+Done.
+>>> 累计 $0.27  (跑完 market_intelligence)
+
+########## company_intelligence ##########
+Running 'company_intelligence' for cd2162aa (tagged for accounting)...
+[company_intelligence] Tracking 15 companies: Apex Financial, Buildrightgroup, GlobalTrade Ltd., iModel3D, MediCare Solutions, Nexus Capital, RetailMax Corp., RetailMax Corp....
+[company_intelligence] Searching batch 1/3: Apex Financial, Buildrightgroup, GlobalTrade Ltd., iModel3D, MediCare Solutions
+  Gemini search timeout after 60s, retrying once...
+[ai.usage] feature=company_intelligence uid=cd2162aa in=1443 out=1311 total=9385 search=1
+[company_intelligence]   → 5 items from batch 1 (general)
+[ai.usage] feature=company_intelligence uid=cd2162aa in=757 out=272 total=6262 search=1
+[company_intelligence]   → 1 items from batch 1 (social)
+[company_intelligence] Searching batch 2/3: Nexus Capital, RetailMax Corp., RetailMax Corp., TechCorp Inc., TechCorp Inc.
+  Gemini search timeout after 60s, retrying once...
+  Gemini search timeout twice — giving up.
+[company_intelligence]   → Batch 2 general search failed: Gemini call exceeded 60s
+[ai.usage] feature=company_intelligence uid=cd2162aa in=759 out=1 total=3004 search=1
+[company_intelligence]   → 0 items from batch 2 (social)
+[company_intelligence] Searching batch 3/3: Arup, GHD, Jacobs Engineering, Stantec, WSP Global
+  Gemini search timeout after 60s, retrying once...
+[company_intelligence]   → Batch 3 general search failed: 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'Your project has exceeded its monthly spending cap. Please go to AI Studio at https://ai.studio/spend to manage your project spend cap. Learn more at https://ai.google.dev/gemini-api/docs/billing#project-spend-caps. ', 'status': 'RESOURCE_EXHAUSTED'}}
+[company_intelligence]   → Batch 3 social search failed: 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'Your project has exceeded its monthly spending cap. Please go to AI Studio at https://ai.studio/spend to manage your project spend cap. Learn more at https://ai.google.dev/gemini-api/docs/billing#project-spend-caps. ', 'status': 'RESOURCE_EXHAUSTED'}}
+[company_intelligence] 6 valid items before dedup
+[company_intelligence] URLs: 3 resolved · 2 kept · 1 fallback · 0 empty
+[company_intelligence] 6 new items after md5 dedup
+[Validator:company_intelligence] Failed (429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'Your project has exceeded its monthly spending cap. Please go to AI Studio at https://ai.studio/spend to manage your project spend cap. Learn more at https://ai.google.dev/gemini-api/docs/billing#project-spend-caps. ', 'status': 'RESOURCE_EXHAUSTED'}}) — returning original 6 items
+[company_intelligence] Done — 6 items across 15 companies
+  → 6 items, status=fresh
+Done.
+>>> 累计 $0.35  (跑完 company_intelligence)
+
+########## crm_refresh ##########
+Running 'crm_refresh' for cd2162aa (tagged for accounting)...
+[CRM] Incremental refresh — scanning last 2 days...
+[CRM] 3 contacts with activity in scan window
+[CRM] 0 contacts to re-enrich with AI (capped at 30 per run)
+[CRM] Refresh complete — 87 total contacts, 0 re-enriched
+Done.
+>>> 累计 $0.35  (跑完 crm_refresh)
+
+########## projects_refresh ##########
+Running 'projects_refresh' for cd2162aa (tagged for accounting)...
+[Projects] Broad re-scan: last 45 days of mail...
+[Projects] Screening 339 inbox messages...
+[Projects] Re-assess failed for IPS Consultancy — CTO Role Alignment: 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'Your project has exceeded its monthly spending cap. Please go to AI Studio at https://ai.studio/spend to manage your project spend cap. Learn more at https://ai.google.dev/gemini-api/docs/billing#project-spend-caps. ', 'status': 'RESOURCE_EXHAUSTED'}}
+[Projects] Checking 45 unclaimed conversation(s) for new projects...
+[Projects] Batch extraction failed: 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'Your project has exceeded its monthly spending cap. Please go to AI Studio at https://ai.studio/spend to manage your project spend cap. Learn more at https://ai.google.dev/gemini-api/docs/billing#project-spend-caps. ', 'status': 'RESOURCE_EXHAUSTED'}}
+[Projects] Batch extraction failed: 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'Your project has exceeded its monthly spending cap. Please go to AI Studio at https://ai.studio/spend to manage your project spend cap. Learn more at https://ai.google.dev/gemini-api/docs/billing#project-spend-caps. ', 'status': 'RESOURCE_EXHAUSTED'}}
+[Projects] Batch extraction failed: 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'Your project has exceeded its monthly spending cap. Please go to AI Studio at https://ai.studio/spend to manage your project spend cap. Learn more at https://ai.google.dev/gemini-api/docs/billing#project-spend-caps. ', 'status': 'RESOURCE_EXHAUSTED'}}
+[Projects] Batch extraction failed: 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'Your project has exceeded its monthly spending cap. Please go to AI Studio at https://ai.studio/spend to manage your project spend cap. Learn more at https://ai.google.dev/gemini-api/docs/billing#project-spend-caps. ', 'status': 'RESOURCE_EXHAUSTED'}}
+[Projects] Batch extraction failed: 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'Your project has exceeded its monthly spending cap. Please go to AI Studio at https://ai.studio/spend to manage your project spend cap. Learn more at https://ai.google.dev/gemini-api/docs/billing#project-spend-caps. ', 'status': 'RESOURCE_EXHAUSTED'}}
+[Projects] Refresh done — 2 projects
+Done.
+>>> 累计 $0.35  (跑完 projects_refresh)
+
+=== today  (est $0.35) ===
+  feature                     calls           in          out  search         $
+  market_intelligence             4       10,546        3,957       3     0.129
+  company_intelligence            3        2,959        1,584       3     0.084
+  reply_needed                    2       13,163        1,492       0     0.046
+  relationship_health             4        8,741        2,031       0     0.043
+  commitments_extract             2        7,246          845       0     0.025
+  followup_needed                 2        2,856          119       0     0.007
+  ai_summary                      1        1,901          154       0     0.006
+  business_insights               1        1,776          121       0     0.005
+  yesterday_recap                 1        1,975           63       0     0.005
+
+=== last_7d  (est $0.35) ===
+  feature                     calls           in          out  search         $
+  market_intelligence             4       10,546        3,957       3     0.129
+  company_intelligence            3        2,959        1,584       3     0.084
+  reply_needed                    2       13,163        1,492       0     0.046
+  relationship_health             4        8,741        2,031       0     0.043
+  commitments_extract             2        7,246          845       0     0.025
+  followup_needed                 2        2,856          119       0     0.007
+  ai_summary                      1        1,901          154       0     0.006
+  business_insights               1        1,776          121       0     0.005
+  yesterday_recap                 1        1,975           63       0     0.005

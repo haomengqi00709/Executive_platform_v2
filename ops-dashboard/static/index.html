@@ -66,6 +66,7 @@
           <th class="px-3 py-2 text-left">Bot</th>
           <th class="px-3 py-2 text-left">Briefings</th>
           <th class="px-3 py-2 text-left">Push quality</th>
+          <th class="px-3 py-2 text-left">Budget today</th>
         </tr>
       </thead>
       <tbody id="rows-accounts"></tbody>
@@ -90,6 +91,7 @@
       <tbody id="rows-jobs"></tbody>
     </table>
   </section>
+
   </div><!-- /tab-details -->
 </main>
 
@@ -160,6 +162,9 @@ const render = data => {
   const pq = data.push_qa;
   const pqByUid = {};
   if (pq) for (const pu of (pq.users || [])) pqByUid[pu.uid] = pu;
+  const bdata = data.budget || {};
+  const budgetByUid = {};
+  for (const bu of (bdata.users || [])) budgetByUid[bu.uid] = bu;
 
   const verdictPill = v =>
       v === "fail" ? '<span class="text-rose-700 font-medium">fail</span>'
@@ -176,10 +181,19 @@ const render = data => {
     return parts.join(' ') || '<span class="text-slate-300">—</span>';
   };
 
-  const accountExpand = (u, uh, bot, bh, pu) => {
+  const budgetCell = bu => {
+    if (!bu) return '<span class="text-slate-300">—</span>';
+    const eff = bu.effective_budget_usd || bu.budget_usd || 1;
+    const pill = bu.over ? '<span class="text-rose-700 font-medium">OVER</span>'
+      : (bu.spent_usd / eff > 0.8 ? '<span class="text-amber-600">near</span>'
+      : '<span class="text-emerald-700">ok</span>');
+    return '$' + (bu.spent_usd || 0).toFixed(2) + '/$' + (bu.budget_usd || 0).toFixed(0) + ' ' + pill;
+  };
+
+  const accountExpand = (u, uh, bot, bh, pu, bu) => {
     const tr = document.createElement("tr");
     tr.className = "row-expand bg-slate-50";
-    let html = '<td colspan="5" class="px-6 py-3 space-y-3">';
+    let html = '<td colspan="6" class="px-6 py-3 space-y-3">';
     html += '<div><div class="text-xs font-semibold text-slate-500 mb-1">AUTH</div>';
     if (uh.last_error)  html += '<div class="text-rose-700 text-xs"><b>last error:</b> ' + (typeof uh.last_error === "string" ? uh.last_error : JSON.stringify(uh.last_error)) + '</div>';
     if (uh.broken_since) html += '<div class="text-rose-700 text-xs"><b>broken since:</b> ' + uh.broken_since + '</div>';
@@ -200,6 +214,21 @@ const render = data => {
       }
       html += '</div></div>';
     }
+    if (bu) {
+      html += '<div><div class="text-xs font-semibold text-slate-500 mb-1">BUDGET · plan ' + (bu.plan || '?') + '</div>';
+      html += '<div class="text-xs text-slate-600">today $' + (bu.spent_usd || 0).toFixed(3) + ' / $' + (bu.budget_usd || 0).toFixed(2) +
+        (bu.grant_usd ? ' <span class="text-sky-600">(+$' + bu.grant_usd.toFixed(2) + ' grant)</span>' : '') +
+        ' · ' + fmtTok(bu.in_tokens) + ' in / ' + fmtTok(bu.out_tokens) + ' out · ' + (bu.calls || 0) + ' calls</div>';
+      const feats = Object.entries(bu.by_feature || {}).sort((a, c) => c[1].usd - a[1].usd);
+      if (feats.length) {
+        html += '<div class="text-xs space-y-0.5 mt-1">';
+        for (const [f, b] of feats) html += '<div>' + f + ': $' + b.usd.toFixed(3) +
+          ' <span class="text-slate-400">(' + fmtTok(b.in) + '/' + fmtTok(b.out) + ', ' + b.calls + ' calls)</span></div>';
+        html += '</div>';
+      }
+      if (bu.over) html += '<button onclick="event.stopPropagation(); unblockUser(\'' + bu.uid + '\')" class="mt-2 px-2 py-1 text-xs rounded bg-sky-600 text-white hover:bg-sky-700">Unblock today</button>';
+      html += '</div>';
+    }
     html += '</td>';
     tr.innerHTML = html;
     return tr;
@@ -212,7 +241,7 @@ const render = data => {
     if (u.error) {
       const er = document.createElement("tr");
       er.className = "border-t border-slate-100";
-      er.innerHTML = '<td colspan="5" class="px-3 py-2 text-rose-600">' + u.uid + ": " + u.error + '</td>';
+      er.innerHTML = '<td colspan="6" class="px-3 py-2 text-rose-600">' + u.uid + ": " + u.error + '</td>';
       rowsA.appendChild(er);
       continue;
     }
@@ -232,10 +261,11 @@ const render = data => {
         '<div class="text-slate-400 mt-0.5">refresh ' + fmtTs(uh.last_success_at) + '</div></td>' +
       '<td class="px-3 py-2 text-xs">' + botCell + '</td>' +
       '<td class="px-3 py-2 text-xs text-slate-600">' + briefingsCell(u.briefings) + '</td>' +
-      '<td class="px-3 py-2 text-xs">' + qualitySummary(pu) + '</td>';
+      '<td class="px-3 py-2 text-xs">' + qualitySummary(pu) + '</td>' +
+      '<td class="px-3 py-2 text-xs">' + budgetCell(budgetByUid[u.uid]) + '</td>';
     tr.onclick = () => tr.classList.toggle("expanded");
     rowsA.appendChild(tr);
-    rowsA.appendChild(accountExpand(u, uh, bot, bh, pu));
+    rowsA.appendChild(accountExpand(u, uh, bot, bh, pu, budgetByUid[u.uid]));
   }
   // Orphan bots: registered bot accounts whose owner isn't in the user list
   for (const b of botRecords) {
@@ -377,6 +407,18 @@ const setTab = name => {
 document.getElementById("tab-btn-overview").addEventListener("click", () => setTab("overview"));
 document.getElementById("tab-btn-details").addEventListener("click", () => setTab("details"));
 setTab("overview");
+
+const fmtTok = n => { n = n || 0; return n >= 1e6 ? (n/1e6).toFixed(1)+"M" : n >= 1e3 ? (n/1e3).toFixed(0)+"k" : String(n); };
+
+async function unblockUser(uid){
+  if (!confirm("Unblock " + uid.slice(0,8) + " for the rest of today?")) return;
+  try {
+    const r = await fetch("/api/budget/unblock", { method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ uid }) });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    await load();
+  } catch (e) { alert("Unblock failed: " + e.message); }
+}
 
 const load = async () => {
   try {

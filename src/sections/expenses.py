@@ -179,6 +179,7 @@ def _extract_document(ai: AIClient, file_bytes: bytes, filename: str) -> dict | 
                         _EXTRACT_PROMPT,
                     ],
                 )
+                ai.record_external_usage(response)
                 raw = (response.text or "").strip()
                 if raw.startswith("```"):
                     raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]

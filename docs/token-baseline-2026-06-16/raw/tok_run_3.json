@@ -1,0 +1,67 @@
+{
+  "2026-06-16": {
+    "reply_needed": {
+      "prompt": 13163,
+      "output": 1492,
+      "total": 22454,
+      "search_calls": 0,
+      "calls": 2
+    },
+    "followup_needed": {
+      "prompt": 2856,
+      "output": 119,
+      "total": 5177,
+      "search_calls": 0,
+      "calls": 2
+    },
+    "commitments_extract": {
+      "prompt": 7246,
+      "output": 845,
+      "total": 14944,
+      "search_calls": 0,
+      "calls": 2
+    },
+    "ai_summary": {
+      "prompt": 1901,
+      "output": 154,
+      "total": 8042,
+      "search_calls": 0,
+      "calls": 1
+    },
+    "yesterday_recap": {
+      "prompt": 1975,
+      "output": 63,
+      "total": 2837,
+      "search_calls": 0,
+      "calls": 1
+    },
+    "relationship_health": {
+      "prompt": 8741,
+      "output": 2031,
+      "total": 17282,
+      "search_calls": 0,
+      "calls": 4
+    },
+    "business_insights": {
+      "prompt": 1776,
+      "output": 121,
+      "total": 3974,
+      "search_calls": 0,
+      "calls": 1
+    },
+    "market_intelligence": {
+      "prompt": 10546,
+      "output": 3957,
+      "total": 37716,
+      "search_calls": 3,
+      "calls": 4
+    },
+    "company_intelligence": {
+      "prompt": 2959,
+      "output": 1584,
+      "total": 18651,
+      "search_calls": 3,
+      "calls": 3
+    }
+  }
+}

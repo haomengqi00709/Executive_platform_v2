@@ -1,0 +1,200 @@
+[Auth WARNING] CLIENT_ID not set — using dev default. Set explicitly in production.
+[measure] DATA_DIR = /Users/jasonhao/Desktop/Trust AI Advisory/daniel's/CEO_platform/CEO_platform_v2/.data  (exists=True)
+
+########## reply_needed ##########
+Running 'reply_needed' for cd2162aa (tagged for accounting)...
+[ai.usage] feature=reply_needed uid=cd2162aa in=4597 out=451 total=8157 search=0
+[ai.usage] feature=reply_needed uid=cd2162aa in=8566 out=1041 total=14292 search=0
+  → 0 items, status=fresh
+Done.
+>>> 累计 $0.05  (跑完 reply_needed)
+
+########## followup_needed ##########
+Running 'followup_needed' for cd2162aa (tagged for accounting)...
+[ai.usage] feature=followup_needed uid=cd2162aa in=1384 out=1 total=2643 search=0
+[ai.usage] feature=followup_needed uid=cd2162aa in=1475 out=126 total=2985 search=0
+[Validator:followup_needed] Removed [1]: This is a meeting request, calendar invite, or scheduling email, which is excluded under the validator rules.
+[Validator:followup_needed] Removed [2]: Excluded because it was sent to yourself (Hao Jason), which violates the user instruction to ignore emails sent to yourself.
+[Validator:followup_needed] 2 → 0 items after review
+  → 0 items, status=fresh
+Done.
+>>> 累计 $0.05  (跑完 followup_needed)
+
+########## commitments_extract ##########
+Running 'commitments_extract' for cd2162aa (tagged for accounting)...
+[ai.usage] feature=commitments_extract uid=cd2162aa in=5255 out=533 total=9255 search=0
+[ai.usage] feature=commitments_extract uid=cd2162aa in=1991 out=335 total=4676 search=0
+[Validator:commitments_extract] Removed [1]: Nonsensical self-payment commitment and is a financial transaction task.
+[Validator:commitments_extract] Removed [2]: Financial payment confirmation task which belongs in the expenses/finance workflow.
+[Validator:commitments_extract] Removed [4]: Description is too vague to act on ('act on prioritization decisions') and is already past due.
+[Validator:commitments_extract] Removed [6]: Description is incomplete and vague ('onboarding the 5').
+[Validator:commitments_extract] 7 → 3 items after review
+  → 3 items, status=fresh
+Done.
+>>> 累计 $0.08  (跑完 commitments_extract)
+
+########## ai_summary ##########
+Running 'ai_summary' for cd2162aa (tagged for accounting)...
+[ai.usage] feature=ai_summary uid=cd2162aa in=1763 out=152 total=5857 search=0
+  → 0 items, status=fresh
+Done.
+>>> 累计 $0.08  (跑完 ai_summary)
+
+########## yesterday_recap ##########
+Running 'yesterday_recap' for cd2162aa (tagged for accounting)...
+[yesterday_recap] Fetching yesterday's inbox metadata...
+[yesterday_recap] Screening 3 inbound email(s)...
+[ai.usage] feature=yesterday_recap uid=cd2162aa in=1975 out=62 total=2985 search=0
+[yesterday_recap] Fetching yesterday's sent items...
+[yesterday_recap] Fetching yesterday's calendar...
+[yesterday_recap] 0 item(s) before user-preference review
+[yesterday_recap] Done — 0 in / 0 out / 0 meeting(s) / 0 commitment(s)
+  → 0 items, status=fresh
+Done.
+>>> 累计 $0.09  (跑完 yesterday_recap)
+
+########## relationship_health ##########
+Running 'relationship_health' for cd2162aa (tagged for accounting)...
+[relationship_health] Evaluating 28 CRM contact(s) (last 90d)
+[relationship_health] Fetching inbox metadata...
+[relationship_health] Fetching sent metadata...
+[relationship_health] 15 contact(s) need attention (filtered out 13 healthy)
+[ai.usage] feature=relationship_health uid=cd2162aa in=2399 out=473 total=4287 search=0
+[ai.usage] feature=relationship_health uid=cd2162aa in=2382 out=475 total=4552 search=0
+[ai.usage] feature=relationship_health uid=cd2162aa in=2403 out=515 total=5033 search=0
+[ai.usage] feature=relationship_health uid=cd2162aa in=1557 out=594 total=3908 search=0
+[Validator:relationship_health] 15 → 15 items after review
+[relationship_health] Done — 15 item(s) saved
+  → 15 items, status=fresh
+Done.
+>>> 累计 $0.13  (跑完 relationship_health)
+
+########## business_insights ##########
+Running 'business_insights' for cd2162aa (tagged for accounting)...
+[business_insights] Aggregating weekly brief for Jun 8 – Jun 14, 2026
+[business_insights] Computed 23 delta(s) vs week of 2026-06-08
+[business_insights] Surfaced 3 headline(s)
+[business_insights] Generating narrative...
+[ai.usage] feature=business_insights uid=cd2162aa in=1772 out=105 total=3650 search=0
+[business_insights] Done — 3 headline(s) saved
+  → 3 items, status=fresh
+Done.
+>>> 累计 $0.14  (跑完 business_insights)
+
+########## market_intelligence ##########
+Running 'market_intelligence' for cd2162aa (tagged for accounting)...
+[market_intelligence] Searching topic 1/3: regulatory & macro
+[ai.usage] feature=market_intelligence uid=cd2162aa in=1629 out=1434 total=9538 search=1
+[market_intelligence]   → 5 items from 'regulatory & macro'
+[market_intelligence] Searching topic 2/3: funding & M&A
+[ai.usage] feature=market_intelligence uid=cd2162aa in=1620 out=1073 total=8428 search=1
+[market_intelligence]   → 4 items from 'funding & M&A'
+[market_intelligence] Searching topic 3/3: technology & competitive
+[ai.usage] feature=market_intelligence uid=cd2162aa in=1627 out=978 total=8191 search=1
+[market_intelligence]   → 4 items from 'technology & competitive'
+[market_intelligence] Parsing results...
+[market_intelligence] URLs: 8 resolved · 2 kept · 3 fallback · 0 empty
+[market_intelligence] 13 items before dedup
+[market_intelligence] 13 new items after md5 dedup
+[ai.usage] feature=market_intelligence uid=cd2162aa in=4596 out=681 total=10150 search=0
+[Validator:market_intelligence] Removed [4]: Irrelevant sector: focuses on residential/commercial pool pumps and grid capacity scheduling, which represents consumer/retail applications and falls outside the scope of industrial, municipal, and B2B water pump systems.
+[Validator:market_intelligence] Removed [7]: Duplicate: This report on municipal digital water capital spending doubling to $28.6B is the exact same market signal/event surfaced in the June 15 briefing.
+[Validator:market_intelligence] Removed [11]: Duplicate: This item detailing Aqua Alarm winning the Water Council's challenge was already surfaced twice in the June 13 briefing.
+[Validator:market_intelligence] Removed [12]: Generic trend piece: The item is a high-level market forecast and analysis of IoT pump monitoring growth without a specific, actionable corporate event, project announcement, or regulatory shift.
+[Validator:market_intelligence] Removed [13]: Duplicate: This item covers the identical signal regarding generative AI graduating to utility asset operations and municipal management that was already surfaced in the June 15 briefing.
+[Validator:market_intelligence] 13 → 8 items after review
+[market_intelligence] Done — 8 items saved
+  → 8 items, status=fresh
+Done.
+>>> 累计 $0.27  (跑完 market_intelligence)
+
+########## company_intelligence ##########
+Running 'company_intelligence' for cd2162aa (tagged for accounting)...
+[company_intelligence] Tracking 15 companies: Apex Financial, Buildrightgroup, GlobalTrade Ltd., iModel3D, MediCare Solutions, Nexus Capital, RetailMax Corp., RetailMax Corp....
+[company_intelligence] Searching batch 1/3: Apex Financial, Buildrightgroup, GlobalTrade Ltd., iModel3D, MediCare Solutions
+  Gemini search timeout after 60s, retrying once...
+  Gemini search timeout twice — giving up.
+[company_intelligence]   → Batch 1 general search failed: Gemini call exceeded 60s
+[ai.usage] feature=company_intelligence uid=cd2162aa in=757 out=1 total=4103 search=1
+[company_intelligence]   → 0 items from batch 1 (social)
+[company_intelligence] Searching batch 2/3: Nexus Capital, RetailMax Corp., RetailMax Corp., TechCorp Inc., TechCorp Inc.
+[ai.usage] feature=company_intelligence uid=cd2162aa in=1445 out=833 total=7428 search=1
+[company_intelligence]   → 3 items from batch 2 (general)
+[ai.usage] feature=company_intelligence uid=cd2162aa in=759 out=798 total=8920 search=1
+[company_intelligence]   → 3 items from batch 2 (social)
+[company_intelligence] Searching batch 3/3: Arup, GHD, Jacobs Engineering, Stantec, WSP Global
+[ai.usage] feature=company_intelligence uid=cd2162aa in=1438 out=1707 total=8806 search=1
+[company_intelligence]   → 5 items from batch 3 (general)
+  Gemini search timeout after 60s, retrying once...
+  Gemini search timeout twice — giving up.
+[company_intelligence]   → Batch 3 social search failed: Gemini call exceeded 60s
+[company_intelligence] 11 valid items before dedup
+[company_intelligence] URLs: 5 resolved · 1 kept · 5 fallback · 0 empty
+[company_intelligence] 11 new items after md5 dedup
+[ai.usage] feature=company_intelligence uid=cd2162aa in=4674 out=680 total=8542 search=0
+[Validator:company_intelligence] Removed [1]: Duplicate of previously surfaced item regarding Nexus Capital's acquisition/funding of Laird Superfood on 2026-06-10.
+[Validator:company_intelligence] Removed [2]: Duplicate of previously surfaced item regarding RetailMax's global ServiceAI deployment/rollout on 2026-06-10.
+[Validator:company_intelligence] Removed [6]: Duplicate of previously surfaced items from 2026-06-15 detailing TechCorp's transition away from fragmented legacy systems.
+[Validator:company_intelligence] Removed [7]: Duplicate of previously surfaced items from 2026-06-15 and 2026-06-10 regarding Arup's acquisition of EnTrade.
+[Validator:company_intelligence] Removed [8]: Duplicate of previously surfaced items from 2026-06-15, 2026-06-13, and 2026-06-10 regarding GHD's acquisition of Bowman Engineering.
+[Validator:company_intelligence] Removed [10]: Duplicate of previously surfaced item from 2026-06-15 regarding Stantec's $85M Army Corps contract partnership with Black & Veatch.
+[Validator:company_intelligence] Removed [11]: Duplicate of previously surfaced item from 2026-06-13 regarding WSP Global's strategic partnership with HAAS Alert.
+[Validator:company_intelligence] 11 → 4 items after review
+[company_intelligence] Done — 4 items across 15 companies
+  → 4 items, status=fresh
+Done.
+>>> 累计 $0.41  (跑完 company_intelligence)
+
+########## crm_refresh ##########
+Running 'crm_refresh' for cd2162aa (tagged for accounting)...
+[CRM] Incremental refresh — scanning last 2 days...
+[CRM] 3 contacts with activity in scan window
+[CRM] 0 contacts to re-enrich with AI (capped at 30 per run)
+[CRM] Refresh complete — 87 total contacts, 0 re-enriched
+Done.
+>>> 累计 $0.41  (跑完 crm_refresh)
+
+########## projects_refresh ##########
+Running 'projects_refresh' for cd2162aa (tagged for accounting)...
+[Projects] Broad re-scan: last 45 days of mail...
+[Projects] Screening 339 inbox messages...
+[ai.usage] feature=projects_refresh uid=cd2162aa in=8302 out=1031 total=14877 search=0
+[ai.usage] feature=projects_refresh uid=cd2162aa in=7429 out=1018 total=13807 search=0
+[ai.usage] feature=projects_refresh uid=cd2162aa in=6568 out=1037 total=13821 search=0
+[ai.usage] feature=projects_refresh uid=cd2162aa in=8566 out=1041 total=14785 search=0
+[ai.usage] feature=projects_refresh uid=cd2162aa in=7275 out=1010 total=14577 search=0
+[ai.usage] feature=projects_refresh uid=cd2162aa in=6444 out=812 total=8309 search=0
+[ai.usage] feature=projects_refresh uid=cd2162aa in=7259 out=1029 total=12292 search=0
+[ai.usage] feature=projects_refresh uid=cd2162aa in=1572 out=75 total=3196 search=0
+[Projects] Re-assessed 'IPS Consultancy — CTO Role Alignment': 4/24 msgs relevant → paused
+[Projects] Checking 3 unclaimed conversation(s) for new projects...
+[ai.usage] feature=projects_refresh uid=cd2162aa in=1733 out=1 total=2685 search=0
+[Projects] Refresh done — 2 projects
+Done.
+>>> 累计 $0.62  (跑完 projects_refresh)
+
+=== today  (est $0.62) ===
+  feature                     calls           in          out  search         $
+  projects_refresh                9       55,148        7,054       0     0.202
+  company_intelligence            5        9,073        4,019       4     0.146
+  market_intelligence             4        9,472        4,166       3     0.130
+  reply_needed                    2       13,163        1,492       0     0.046
+  relationship_health             4        8,741        2,057       0     0.044
+  commitments_extract             2        7,246          868       0     0.026
+  followup_needed                 2        2,859          127       0     0.007
+  ai_summary                      1        1,763          152       0     0.005
+  business_insights               1        1,772          105       0     0.005
+  yesterday_recap                 1        1,975           62       0     0.005
+
+=== last_7d  (est $0.62) ===
+  feature                     calls           in          out  search         $
+  projects_refresh                9       55,148        7,054       0     0.202
+  company_intelligence            5        9,073        4,019       4     0.146
+  market_intelligence             4        9,472        4,166       3     0.130
+  reply_needed                    2       13,163        1,492       0     0.046
+  relationship_health             4        8,741        2,057       0     0.044
+  commitments_extract             2        7,246          868       0     0.026
+  followup_needed                 2        2,859          127       0     0.007
+  ai_summary                      1        1,763          152       0     0.005
+  business_insights               1        1,772          105       0     0.005
+  yesterday_recap                 1        1,975           62       0     0.005

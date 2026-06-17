@@ -1,0 +1,12 @@
+{
+  "2026-06-16": {
+    "company_intelligence": {
+      "prompt": 9302,
+      "output": 8274,
+      "total": 64645,
+      "search_calls": 6,
+      "search_queries": 72,
+      "calls": 7
+    }
+  }
+}

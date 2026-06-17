@@ -286,6 +286,32 @@ def detect_pushqa_transitions(snapshot: dict) -> list:
     return transitions
 
 
+def detect_budget_transitions(snapshot: dict) -> list:
+    """Turn each per-user daily-budget block event into an alert transition. The main app
+    logs each event once per user per UTC day, and the alerter's was_recently_alerted()
+    dedups further — so Jason gets at most one ping per user per day."""
+    b = snapshot.get("budget")
+    if not b:
+        return []
+    transitions = []
+    for ev in (b.get("block_events_24h") or []):
+        uid = ev.get("uid")
+        if not uid:
+            continue
+        day = (ev.get("ts") or "")[:10]
+        transitions.append({
+            "type":     "budget_capped",
+            "key":      f"budget_capped:{uid}:{day}",
+            "uid":      uid,
+            "username": uid[:8],
+            "feature":  ev.get("feature"),
+            "spent":    ev.get("spent_usd"),
+            "budget":   ev.get("budget_usd"),
+            "plan":     ev.get("plan"),
+        })
+    return transitions
+
+
 def load_alert_history() -> dict:
     return _read_json(DATA_DIR / "alert_history.json", {}) or {}
 
