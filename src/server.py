@@ -4263,13 +4263,13 @@ async def submit_onboarding_preferences(request: Request, session: dict = Depend
     # 3. Schedule presets (skip 'custom' so we don't clobber prior config)
     if briefings_preset != "custom":
         apply_briefing_preset(_udir(uid), briefings_preset, tz)
-        # Hot-register the new briefings with the live scheduler so cron starts ticking
-        # without waiting for a server restart.
-        for b in load_schedules(_udir(uid)).get("briefings", []):
-            try:
-                _register_briefing(uid, b)
-            except Exception as e:
-                print(f"[Onboarding] briefing register failed for {b.get('id')}: {e}")
+        # Reconcile the live scheduler to the rewritten file. apply_briefing_preset
+        # regenerates briefing ids, so registering the new ones alone would leave the
+        # old jobs as orphans — _resync removes stale jobs AND registers the current set.
+        try:
+            _resync_user_briefings(uid)
+        except Exception as e:
+            print(f"[Onboarding] briefing resync failed for {uid}: {e}")
     if monitor_preset != "custom":
         apply_monitor_preset(_udir(uid), monitor_preset)
 
@@ -4681,6 +4681,26 @@ def _unregister_briefing(uid: str, briefing_id: str) -> None:
         _scheduler.remove_job(_briefing_job_id(uid, briefing_id))
     except Exception:
         pass
+
+
+def _resync_user_briefings(uid: str) -> None:
+    """Make the live scheduler match schedules.json EXACTLY for this user.
+
+    Removes any user_{uid}_briefing_* job whose id is no longer in the file
+    (orphans left behind when apply_briefing_preset regenerates ids on a
+    re-onboarding), then (re)registers every briefing that is. Idempotent."""
+    from src.modules.schedules import load_schedules
+    prefix    = _briefing_job_id(uid, "")          # "user_{uid}_briefing_"
+    briefings = load_schedules(_udir(uid)).get("briefings", [])
+    current   = {b.get("id") for b in briefings}
+    for job in _scheduler.get_jobs():
+        if job.id.startswith(prefix) and job.id[len(prefix):] not in current:
+            try:
+                _scheduler.remove_job(job.id)
+            except Exception:
+                pass
+    for b in briefings:
+        _register_briefing(uid, b)
 
 
 def _load_all_user_schedules_at_startup() -> None:
