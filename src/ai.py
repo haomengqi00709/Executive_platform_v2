@@ -37,7 +37,7 @@ _GEMINI_TIMEOUT_SECS = 60
 _GEMINI_SEARCH_TIMEOUT_SECS = int(os.getenv("GEMINI_SEARCH_TIMEOUT_SECS", str(_GEMINI_TIMEOUT_SECS)))
 
 
-def _call_with_timeout(fn, timeout_secs: int):
+def _call_with_timeout(fn, timeout_secs: int, on_late=None):
     """Run fn() in a daemon thread, raise TimeoutError if it doesn't finish in time.
 
     The naive implementation `with ThreadPoolExecutor() as ex` does NOT work for
@@ -57,16 +57,27 @@ def _call_with_timeout(fn, timeout_secs: int):
     rare.
     """
     result: dict = {}
+    timed_out = {"flag": False}
     def runner():
         try:
             result["value"] = fn()
         except BaseException as e:
             result["error"] = e
+        finally:
+            # If the main thread already gave up (timeout) but the call EVENTUALLY
+            # returned, hand the late response to on_late so its token usage can still
+            # be recorded — the response came back, we just used to throw it away.
+            if timed_out["flag"] and on_late is not None and "value" in result:
+                try:
+                    on_late(result["value"])
+                except Exception:
+                    pass
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
     t.join(timeout=timeout_secs)
     if t.is_alive():
+        timed_out["flag"] = True
         raise TimeoutError(f"Gemini call exceeded {timeout_secs}s")
     if "error" in result:
         raise result["error"]
@@ -160,6 +171,34 @@ def _record_usage(response, is_search: bool, feature_override: str | None = None
         pass
 
 
+def _late_usage_recorder(tag: dict, model: str, is_search: bool):
+    """Build a callback that records a LATE (post-timeout) response's usage under the
+    captured tag. Used by _call_with_timeout's on_late: the daemon thread runs this when a
+    timed-out call eventually returns. Contextvars don't cross threads, so feature/uid are
+    captured up-front and passed explicitly. Best-effort; a truly-hung call never fires it."""
+    def _rec(response):
+        try:
+            from src.modules import token_usage
+            um = getattr(response, "usage_metadata", None)
+            queries = _extract_search_queries(response) if is_search else []
+            if um is None and not queries:
+                return
+            if um is not None:
+                p = getattr(um, "prompt_token_count", 0) or 0
+                o = getattr(um, "candidates_token_count", 0) or 0
+                t = getattr(um, "total_token_count", 0) or (p + o)
+            else:
+                p = o = t = 0
+            token_usage.record(tag.get("feature", "unknown"), tag.get("uid", "unknown"),
+                               p, o, t, is_search=is_search,
+                               search_queries=len(queries), queries=queries, model=model)
+            print(f"[ai.usage] LATE-RECORDED a timed-out {'search' if is_search else 'call'} "
+                  f"feature={tag.get('feature')} — captured {t} tok after the fact")
+        except Exception:
+            pass
+    return _rec
+
+
 def _budget_guard() -> None:
     """Per-user daily budget breaker: raise BudgetExceededError BEFORE an AI call if the
     current (uid, feature) is an expensive feature for an over-budget user. Cheap features
@@ -178,11 +217,12 @@ class AIClient:
 
     def generate(self, prompt: str) -> str:
         _budget_guard()
+        _late = _late_usage_recorder(dict(_usage_ctx.get()), self.model, is_search=False)
         for attempt in range(2):
             try:
                 response = _call_with_timeout(
                     lambda: self.client.models.generate_content(model=self.model, contents=prompt),
-                    _GEMINI_TIMEOUT_SECS,
+                    _GEMINI_TIMEOUT_SECS, on_late=_late,
                 )
                 text = response.text
                 if not text or not text.strip():
@@ -331,6 +371,7 @@ class AIClient:
         Search-grounded calls can be slower than plain generate; use the same
         60s budget as generate() with one retry on timeout."""
         _budget_guard()
+        _late = _late_usage_recorder(dict(_usage_ctx.get()), self.model, is_search=True)
         for attempt in range(2):
             try:
                 response = _call_with_timeout(
@@ -341,7 +382,7 @@ class AIClient:
                             tools=[types.Tool(google_search=types.GoogleSearch())],
                         ),
                     ),
-                    _GEMINI_SEARCH_TIMEOUT_SECS,
+                    _GEMINI_SEARCH_TIMEOUT_SECS, on_late=_late,
                 )
                 _record_usage(response, is_search=True, model=self.model)
                 # Empty result = "no news found" — a LEGITIMATE outcome for a search,
