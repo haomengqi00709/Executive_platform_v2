@@ -348,9 +348,16 @@ def _save_reply_needed(data_dir: Path, data: dict) -> None:
     tmp.replace(path)
 
 
-def _undigested_items(data_dir: Path) -> list:
+def _undigested_items(data_dir: Path, pushed_ids: set | None = None) -> list:
+    """reply_needed items not yet digested AND not already realtime-pushed.
+    pushed_ids = monitor_state['realtime_pushed_ids'] (Graph message ids) — those were
+    surfaced via the immediate Priority card, so they must never appear in the digest."""
     data = _load_reply_needed(data_dir)
-    return [it for it in (data.get("items") or []) if not it.get("digested_at")]
+    return [
+        it for it in (data.get("items") or [])
+        if not it.get("digested_at")
+        and (not pushed_ids or it.get("email_id") not in pushed_ids)
+    ]
 
 
 def _should_send_digest(data_dir: Path, monitor_state: dict, settings: dict) -> bool:
@@ -360,7 +367,8 @@ def _should_send_digest(data_dir: Path, monitor_state: dict, settings: dict) -> 
     if interval_h <= 0:
         return False
 
-    if not _undigested_items(data_dir):
+    pushed_ids = set(monitor_state.get("realtime_pushed_ids") or [])
+    if not _undigested_items(data_dir, pushed_ids):
         return False
 
     active = settings.get("email_active_hours") or _DEFAULT_ACTIVE_HOURS
@@ -467,9 +475,13 @@ def _maybe_send_digest(graph, chat_id: str, data_dir: Path, monitor_state: dict,
     if not _should_send_digest(data_dir, monitor_state, settings):
         return
 
+    pushed_ids = set(monitor_state.get("realtime_pushed_ids") or [])
     rn = _load_reply_needed(data_dir)
     items = rn.get("items") or []
-    pending = [it for it in items if not it.get("digested_at")]
+    pending = [
+        it for it in items
+        if not it.get("digested_at") and it.get("email_id") not in pushed_ids
+    ]
     if not pending:
         return
 
@@ -488,10 +500,14 @@ def _maybe_send_digest(graph, chat_id: str, data_dir: Path, monitor_state: dict,
         html = _build_digest_html(mapped, since_time_str=since_str)
         graph.send_html_message(chat_id, html)
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        # Stamp digested_at on every item we just sent
+        # Stamp digested_at on the items we just sent AND on any already-realtime-pushed
+        # items still unstamped — so a pushed email is permanently kept out of the digest
+        # (digested_at survives reply_needed rebuilds) even if its id later ages out of
+        # realtime_pushed_ids.
         sent_ids = {it.get("email_id") for it in pending if it.get("email_id")}
         for it in items:
-            if it.get("email_id") in sent_ids:
+            eid = it.get("email_id")
+            if not it.get("digested_at") and (eid in sent_ids or eid in pushed_ids):
                 it["digested_at"] = now_iso
         rn["items"] = items
         _save_reply_needed(data_dir, rn)
@@ -612,6 +628,7 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
     monitor_state = _load_monitor_state(data_dir)
     processed_ids = set(monitor_state.get("processed_conv_ids") or [])
     seen_msg_ids = set(monitor_state.get("seen_msg_ids") or [])
+    realtime_pushed_ids = set(monitor_state.get("realtime_pushed_ids") or [])
 
     # Prune priority followups that have already been replied to
     followups = monitor_state.get("pending_priority_followup") or []
@@ -764,6 +781,8 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
                     notified.append(summary)
                     print(f"[EmailMonitor] Priority push: {_from_addr(email_item)} — {email_item.get('subject','')[:60]}")
                     _pushed += 1
+                    # Record so this email is never ALSO surfaced in the digest.
+                    realtime_pushed_ids.add(email_item.get("id") or "")
                 except Exception as e:
                     print(f"[EmailMonitor] Card send failed: {e}")
             else:
@@ -794,6 +813,9 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
 
         monitor_state["processed_conv_ids"] = list(processed_ids)
         monitor_state["seen_msg_ids"] = list(seen_msg_ids)
+        if len(realtime_pushed_ids) > _MAX_PROCESSED_IDS:
+            realtime_pushed_ids = set(list(realtime_pushed_ids)[-_MAX_PROCESSED_IDS:])
+        monitor_state["realtime_pushed_ids"] = list(realtime_pushed_ids)
         monitor_state["last_notified_emails"] = notified[-20:]
 
         # Refresh reply_needed.json now so the digest + frontend reflect this batch.
