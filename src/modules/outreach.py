@@ -316,26 +316,249 @@ def _fill_template(subject: str, body: str, contact: dict) -> tuple:
     return _sub(subject), _sub(body)
 
 
+# ── CRM bulk email: two-phase (generate preview → user edits → commit) ──────
+#
+# Phase 1 generate_bulk() produces editable previews and touches NOTHING in
+# Outlook. Phase 2 commit_bulk() takes the user-edited previews and only THEN
+# saves drafts / sends. This is the human-review gate the one-shot path lacked.
+
+_BULK_SKILL_FILE = Path(__file__).parent.parent / "skills" / "bulk_email" / "skill.md"
+
+
+def _generate_bulk_email(ai: AIClient, contact: dict, intent: str,
+                         display_name: str, business_context: str,
+                         user_instruction: str = "") -> dict | None:
+    """Intent-led counterpart to _generate_draft for CRM bulk email: build the
+    email AROUND the user's message (intent), adapt tone/structure to the
+    contact's relationship status, use the contact's own writing_style + summary.
+    Does NOT impose the cold-outreach 'how we met / what I offer / book a call'
+    skeleton. Body comes back WITHOUT a signature (commit_bulk appends it).
+    Returns None on failure — never silently falls back to cold outreach."""
+    skill_text = _BULK_SKILL_FILE.read_text() if _BULK_SKILL_FILE.exists() else ""
+    if not skill_text:
+        print("[Outreach] bulk_email/skill.md missing — cannot generate intent-led email")
+        return None
+
+    prompt = (
+        skill_text
+        .replace("{display_name}",     display_name or "the executive")
+        .replace("{business_context}", (business_context or "").strip() or "(no profile available)")
+        .replace("{intent}",           (intent or "").strip())
+        .replace("{contact_name}",     contact.get("name", "") or "")
+        .replace("{contact_company}",  contact.get("company", "") or "")
+        .replace("{contact_role}",     contact.get("role", "") or "")
+        .replace("{contact_status}",   contact.get("status", "") or "other")
+        .replace("{contact_style}",    (contact.get("writing_style", "") or "").strip() or "(no per-contact style on file)")
+        .replace("{contact_history}",  (contact.get("summary", "") or "").strip() or "(no relationship notes on file)")
+        .replace("{user_instruction}", (user_instruction or "").strip() or "(none)")
+    )
+    try:
+        raw = ai.generate(prompt).strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            data = json.loads(match.group())
+            if data.get("subject") and data.get("body"):
+                return {"subject": data["subject"], "body": data["body"]}
+    except Exception as e:
+        print(f"[Outreach] Bulk email gen failed for {contact.get('email')}: {e}")
+    return None
+
+
+def _save_preview(data_dir: Path, preview: dict) -> None:
+    out_dir = Path(data_dir) / "outreach"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    f = out_dir / "preview.json"
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(preview, indent=2, ensure_ascii=False))
+    tmp.replace(f)
+
+
+def generate_bulk(ai: AIClient, data_dir: Path, settings: dict,
+                  emails: list, subject: str = "", body: str = "",
+                  personalize: bool = True, context_note: str = "",
+                  write_files: bool = True, progress=None) -> dict:
+    """Phase 1 — generate per-contact email previews. No Outlook calls at all
+    (no draft, no send). Writes outreach/preview.json incrementally so the UI
+    can poll, then render each item editable before the user commits.
+
+    Bodies come back WITHOUT a signature — commit_bulk appends it, so the user
+    edits clean text and the signature stays consistent across the batch."""
+    def log(msg: str):
+        print(f"[Outreach] {msg}")
+        if progress:
+            progress(msg)
+
+    from src.modules.crm import find_contacts_by_emails
+    data_dir = Path(data_dir)
+    display_name     = settings.get("display_name", "the executive")
+    business_context = load_profile_context(data_dir) if data_dir else ""
+    use_template     = not personalize
+    instruction_path = data_dir / "instructions" / "bulk_email.md"
+    user_instruction = instruction_path.read_text().strip() if instruction_path.exists() else ""
+
+    contacts = find_contacts_by_emails(data_dir, emails)
+    items: list = []
+    skipped: list = []
+    log(f"Generating {len(contacts)} preview(s) (personalize={personalize})")
+
+    def _preview(done: bool) -> dict:
+        return {
+            "status": "fresh" if done else "running",
+            "last_run": datetime.now(timezone.utc).isoformat(),
+            "personalize": bool(personalize),
+            "total": len(contacts),
+            "context_note": context_note,
+            "items": items,
+            "skipped": skipped,
+        }
+
+    if write_files:
+        _save_preview(data_dir, _preview(done=False))
+
+    for i, contact in enumerate(contacts):
+        email = (contact.get("email") or "").strip()
+        if not email or "@" not in email:
+            skipped.append({"reason": "no_email", "contact": contact})
+            continue
+
+        if use_template:
+            subj, bod = _fill_template(subject, body, contact)
+            if not subj.strip() or not bod.strip():
+                skipped.append({"reason": "empty_template", "contact": contact})
+                continue
+        else:
+            draft = _generate_bulk_email(
+                ai, contact, intent=body,
+                display_name=display_name, business_context=business_context,
+                user_instruction=user_instruction,
+            )
+            if not draft:
+                skipped.append({"reason": "draft_gen_failed", "contact": contact})
+                continue
+            # User-typed subject wins (consistent line, {name}/{company} filled);
+            # otherwise the AI's per-contact subject.
+            subj = _fill_template(subject, "", contact)[0] if subject.strip() else draft["subject"]
+            bod = draft["body"]
+
+        items.append({
+            "to": email,
+            "name": contact.get("name", ""),
+            "company": contact.get("company", ""),
+            "subject": subj,
+            "body": bod,
+        })
+        if write_files and (i + 1) % 3 == 0:
+            _save_preview(data_dir, _preview(done=False))
+
+    preview = _preview(done=True)
+    if write_files:
+        _save_preview(data_dir, preview)
+    log(f"Preview ready — {len(items)} generated, {len(skipped)} skipped")
+    return preview
+
+
+def commit_bulk(graph: GraphClient, data_dir: Path, settings: dict,
+                items: list, send: bool = False, write_files: bool = True,
+                progress=None) -> dict:
+    """Phase 2 — commit the (user-edited) previews. Appends the signature, then
+    saves to Outlook Drafts (send=False, the default) or sends for real
+    (send=True, capped). `items` = [{to, name, company, subject, body}].
+    Writes outreach/results.json (polled by the UI)."""
+    def log(msg: str):
+        print(f"[Outreach] {msg}")
+        if progress:
+            progress(msg)
+
+    data_dir = Path(data_dir)
+    user_signature = get_user_signature(settings)
+    items = items or []
+
+    if send and len(items) > BULK_SEND_CAP:
+        result = {
+            "status": "not_run", "last_run": datetime.now(timezone.utc).isoformat(),
+            "mode": "bulk", "send": True,
+            "error": (f"Send batch too large: {len(items)} recipients > cap "
+                      f"{BULK_SEND_CAP}. Reduce the selection or save as drafts instead."),
+            "drafts_created": [], "files_processed": [], "contacts_skipped": [], "errors": [],
+            "summary": {"drafts": 0, "sent": 0, "files": 0, "skipped": 0, "errors": 0},
+        }
+        if write_files:
+            _save_result(data_dir, result)
+        return result
+
+    drafts_created: list = []
+    errors: list = []
+
+    def _result(done: bool) -> dict:
+        sent_n = sum(1 for d in drafts_created if d.get("sent"))
+        return {
+            "status": "fresh" if done else "running",
+            "last_run": datetime.now(timezone.utc).isoformat(),
+            "mode": "bulk", "send": bool(send), "total": len(items),
+            "drafts_created": drafts_created, "files_processed": [],
+            "contacts_skipped": [], "errors": errors,
+            "summary": {
+                "drafts": len(drafts_created) - sent_n, "sent": sent_n,
+                "files": 0, "skipped": 0, "errors": len(errors),
+            },
+        }
+
+    if write_files:
+        _save_result(data_dir, _result(done=False))
+
+    for i, it in enumerate(items):
+        email = (it.get("to") or "").strip()
+        subj = (it.get("subject") or "")
+        bod = (it.get("body") or "")
+        if not email or "@" not in email or not subj.strip() or not bod.strip():
+            errors.append({"contact": email, "error": "missing to / subject / body"})
+            continue
+        final_body = append_signature_to_body(bod, user_signature)
+        try:
+            if send:
+                graph.send_mail(to=email, subject=subj, html=_ensure_html(final_body))
+                web_link = ""
+            else:
+                gr = graph.create_draft(subject=subj, body=final_body, to=email)
+                web_link = gr.get("webLink", "")
+            drafts_created.append({
+                "to": email, "name": it.get("name", ""), "company": it.get("company", ""),
+                "subject": subj, "web_link": web_link, "sent": bool(send),
+                "source_file": "CRM:bulk",
+            })
+            log(f"  ✅ {'Sent' if send else 'Draft'}: {email}")
+        except Exception as e:
+            errors.append({"contact": email, "error": str(e)})
+
+        if write_files and (i + 1) % 5 == 0:
+            _save_result(data_dir, _result(done=False))
+        if send:
+            time.sleep(0.5)  # gentle pacing — let M365 throttling breathe
+
+    result = _result(done=True)
+    if write_files:
+        _save_result(data_dir, result)
+    log(f"Commit done — {len(drafts_created)} created "
+        f"({sum(1 for d in drafts_created if d.get('sent'))} sent), {len(errors)} errors")
+    return result
+
+
 # ── Main entry ─────────────────────────────────────────────────────────────
 
 def run(graph: GraphClient, ai: AIClient, data_dir: Path, settings: dict,
         context_note: str = "", folder: str = "",
-        tag: str = "", recent_hours: int = 0,
-        emails: list = None, subject: str = "", body: str = "",
-        personalize: bool = True, send: bool = False, progress=None) -> dict:
+        tag: str = "", recent_hours: int = 0, progress=None) -> dict:
     """
-    Generate Outlook drafts (or send) for a batch of contacts. Four modes:
+    Generate Outlook drafts for a batch of contacts. Three modes:
 
-      emails       — explicit CRM email list (the CRM multi-select bulk-email UI).
-                     personalize=True → AI writes per contact in their stored tone;
-                     personalize=False → fixed subject/body template ({name}/{company}…);
-                     send=True → real send via graph.send_mail (capped, default off);
-                     send=False → save to Outlook Drafts (the safe default).
       folder       — scan OneDrive folder for files (cards/csv/xlsx/pdf), extract contacts, draft.
       tag          — pull contacts from CRM that have this tag, draft.
       recent_hours — pull contacts from CRM added in the last N hours, draft.
 
     Defaults to folder mode if none specified. context_note is injected into each draft prompt.
+    (CRM multi-select bulk email is a separate two-phase flow — see generate_bulk / commit_bulk.)
     """
     def log(msg: str):
         print(f"[Outreach] {msg}")
@@ -356,107 +579,6 @@ def run(graph: GraphClient, ai: AIClient, data_dir: Path, settings: dict,
     contacts_skipped = []
     files_processed = []
     errors = []
-
-    # ── Mode 0: explicit email list (CRM multi-select bulk email) ─────
-    if emails:
-        from src.modules.crm import find_contacts_by_emails
-        contacts = find_contacts_by_emails(data_dir, emails)
-        use_template = not personalize
-        log(f"Bulk email → {len(contacts)} contact(s) (personalize={personalize}, send={send})")
-
-        if send and len(contacts) > BULK_SEND_CAP:
-            result = {
-                "status": "not_run",
-                "last_run": datetime.now(timezone.utc).isoformat(),
-                "mode": "bulk", "send": True,
-                "error": (f"Send batch too large: {len(contacts)} recipients > cap "
-                          f"{BULK_SEND_CAP}. Reduce the selection or save as drafts instead."),
-                "drafts_created": [], "files_processed": [],
-                "contacts_skipped": [], "errors": [],
-                "summary": {"drafts": 0, "sent": 0, "files": 0, "skipped": 0, "errors": 0},
-            }
-            _save_result(data_dir, result)
-            return result
-
-        def _bulk_result(done: bool) -> dict:
-            sent_n = sum(1 for d in drafts_created if d.get("sent"))
-            return {
-                "status": "fresh" if done else "running",
-                "last_run": datetime.now(timezone.utc).isoformat(),
-                "mode": "bulk",
-                "send": bool(send),
-                "personalize": bool(personalize),
-                "total": len(contacts),
-                "context_note": context_note,
-                "drafts_created": drafts_created,
-                "files_processed": [],
-                "contacts_skipped": contacts_skipped,
-                "errors": errors,
-                "summary": {
-                    "drafts": len(drafts_created) - sent_n,
-                    "sent": sent_n,
-                    "files": 0,
-                    "skipped": len(contacts_skipped),
-                    "errors": len(errors),
-                },
-            }
-
-        for i, contact in enumerate(contacts):
-            email = (contact.get("email") or "").strip()
-            if not email or "@" not in email:
-                contacts_skipped.append({"reason": "no_email", "contact": contact})
-                continue
-
-            if use_template:
-                subj, bod = _fill_template(subject, body, contact)
-                if not subj.strip() or not bod.strip():
-                    contacts_skipped.append({"reason": "empty_template", "contact": contact})
-                    continue
-            else:
-                draft = _generate_draft(
-                    ai, contact, context_note, display_name, business_context,
-                    writing_style,
-                    contact_style=contact.get("writing_style", ""),
-                    contact_history=contact.get("summary", ""),
-                    intent=body,
-                )
-                if not draft:
-                    contacts_skipped.append({"reason": "draft_gen_failed", "contact": contact})
-                    continue
-                # A user-typed subject wins (consistent line across the batch,
-                # with {name}/{company} filled); otherwise the AI's per-contact one.
-                subj = _fill_template(subject, "", contact)[0] if subject.strip() else draft["subject"]
-                bod = draft["body"]
-
-            final_body = append_signature_to_body(bod, user_signature)
-            try:
-                if send:
-                    graph.send_mail(to=email, subject=subj, html=_ensure_html(final_body))
-                    web_link = ""
-                else:
-                    gr = graph.create_draft(subject=subj, body=final_body, to=email)
-                    web_link = gr.get("webLink", "")
-                drafts_created.append({
-                    "to": email, "name": contact.get("name", ""),
-                    "company": contact.get("company", ""),
-                    "subject": subj, "web_link": web_link,
-                    "sent": bool(send), "source_file": "CRM:bulk",
-                })
-                log(f"  ✅ {'Sent' if send else 'Draft'}: {email}")
-            except Exception as e:
-                errors.append({"contact": email, "error": str(e)})
-
-            if (i + 1) % 5 == 0:
-                _save_result(data_dir, _bulk_result(done=False))
-            if send:
-                time.sleep(0.5)  # gentle pacing — let M365 throttling breathe
-
-        result = _bulk_result(done=True)
-        _save_result(data_dir, result)
-        log(f"Bulk done — {len(drafts_created)} created "
-            f"({sum(1 for d in drafts_created if d.get('sent'))} sent), "
-            f"{len(contacts_skipped)} skipped, {len(errors)} errors")
-        return result
 
     # ── Mode 1: CRM by tag or recency ─────────────────────────────────
     if tag or recent_hours:

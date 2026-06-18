@@ -403,6 +403,75 @@ def find_contacts_by_tag(data_dir: Path, tag: str) -> list:
     ]
 
 
+def find_contacts_by_tag_exact(data_dir: Path, tag: str) -> list:
+    """Return contacts whose tags contain `tag` as a WHOLE tag (case-insensitive
+    EXACT match, not substring). 'Investors' matches the tag 'investors' but NOT
+    'potential_investors'. The accurate path for group email, where over-matching
+    means emailing the wrong people."""
+    crm = load_crm(data_dir)
+    tl = (tag or "").strip().lower()
+    if not tl:
+        return []
+    return [
+        c for c in crm.get("contacts", {}).values()
+        if any(tl == (t or "").strip().lower() for t in (c.get("tags") or []))
+    ]
+
+
+def list_groups(data_dir: Path) -> list:
+    """Return [{tag, count}, ...] of every distinct tag and how many contacts
+    carry it, sorted by count desc then name. Lets callers answer "what groups
+    do I have?" and disambiguate a fuzzy group name."""
+    crm = load_crm(data_dir)
+    counts: dict = {}
+    display: dict = {}
+    for c in crm.get("contacts", {}).values():
+        for t in (c.get("tags") or []):
+            t = (t or "").strip()
+            if not t:
+                continue
+            key = t.lower()
+            counts[key] = counts.get(key, 0) + 1
+            display.setdefault(key, t)   # first-seen casing for display
+    out = [{"tag": display[k], "count": v} for k, v in counts.items()]
+    out.sort(key=lambda g: (-g["count"], g["tag"].lower()))
+    return out
+
+
+def resolve_group(data_dir: Path, group: str) -> dict:
+    """Resolve a user-typed group name to CRM contacts. Exact-tag match first;
+    only if zero exact matches, fall back to substring. Returns:
+      {mode: 'exact'|'substring'|'none', matched_tag, contacts,
+       candidate_tags: [{tag,count}], all_groups: [{tag,count}]}
+    Caller decides: exact → proceed; substring with ONE candidate → proceed;
+    substring with >1 → ask the user to pick; none → show all_groups."""
+    exact = find_contacts_by_tag_exact(data_dir, group)
+    if exact:
+        return {"mode": "exact", "matched_tag": (group or "").strip(),
+                "contacts": exact, "candidate_tags": [], "all_groups": []}
+
+    crm = load_crm(data_dir)
+    gl = (group or "").strip().lower()
+    sub_contacts: list = []
+    cand: dict = {}
+    if gl:
+        for c in crm.get("contacts", {}).values():
+            hit = [t for t in (c.get("tags") or []) if gl in (t or "").strip().lower()]
+            if hit:
+                sub_contacts.append(c)
+                for t in hit:
+                    key = (t or "").strip().lower()
+                    rec = cand.setdefault(key, {"tag": (t or "").strip(), "count": 0})
+                    rec["count"] += 1
+    if sub_contacts:
+        return {"mode": "substring", "matched_tag": "", "contacts": sub_contacts,
+                "candidate_tags": sorted(cand.values(), key=lambda g: (-g["count"], g["tag"].lower())),
+                "all_groups": []}
+
+    return {"mode": "none", "matched_tag": "", "contacts": [],
+            "candidate_tags": [], "all_groups": list_groups(data_dir)}
+
+
 def find_contacts_added_since(data_dir: Path, hours: int) -> list:
     """Return list of contact dicts added in the last `hours` hours."""
     crm = load_crm(data_dir)
@@ -417,6 +486,22 @@ def find_contacts_added_since(data_dir: Path, hours: int) -> list:
         except Exception:
             continue
         if dt >= cutoff:
+            out.append(c)
+    return out
+
+
+def find_contacts_by_emails(data_dir: Path, emails: list) -> list:
+    """Return contact dicts for the given emails, in the order requested.
+
+    Only returns contacts that exist in the CRM (the bulk-email feature never
+    sends to addresses the user hasn't already vetted as contacts). Lookup is
+    by lowercased email, matching how the contacts map is keyed."""
+    contacts = load_crm(data_dir).get("contacts", {})
+    out = []
+    for e in emails or []:
+        key = (e or "").strip().lower()
+        c = contacts.get(key)
+        if c:
             out.append(c)
     return out
 

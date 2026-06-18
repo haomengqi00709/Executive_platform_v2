@@ -1,0 +1,61 @@
+{
+  "ai_governance": {
+    "label": "AI & Governance",
+    "description": "AI policy/regulation, responsible AI, enterprise AI adoption, AI consulting market.",
+    "rss": [
+      { "name": "Simon Willison", "url": "https://simonwillison.net/atom/everything/", "category": "ai" },
+      { "name": "Import AI (Jack Clark)", "url": "https://importai.substack.com/feed", "category": "ai-policy" },
+      { "name": "Hugging Face Blog", "url": "https://huggingface.co/blog/feed.xml", "category": "ai" }
+    ],
+    "google_news": [
+      { "name": "AI governance / regulation Canada", "query": "(AI governance OR AI regulation OR AIDA) Canada", "category": "regulatory" },
+      { "name": "EU AI Act enterprise compliance", "query": "EU AI Act compliance enterprise deadline", "category": "regulatory" },
+      { "name": "NIST AI RMF / ISO 42001", "query": "\"NIST AI RMF\" OR \"ISO 42001\" enterprise", "category": "regulatory" },
+      { "name": "AI consulting market moves", "query": "AI consulting firm acquisition OR partnership OR funding", "category": "competitive" }
+    ]
+  },
+  "civil_construction": {
+    "label": "Civil & Construction Engineering",
+    "description": "Capital projects, tenders, construction-firm moves, infrastructure policy (NA).",
+    "rss": [
+      { "name": "Construction Dive", "url": "https://www.constructiondive.com/feeds/news/", "category": "construction" }
+    ],
+    "google_news": [
+      { "name": "Infrastructure tenders Canada", "query": "(infrastructure OR capital project) tender OR RFP Canada", "category": "regulatory" },
+      { "name": "Engineering firm M&A North America", "query": "engineering firm acquisition OR merger North America", "category": "M&A" },
+      { "name": "Construction technology / digital", "query": "construction technology OR digital twin OR BIM adoption", "category": "technology" }
+    ]
+  },
+  "water_utilities": {
+    "label": "Water & Utilities",
+    "description": "Water/pump infrastructure, municipal water projects, utility capital spend.",
+    "rss": [],
+    "google_news": [
+      { "name": "Municipal water pump projects NA", "query": "municipal water pump OR pumping station project Canada OR USA", "category": "regulatory" },
+      { "name": "Water infrastructure funding", "query": "water infrastructure funding OR investment North America", "category": "funding" },
+      { "name": "Pump manufacturer / distributor news", "query": "industrial pump manufacturer OR distributor acquisition OR contract", "category": "M&A" }
+    ]
+  },
+  "mechanical_electrical": {
+    "label": "Mechanical & Electrical Engineering",
+    "description": "Industrial M/E engineering, automation, equipment, supply chain.",
+    "rss": [
+      { "name": "Design News", "url": "https://www.designnews.com/rss.xml", "category": "engineering" }
+    ],
+    "google_news": [
+      { "name": "Industrial automation North America", "query": "industrial automation investment OR project North America", "category": "technology" },
+      { "name": "Electrical / power engineering projects", "query": "electrical engineering OR power systems project Canada OR USA", "category": "regulatory" }
+    ]
+  },
+  "consulting": {
+    "label": "Management & Technology Consulting",
+    "description": "Consulting market trends, advisory-firm moves, enterprise transformation.",
+    "rss": [
+      { "name": "McKinsey Insights", "url": "https://www.mckinsey.com/insights/rss", "category": "consulting" }
+    ],
+    "google_news": [
+      { "name": "Management consulting market", "query": "management consulting market trends OR acquisition", "category": "competitive" },
+      { "name": "Enterprise digital transformation", "query": "enterprise digital transformation advisory North America", "category": "technology" }
+    ]
+  }
+}

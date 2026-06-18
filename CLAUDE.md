@@ -216,6 +216,25 @@ Skill 文件：`src/skills/{section_id}/skill.md` — AI 提示词
 
 ---
 
+## 代码知识库（`kb/`）与 feedback-board
+
+`kb/` 是一个 LLM 维护的代码知识库（markdown），给内部团队的 feedback-board 服务做 AI 问答用。
+约定见 `kb/KB_GUIDE.md`。**它不是 meeting `wiki/`，不放 per-user 数据，是 repo-wide 进 git 的。**
+
+**维护钩子（改完代码必须做）：**
+改完某 section 的行为 / prompt 后 → 更新它对应的 `kb/capabilities/*.md`（bump frontmatter 的
+`derived_from_commit` + `last_synced`）+ 给 `kb/log.md` append 一行；**push 前跑 `python kb/lint.py`，
+必须 exit clean**。`lint.py` 用 git 比对每页 `describes_files` 自 `derived_from_commit` 后有没有变，
+检测过期。改了哪些文件、影响哪些页：`python kb/lint.py --files <changed files>`。
+
+易变事实**不冻进 KB**：某 section 当前 prompt 的真相源是 `src/skills/{id}/skill.md`（feedback-board
+实时读原文）；已知问题的真相源是 feedback-board 的 `requests.json`。
+
+`feedback-board/` 是独立 Railway service（克隆 `ops-dashboard/`），对主程序**零侵入**：不 import 主
+`src/`、不写 `.data/`，构建时只 COPY 一份 `kb/` + `src/skills/` 只读副本。详见 `feedback-board/README.md`。
+
+---
+
 ## 前端待完成
 
 **定时任务配置页面（尚未实现）：**

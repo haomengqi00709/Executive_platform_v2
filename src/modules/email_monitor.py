@@ -581,6 +581,8 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
         return
 
     data_dir = Path(data_dir)
+    from src.ai import set_usage_context
+    set_usage_context("email_monitor", data_dir.name)
 
     # Pull email-monitor config from schedules.json and overlay onto settings
     # so downstream functions (digest timing, realtime push) use the user's preferences.

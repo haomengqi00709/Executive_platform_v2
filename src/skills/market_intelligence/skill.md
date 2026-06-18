@@ -48,6 +48,25 @@ Return 8–12 items as a JSON array:
 
 Only report real, verifiable events. Do not fabricate sources or URLs.
 
+## Relevance Scoring (0-10)
+
+After collection (grounding search + any configured feeds), every candidate is
+scored 0-10 for relevance to {display_name}'s specific business and geography,
+then gated — items below threshold (default 6.0) are dropped, and `priority` is
+set from the score band. This is what lets broad feed sources coexist with
+targeted grounding without flooding the brief with off-topic news. Bands:
+
+- **10** — Act now: directly affects this business (client/competitor move,
+  regulation with a deadline, live tender, direct threat).
+- **8-9 (high)** — Strong strategic signal to read this week.
+- **6-7 (medium)** — Worth knowing; relevant context, not urgent.
+- **4-5** — Tangential: same broad industry, no specific implication. *(dropped)*
+- **2-3** — Off-target: adjacent/general news, little bearing. *(dropped)*
+- **0-1** — Noise: irrelevant/promotional. *(dropped)*
+
+A technically impressive or popular item with no bearing on THIS reader's
+business scores LOW. (Operational rubric: `src/modules/intel_score.py`.)
+
 ## User Instruction
 
 {user_instruction}

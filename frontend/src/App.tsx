@@ -16,6 +16,7 @@ import ToolsPage from './pages/ToolsPage';
 import ProfilePage from './pages/ProfilePage';
 import OnboardingWizard from './components/OnboardingWizard';
 import { ActivityProvider } from './components/ActivityDrawer';
+import { BulkEmailContext } from './lib/bulkEmail';
 
 // ── Types (preserved auth + onboarding + settings) ─────────────────────────
 
@@ -94,6 +95,9 @@ function brandInitials(name: string): string {
 export default function App() {
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
   const [page,  setPage]  = useState<Page>('dashboard');
+  const [bulkResume, setBulkResume] = useState(false);
+  const requestResume = useCallback(() => { setPage('records'); setBulkResume(true); }, []);
+  const clearResume   = useCallback(() => setBulkResume(false), []);
   const [pendingSkillId, setPendingSkillId] = useState<string | undefined>();
   const [sectionDetailId, setSectionDetailId] = useState<string | undefined>();
   const [user,  setUser]  = useState<AuthUser | null>(null);
@@ -189,6 +193,7 @@ export default function App() {
   return (
     <BrandingContext.Provider value={{ bot: brandBot }}>
     <ActivityProvider>
+    <BulkEmailContext.Provider value={{ resumeRequested: bulkResume, requestResume, clearResume }}>
     <div className="flex h-screen w-full bg-executive-bg text-executive-text overflow-hidden executive-grid">
       {/* Sidebar */}
       <aside className="w-56 shrink-0 h-full flex flex-col border-r border-executive-border bg-executive-card z-10">
@@ -288,6 +293,7 @@ export default function App() {
         {page === 'settings'  && <SettingsPage user={user} onBrandingChange={loadBranding} />}
       </main>
     </div>
+    </BulkEmailContext.Provider>
     </ActivityProvider>
     </BrandingContext.Provider>
   );

@@ -7,6 +7,7 @@ import { getProjects, patchProject, relativeTime, archiveRecord, scanProjects, p
 import type { ProjectRecord } from '../../lib/api';
 import MergePicker from './MergePicker';
 import BulkUploadModal from './BulkUploadModal';
+import { useActivity } from '../../components/ActivityDrawer';
 
 const STATUS_OPTIONS = ['ongoing', 'needs_attention', 'paused', 'early_stage', 'completed'];
 const MOMENTUM_OPTIONS = ['accelerating', 'steady', 'slowing', 'stalled'];
@@ -49,7 +50,7 @@ export default function ProjectsTab() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [savingId, setSavingId] = useState<string | null>(null);
   const [mergeSource, setMergeSource] = useState<ProjectRecord | null>(null);
-  const [scanning, setScanning] = useState(false);
+  const { startJob, isActive } = useActivity();
   const [bulkOpen, setBulkOpen] = useState(false);
   const [stages, setStages] = useState<Record<string, string>>({});
 
@@ -100,29 +101,27 @@ export default function ProjectsTab() {
 
   const rescan = async () => {
     if (!confirm('Re-scan inbox history and rebuild the Projects DB? This may take a few minutes.')) return;
-    setScanning(true);
+    const before = lastScan;
     try {
-      const before = lastScan;
       await scanProjects();
-      const start = Date.now();
-      const tick = async () => {
-        if (Date.now() - start > 20 * 60 * 1000) { setScanning(false); return; }
-        try {
-          const d = await getProjects();
-          if (d.last_scan && d.last_scan !== before) {
-            setProjects(d.projects || []);
-            setLastScan(d.last_scan);
-            setScanning(false);
-            return;
-          }
-        } catch {}
-        setTimeout(tick, 5000);
-      };
-      setTimeout(tick, 5000);
     } catch (e: any) {
       alert(`Scan failed: ${e?.message || 'unknown error'}`);
-      setScanning(false);
+      return;
     }
+    startJob({
+      id: 'projects-rescan',
+      label: 'Projects re-scan',
+      kind: 'rescan',
+      poll: async () => {
+        const d = await getProjects();
+        if (d.last_scan && d.last_scan !== before) {
+          setProjects(d.projects || []);
+          setLastScan(d.last_scan);
+          return { status: 'done', last_run: d.last_scan };
+        }
+        return { status: 'running' };
+      },
+    });
   };
 
   const visible = useMemo(() => {
@@ -187,12 +186,12 @@ export default function ProjectsTab() {
           </a>
           <button
             onClick={rescan}
-            disabled={scanning}
+            disabled={isActive('projects-rescan')}
             className="flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg border border-executive-border text-executive-muted hover:text-executive-text hover:bg-executive-border/40 disabled:opacity-50"
             title="Re-scan inbox history and rebuild projects DB"
           >
-            {scanning ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-            {scanning ? 'Scanning…' : 'Re-scan'}
+            {isActive('projects-rescan') ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+            {isActive('projects-rescan') ? 'Scanning…' : 'Re-scan'}
           </button>
           <button
             onClick={() => setBulkOpen(true)}

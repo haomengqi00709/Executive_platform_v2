@@ -11,6 +11,7 @@ Returns the same messages list with two fields added per message:
 """
 import json
 import threading
+import contextvars
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.ai import AIClient
@@ -270,9 +271,11 @@ def screen_emails(
     lock = threading.Lock()
 
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+        # Fresh context copy PER task to carry the ai-usage tag into the worker —
+        # a single Context can't be entered by more than one ctx.run() at a time.
         futures = {
             executor.submit(
-                _screen_batch,
+                contextvars.copy_context().run, _screen_batch,
                 i, batch, ai,
                 business_context, display_name,
                 progress, total_batches,

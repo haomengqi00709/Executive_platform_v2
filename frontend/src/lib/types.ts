@@ -148,6 +148,11 @@ export interface RelationshipItem {
   suggested_action?: string;
 }
 
+export interface IntelReference {
+  title: string;
+  url: string;
+}
+
 export interface IntelItem {
   id: string;
   headline: string;
@@ -160,7 +165,30 @@ export interface IntelItem {
   priority: 'high' | 'medium' | 'low';
   company?: string;
   person?: string;
+  // Added by the scoring + enrichment passes (optional; older results lack them)
+  ai_score?: number;
+  score_reason?: string;
+  background?: string;
+  community_view?: string;
+  references?: IntelReference[];
 }
+
+export interface FeedRss { name: string; url: string; enabled?: boolean; category?: string; }
+export interface FeedGoogleNews { name: string; query: string; enabled?: boolean; category?: string; }
+export interface FeedsConfig {
+  enabled: boolean;
+  rss: FeedRss[];
+  google_news: FeedGoogleNews[];
+  hackernews: { enabled: boolean; fetch_top_stories?: number; min_score?: number };
+  reddit: { enabled: boolean; subreddits: { subreddit: string; enabled?: boolean; sort?: string; fetch_limit?: number; min_score?: number }[] };
+}
+export interface FeedPreset {
+  label: string;
+  description?: string;
+  rss?: FeedRss[];
+  google_news?: FeedGoogleNews[];
+}
+export interface FeedsResponse { feeds: FeedsConfig; presets: Record<string, FeedPreset>; }
 
 export interface ExpenseItem {
   vendor: string;
@@ -213,6 +241,7 @@ export interface OutreachDraft {
   subject: string;
   web_link: string;
   source_file: string;
+  sent?: boolean;          // bulk mode: true when actually sent (not just drafted)
 }
 
 export interface OutreachSkippedContact {
@@ -228,11 +257,16 @@ export interface OutreachSkippedContact {
 }
 
 export interface OutreachLastRun {
-  status?: 'fresh' | 'not_run' | 'error';
+  status?: 'fresh' | 'not_run' | 'error' | 'running';
   last_run?: string;        // ISO datetime — what the backend writes
   ran_at?: string;          // legacy alias (older runs may still have this)
   folder?: string;
   context_note?: string;
+  mode?: string;            // 'crm' | 'bulk' | undefined (folder)
+  send?: boolean;           // bulk mode: real send vs draft-only
+  personalize?: boolean;    // bulk mode: AI per-contact vs template
+  total?: number;           // bulk mode: recipients in this batch
+  error?: string;
   drafts_created?: OutreachDraft[];
   contacts_skipped?: OutreachSkippedContact[];
   files_processed?: { file: string; type: string; contacts_found: number }[];
@@ -242,6 +276,7 @@ export interface OutreachLastRun {
     files: number;
     skipped: number;
     errors: number;
+    sent?: number;          // bulk mode: count actually sent
   };
 }
 

@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Feedback Board</title>
+<style>
+  :root { --bg:#0f1115; --card:#1a1d24; --line:#2a2e38; --fg:#e6e8ee; --mut:#9aa0ad;
+          --new:#3b82f6; --prog:#f59e0b; --done:#22c55e; --accent:#6366f1; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  header { padding:18px 24px; border-bottom:1px solid var(--line); display:flex;
+           align-items:baseline; gap:14px; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--mut); font-size:13px; }
+  .wrap { max-width:980px; margin:0 auto; padding:24px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:24px; margin-top:24px; }
+  @media (max-width:760px){ .grid{ grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px; }
+  h2 { font-size:14px; text-transform:uppercase; letter-spacing:.04em; color:var(--mut); margin:0 0 14px; }
+  label { display:block; font-size:13px; color:var(--mut); margin:10px 0 4px; }
+  input, select, textarea { width:100%; background:var(--bg); color:var(--fg);
+    border:1px solid var(--line); border-radius:8px; padding:9px 11px; font:inherit; }
+  textarea { resize:vertical; min-height:72px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px;
+    padding:9px 16px; font:inherit; font-weight:600; cursor:pointer; margin-top:14px; }
+  button:hover { filter:brightness(1.1); }
+  button:disabled { opacity:.5; cursor:default; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--fg);
+    padding:4px 10px; margin:0; font-size:12px; font-weight:500; }
+  .answer { background:var(--bg); border:1px solid var(--line); border-radius:8px;
+    padding:12px 14px; margin-top:14px; white-space:pre-wrap; display:none; }
+  .answer .src { color:var(--mut); font-size:12px; margin-top:10px; }
+  .req { border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin-bottom:12px; }
+  .req .top { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .req .id { font-weight:700; }
+  .req .title { font-weight:600; }
+  .req .body { color:var(--mut); font-size:14px; margin:6px 0 0; white-space:pre-wrap; }
+  .req .meta { color:var(--mut); font-size:12px; margin-top:8px; }
+  .pill { font-size:11px; font-weight:700; padding:2px 8px; border-radius:999px; text-transform:uppercase; }
+  .k-bug{ background:#7f1d1d; color:#fecaca; } .k-feature{ background:#1e3a5f; color:#bfdbfe; }
+  .k-optimization{ background:#4a3a12; color:#fde68a; }
+  .s-new{ color:var(--new); } .s-in_progress{ color:var(--prog); } .s-done{ color:var(--done); }
+  .admin { margin-top:8px; display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  .adminbar { color:var(--mut); font-size:12px; margin-top:10px; display:flex; gap:8px; align-items:center; }
+  .adminbar input { width:auto; padding:5px 8px; font-size:12px; }
+  .empty { color:var(--mut); font-style:italic; }
+  .msg { font-size:13px; margin-top:8px; min-height:18px; }
+  .ctx { color:var(--mut); font-size:12px; margin-top:6px; display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Feedback Board</h1>
+  <span class="sub">Ask about the platform · report a bug / feature / optimization</span>
+</header>
+
+<div class="wrap">
+  <!-- Ask the assistant -->
+  <section class="card">
+    <h2>Ask about the platform</h2>
+    <textarea id="q" placeholder="e.g. What does the morning summary include? Is Slack supported?"></textarea>
+    <button id="ask">Ask</button>
+    <div class="answer" id="answer"></div>
+  </section>
+
+  <div class="grid">
+    <!-- Submit -->
+    <section class="card">
+      <h2>Report something</h2>
+      <label>Type</label>
+      <select id="kind">
+        <option value="bug">Bug</option>
+        <option value="feature">Feature request</option>
+        <option value="optimization">Optimization</option>
+      </select>
+      <label>Title</label>
+      <input id="title" placeholder="Short summary" />
+      <label>Details</label>
+      <textarea id="body" placeholder="What happened / what you'd like"></textarea>
+      <label>Your name</label>
+      <input id="author" placeholder="(optional)" />
+      <div class="ctx" id="ctxNote">↳ Attaching the assistant conversation for context.</div>
+      <button id="submit">Submit</button>
+      <div class="msg" id="submitMsg"></div>
+    </section>
+
+    <!-- Board -->
+    <section class="card">
+      <h2>Requests</h2>
+      <div id="board"><span class="empty">Loading…</span></div>
+      <div class="adminbar">
+        <span>Admin:</span>
+        <input id="admUser" placeholder="user" autocomplete="off" />
+        <input id="admPass" type="password" placeholder="password" autocomplete="off" />
+        <span class="sub">(needed to change status)</span>
+      </div>
+    </section>
+  </div>
+</div>
+
+<script>
+const KINDS = { bug:"k-bug", feature:"k-feature", optimization:"k-optimization" };
+const NEXT = { new:"in_progress", in_progress:"done", done:"new" };
+let chatContext = null;  // set when a request is filed from a chat answer
+
+function esc(s){ return (s||"").replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+function adminHeader() {
+  const u = document.getElementById("admUser").value.trim();
+  const p = document.getElementById("admPass").value;
+  if (!u || !p) return null;
+  return "Basic " + btoa(u + ":" + p);
+}
+
+// ── Ask the assistant ──
+document.getElementById("ask").addEventListener("click", async () => {
+  const q = document.getElementById("q").value.trim();
+  const ansEl = document.getElementById("answer");
+  const btn = document.getElementById("ask");
+  if (!q) return;
+  btn.disabled = true; btn.textContent = "Thinking…";
+  ansEl.style.display = "block"; ansEl.textContent = "…";
+  try {
+    const r = await fetch("/api/chat", {
+      method:"POST", headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ question: q }),
+    });
+    if (!r.ok) {
+      const detail = (await r.json().catch(()=>({}))).detail || r.status;
+      ansEl.innerHTML = `<span class="empty">Assistant unavailable (${esc(String(detail))}).</span>`;
+      return;
+    }
+    const d = await r.json();
+    ansEl.innerHTML = esc(d.answer)
+      + `<div class="src"><button class="ghost" id="reportBtn">Report this as a request</button></div>`;
+    document.getElementById("reportBtn").addEventListener("click", () => {
+      chatContext = "Q: " + q + "\n\nA: " + d.answer;
+      document.getElementById("title").value = q.slice(0, 80);
+      document.getElementById("ctxNote").style.display = "block";
+      document.getElementById("title").scrollIntoView({behavior:"smooth", block:"center"});
+    });
+  } catch (e) {
+    ansEl.innerHTML = `<span class="empty">Failed: ${esc(e.message)}</span>`;
+  } finally {
+    btn.disabled = false; btn.textContent = "Ask";
+  }
+});
+
+// ── Board ──
+async function loadBoard() {
+  const board = document.getElementById("board");
+  try {
+    const r = await fetch("/api/requests");
+    if (!r.ok) throw new Error(r.status);
+    const { requests } = await r.json();
+    if (!requests.length) { board.innerHTML = '<span class="empty">No requests yet.</span>'; return; }
+    board.innerHTML = requests.map(renderReq).join("");
+  } catch (e) {
+    board.innerHTML = '<span class="empty">Failed to load (' + e.message + ').</span>';
+  }
+}
+
+function renderReq(req) {
+  const k = KINDS[req.kind] || "";
+  return `<div class="req">
+    <div class="top">
+      <span class="id">${req.id}</span>
+      <span class="pill ${k}">${req.kind}</span>
+      <span class="title">${esc(req.title)}</span>
+      <span class="pill s-${req.status}" style="margin-left:auto">${req.status.replace("_"," ")}</span>
+    </div>
+    ${req.body ? `<div class="body">${esc(req.body)}</div>` : ""}
+    <div class="meta">by ${esc(req.author||"anonymous")} · ${(req.created_at||"").slice(0,10)}${req.chat_context ? " · from chat" : ""}</div>
+    <div class="admin">
+      <button class="ghost" data-id="${req.id}" data-to="${NEXT[req.status]}">→ ${NEXT[req.status].replace("_"," ")}</button>
+    </div>
+  </div>`;
+}
+
+document.getElementById("board").addEventListener("click", async (e) => {
+  const btn = e.target.closest("button[data-id]");
+  if (!btn) return;
+  const auth = adminHeader();
+  if (!auth) { alert("Enter admin user/password below to change status."); return; }
+  const r = await fetch(`/api/requests/${btn.dataset.id}/status`, {
+    method:"POST",
+    headers:{ "Content-Type":"application/json", "Authorization":auth },
+    body: JSON.stringify({ status: btn.dataset.to }),
+  });
+  if (r.status === 401) { alert("Admin credentials rejected."); return; }
+  if (!r.ok) { alert("Failed: " + r.status); return; }
+  loadBoard();
+});
+
+// ── Submit ──
+document.getElementById("submit").addEventListener("click", async () => {
+  const msg = document.getElementById("submitMsg");
+  const payload = {
+    kind: document.getElementById("kind").value,
+    title: document.getElementById("title").value,
+    body: document.getElementById("body").value,
+    author: document.getElementById("author").value,
+    chat_context: chatContext,
+  };
+  if (!payload.title.trim()) { msg.textContent = "Title is required."; return; }
+  const r = await fetch("/api/requests", {
+    method:"POST", headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) { msg.textContent = "Failed (" + r.status + ")."; return; }
+  const req = await r.json();
+  msg.textContent = "Submitted " + req.id + ". Thanks!";
+  document.getElementById("title").value = "";
+  document.getElementById("body").value = "";
+  chatContext = null;
+  document.getElementById("ctxNote").style.display = "none";
+  loadBoard();
+});
+
+loadBoard();
+</script>
+</body>
+</html>

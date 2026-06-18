@@ -517,6 +517,19 @@ def _find_bot_for_user(user_id: str):
     return None, None
 
 
+def _notify_owner_teams(uid: str, message: str) -> None:
+    """Fire a Teams DM to the owner via their bound Audrey bot. Silent no-op if
+    no bot is bound (mirrors the M03 scan / email_monitor behaviour). Never raises —
+    a failed notification must not affect the task that triggered it."""
+    try:
+        bot_uid, chat_id = _find_bot_for_user(uid)
+        if bot_uid and chat_id:
+            bot_graph = GraphClient(auth.get_valid_access_token(bot_uid))
+            bot_graph.send_chat_message(chat_id, message)
+    except Exception as e:
+        print(f"[notify] Teams notification failed for {uid}: {e}")
+
+
 def _bind_bot_to_user(bot_uid: str, user_id: str, username: str):
     existing = _read_json(_user_bot_link_path(user_id)).get("bot_uid")
     if existing and existing != bot_uid:
@@ -2293,12 +2306,27 @@ def _format_section_for_teams(result: dict, tz: "ZoneInfo | None" = None) -> str
             meta_parts  = [p for p in [signal, priority if priority != "medium" else "", date_part, source_link] if p]
             meta        = " · ".join(meta_parts)
 
+            background = (item.get("background") or "").strip()
+            community  = (item.get("community_view") or "").strip()
+            refs       = item.get("references") or []
+
             lines.append("")
             lines.append(f"**{i}. {headline}**")
             if summary:
                 lines.append(summary)
+            if background:
+                lines.append(f"_Background:_ {background[:300]}")
+            if community:
+                lines.append(f"_Market view:_ {community[:220]}")
             if meta:
                 lines.append(meta)
+            if refs:
+                ref_links = " · ".join(
+                    f"[{(r.get('title') or 'source')[:30]}]({r.get('url')})"
+                    for r in refs[:2] if r.get("url")
+                )
+                if ref_links:
+                    lines.append(f"Sources: {ref_links}")
         if len(items) > 12:
             lines.append(f"\n+{len(items) - 12} more signals")
         return "\n".join(lines)
@@ -2733,6 +2761,39 @@ def patch_crm_contact(email: str, body: dict, session: dict = Depends(require_se
     data["contacts"][addr].update(body)
     save_crm(_udir(uid), data)
     return data["contacts"][addr]
+
+
+@app.post("/api/crm/tag")
+def tag_crm_contacts(body: dict, session: dict = Depends(require_session)):
+    """Add / remove a tag (a.k.a. group) on many contacts in ONE atomic
+    read-modify-write — avoids the lost-update race of N concurrent PATCHes.
+    Body: {emails: [...], tag: str, op: 'add' | 'remove'}.
+    Tags double as bulk-email groups and feed outreach's tag mode."""
+    uid    = session["user_id"]
+    emails = [e.strip().lower() for e in (body.get("emails") or []) if isinstance(e, str)]
+    tag    = (body.get("tag") or "").strip()
+    op     = (body.get("op") or "add").strip().lower()
+    if not emails or not tag:
+        raise HTTPException(400, "emails and tag are required")
+
+    from src.modules.crm import load_crm, save_crm
+    data = load_crm(_udir(uid))
+    contacts = data.get("contacts", {})
+    changed = 0
+    for addr in emails:
+        c = contacts.get(addr)
+        if not c:
+            continue
+        tags = list(c.get("tags") or [])
+        if op == "remove" and tag in tags:
+            c["tags"] = [t for t in tags if t != tag]
+            changed += 1
+        elif op == "add" and tag not in tags:
+            c["tags"] = tags + [tag]
+            changed += 1
+    if changed:
+        save_crm(_udir(uid), data)
+    return {"ok": True, "changed": changed, "tag": tag, "op": op}
 
 
 @app.post("/api/crm")
@@ -3343,6 +3404,35 @@ def remove_company(key: str, session: dict = Depends(require_session)):
     return {"ok": True}
 
 
+@app.get("/api/feeds")
+def get_feeds(session: dict = Depends(require_session)):
+    """Per-user feed config + the available vertical preset bundles."""
+    uid = session["user_id"]
+    from src.modules.feeds_config import load_feeds, load_presets
+    return {"feeds": load_feeds(_udir(uid)), "presets": load_presets()}
+
+
+@app.patch("/api/feeds")
+def patch_feeds(body: dict, session: dict = Depends(require_session)):
+    """Replace/merge the user's feed config (rss[], google_news[], hackernews, reddit, enabled)."""
+    uid = session["user_id"]
+    from src.modules.feeds_config import load_feeds, save_feeds
+    cfg = load_feeds(_udir(uid))
+    cfg.update(body or {})
+    save_feeds(_udir(uid), cfg)
+    return cfg
+
+
+@app.post("/api/feeds/preset/{key}")
+def apply_feed_preset(key: str, session: dict = Depends(require_session)):
+    """Merge a vertical preset bundle (AI/governance, civil/construction, ...) into the user's feeds."""
+    uid = session["user_id"]
+    from src.modules.feeds_config import load_feeds, save_feeds, apply_preset
+    cfg = apply_preset(load_feeds(_udir(uid)), key)
+    save_feeds(_udir(uid), cfg)
+    return cfg
+
+
 @app.post("/api/companies/scan")
 def trigger_companies_scan(background_tasks: BackgroundTasks,
                            session: dict = Depends(require_session)):
@@ -3933,17 +4023,14 @@ def get_last_outreach(session: dict = Depends(require_session)):
         return {"status": "not_run"}
 
 
-@app.post("/api/outreach/bulk")
-async def trigger_bulk_email(request: Request, background_tasks: BackgroundTasks,
-                             session: dict = Depends(require_session)):
-    """Bulk email to an explicit list of CRM contacts (the CRM multi-select UI).
+@app.post("/api/outreach/bulk/generate")
+async def bulk_email_generate(request: Request, background_tasks: BackgroundTasks,
+                              session: dict = Depends(require_session)):
+    """Phase 1 of CRM bulk email — generate editable per-contact previews.
+    Touches NOTHING in Outlook (no draft, no send).
 
-    Body: {emails:[], subject, body, personalize, send, context_note}.
-      personalize=True  → AI writes per contact in their stored tone.
-      personalize=False → fixed subject/body template ({name}/{company}…).
-      send=False (default) → save to Outlook Drafts. send=True → real send, capped.
-
-    Runs in the background; poll GET /api/outreach/last for progress/result.
+    Body: {emails:[], subject, body, personalize, context_note}.
+    Runs in the background; poll GET /api/outreach/bulk/preview for the previews.
     """
     uid  = session["user_id"]
     body = await request.json()
@@ -3951,46 +4038,112 @@ async def trigger_bulk_email(request: Request, background_tasks: BackgroundTasks
     subject      = (body.get("subject") or "").strip()
     msg_body     = (body.get("body") or "").strip()
     personalize  = bool(body.get("personalize", True))
-    send         = bool(body.get("send", False))
     context_note = (body.get("context_note") or "").strip()
 
     if not emails:
         return JSONResponse(status_code=400, content={"error": "No valid recipients."})
-    if not personalize and (not subject or not msg_body):
+    if not msg_body:
+        return JSONResponse(status_code=400, content={"error": "Message body is required."})
+    if not personalize and not subject:
         return JSONResponse(status_code=400, content={
-            "error": "Subject and body are required when personalization is off."})
+            "error": "Subject is required when personalization is off."})
+
+    out_dir = _udir(uid) / "outreach"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "preview.json").write_text(json.dumps({
+        "status": "running", "personalize": personalize, "total": len(emails),
+        "items": [], "skipped": [],
+    }, ensure_ascii=False))
+
+    def _run():
+        try:
+            from src.modules.outreach import generate_bulk
+            ai       = AIClient()
+            settings = _read_json(_user_settings(uid))
+            result = generate_bulk(
+                ai=ai, data_dir=_udir(uid), settings=settings,
+                emails=emails, subject=subject, body=msg_body,
+                personalize=personalize, context_note=context_note,
+            )
+            n = len(result.get("items", []))
+            if n:
+                _notify_owner_teams(uid, f"✅ {n} email preview{'s' if n != 1 else ''} ready to review")
+        except Exception as e:
+            print(f"[Outreach] Bulk generate failed for {uid}: {e}")
+            try:
+                (out_dir / "preview.json").write_text(json.dumps({
+                    "status": "error", "error": str(e), "items": [], "skipped": [],
+                }, ensure_ascii=False))
+            except Exception:
+                pass
+
+    background_tasks.add_task(_run)
+    return {"ok": True, "total": len(emails)}
+
+
+@app.get("/api/outreach/bulk/preview")
+def get_bulk_preview(session: dict = Depends(require_session)):
+    """Return the latest bulk-email preview (poll target for phase 1)."""
+    f = _udir(session["user_id"]) / "outreach" / "preview.json"
+    if not f.exists():
+        return {"status": "not_run", "items": []}
+    try:
+        return json.loads(f.read_text())
+    except Exception:
+        return {"status": "not_run", "items": []}
+
+
+@app.post("/api/outreach/bulk/commit")
+async def bulk_email_commit(request: Request, background_tasks: BackgroundTasks,
+                            session: dict = Depends(require_session)):
+    """Phase 2 of CRM bulk email — commit the user-edited previews.
+
+    Body: {items:[{to, name, company, subject, body}], send}.
+      send=False (default) → save to Outlook Drafts. send=True → real send, capped.
+    Runs in the background; poll GET /api/outreach/last for progress/result.
+    """
+    uid  = session["user_id"]
+    body = await request.json()
+    items = [it for it in (body.get("items") or [])
+             if isinstance(it, dict) and "@" in (it.get("to") or "")]
+    send  = bool(body.get("send", False))
+
+    if not items:
+        return JSONResponse(status_code=400, content={"error": "No items to commit."})
 
     from src.modules.outreach import BULK_SEND_CAP
-    if send and len(emails) > BULK_SEND_CAP:
+    if send and len(items) > BULK_SEND_CAP:
         return JSONResponse(status_code=400, content={
-            "error": (f"Send batch too large: {len(emails)} recipients > cap "
+            "error": (f"Send batch too large: {len(items)} recipients > cap "
                       f"{BULK_SEND_CAP}. Reduce the selection or save as drafts.")})
 
-    # Initial "running" placeholder so the frontend poll has immediate state
-    # (overwritten incrementally by outreach.run as it works through the batch).
     out_dir = _udir(uid) / "outreach"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "results.json").write_text(json.dumps({
-        "status": "running", "mode": "bulk", "send": send,
-        "personalize": personalize, "total": len(emails),
+        "status": "running", "mode": "bulk", "send": send, "total": len(items),
         "drafts_created": [], "contacts_skipped": [], "errors": [],
         "summary": {"drafts": 0, "sent": 0, "files": 0, "skipped": 0, "errors": 0},
     }, ensure_ascii=False))
 
     def _run():
         try:
-            from src.modules.outreach import run as _run_outreach
+            from src.modules.outreach import commit_bulk
             token    = auth.get_valid_access_token(uid)
             graph    = GraphClient(token)
-            ai       = AIClient()
             settings = _read_json(_user_settings(uid))
-            _run_outreach(
-                graph=graph, ai=ai, data_dir=_udir(uid), settings=settings,
-                emails=emails, subject=subject, body=msg_body,
-                personalize=personalize, send=send, context_note=context_note,
-            )
+            result = commit_bulk(graph=graph, data_dir=_udir(uid), settings=settings,
+                                 items=items, send=send)
+            s = result.get("summary", {})
+            if send:
+                msg = f"✅ Bulk email: {s.get('sent', 0)} sent"
+            else:
+                d = s.get("drafts", 0)
+                msg = f"✅ Bulk email: {d} draft{'s' if d != 1 else ''} saved"
+            if s.get("errors"):
+                msg += f" · {s['errors']} error(s)"
+            _notify_owner_teams(uid, msg)
         except Exception as e:
-            print(f"[Outreach] Bulk email failed for {uid}: {e}")
+            print(f"[Outreach] Bulk commit failed for {uid}: {e}")
             try:
                 (out_dir / "results.json").write_text(json.dumps({
                     "status": "error", "mode": "bulk", "error": str(e),
@@ -4001,8 +4154,7 @@ async def trigger_bulk_email(request: Request, background_tasks: BackgroundTasks
                 pass
 
     background_tasks.add_task(_run)
-    return {"ok": True, "total": len(emails),
-            "message": f"Bulk email started for {len(emails)} recipient(s)"}
+    return {"ok": True, "total": len(items)}
 
 
 @app.get("/api/contacts/list")
