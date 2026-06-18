@@ -582,6 +582,11 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
 
     data_dir = Path(data_dir)
 
+    # Label every AI call in this poll as email_monitor + this user (was logged as
+    # feature=unknown), and instrument the cycle below. Diagnostics only — no behavior change.
+    from src.ai import set_usage_context
+    set_usage_context("email_monitor", data_dir.name)
+
     # Pull email-monitor config from schedules.json and overlay onto settings
     # so downstream functions (digest timing, realtime push) use the user's preferences.
     try:
@@ -604,6 +609,7 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
 
     monitor_state = _load_monitor_state(data_dir)
     processed_ids = set(monitor_state.get("processed_conv_ids") or [])
+    _seen_before = set(processed_ids)   # DIAG: snapshot to count re-fetched already-seen emails
 
     # Prune priority followups that have already been replied to
     followups = monitor_state.get("pending_priority_followup") or []
@@ -644,6 +650,9 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
         (m.get("receivedDateTime", "") for m in raw_emails),
         default=last_ts,
     )
+
+    if not raw_emails:
+        print(f"[EmailMonitor] DIAG uid={data_dir.name[:8]} last_ts={last_ts} fetched=0 (no new email — quiet, healthy)")
 
     if raw_emails:
         # Build ignored_emails from CRM
@@ -724,6 +733,7 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
 
         notified = list(monitor_state.get("last_notified_emails") or [])
         new_actionable = False
+        _pushed = 0   # DIAG
 
         for email_item in triaged:
             importance = email_item.get("_importance", "review")
@@ -746,12 +756,26 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
                     _send_adaptive_card(graph, chat_id, card)
                     notified.append(summary)
                     print(f"[EmailMonitor] Priority push: {_from_addr(email_item)} — {email_item.get('subject','')[:60]}")
+                    _pushed += 1
                 except Exception as e:
                     print(f"[EmailMonitor] Card send failed: {e}")
             else:
                 # Non-priority (review) emails surface via reply_needed.json,
                 # which the digest reads. No separate pending_digest queue.
                 notified.append(summary)
+
+        _already_seen = sum(
+            1 for m in raw_emails
+            if (m.get("conversationId") or m.get("id", "")) in _seen_before
+        )
+        print(
+            f"[EmailMonitor] DIAG uid={data_dir.name[:8]} last_ts={last_ts} "
+            f"fetched={len(raw_emails)} already_seen={_already_seen} "
+            f"screener_out={len(raw_emails) - len(visible)} "
+            f"seen/noise_removed={len(visible) - len(filtered)} "
+            f"triaged={len(triaged)}(crm={len(crm_classified)},ai={len(ai_triaged)}) "
+            f"pushed={_pushed} newest_ts={newest_ts} ts_advanced={newest_ts != last_ts}"
+        )
 
         if len(processed_ids) > _MAX_PROCESSED_IDS:
             processed_ids = set(list(processed_ids)[-_MAX_PROCESSED_IDS:])
