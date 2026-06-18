@@ -1370,7 +1370,18 @@ def admin_fleet_health(x_admin_token: str | None = Header(None, alias="X-Admin-T
     jobs = []
     try:
         jh = _read_json(_JOB_HEALTH_PATH)
+        # job_health.json keeps an entry for every job that ever fired, including
+        # briefing jobs orphaned by old re-onboarding (the live job is gone after a
+        # restart, but the health record lingered with a frozen last_run). Show only
+        # jobs still registered in the live scheduler so dead/orphan records drop off.
+        # When the scheduler isn't running (empty), don't filter — show all.
+        try:
+            live_ids = {j.id for j in _scheduler.get_jobs()}
+        except Exception:
+            live_ids = set()
         for jid, rec in sorted(jh.items()):
+            if live_ids and jid not in live_ids:
+                continue
             jobs.append({"job_id": jid, **(rec if isinstance(rec, dict) else {})})
     except Exception:
         pass
