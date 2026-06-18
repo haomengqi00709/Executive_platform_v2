@@ -114,7 +114,7 @@ _JOB_HEALTH_PATH = _OPS_DIR / "job_health.json"
 _JOB_EXPECTED_INTERVAL_SECS = {
     "teams_bot_poll":          10,
     "email_monitor_poll":      60,
-    "expense_scan_poll":       60,
+    "expense_scan_poll":       600,
     "meeting_prep_poll":       300,
     "meeting_recordings_poll": 1200,
     "init_stuck_detector":     60,
@@ -5172,7 +5172,7 @@ def startup_event():
     _scheduler.add_job(
         _poll_expense_scan_all_users,
         trigger="interval",
-        minutes=1,
+        minutes=10,
         id="expense_scan_poll",
         replace_existing=True,
         max_instances=1,

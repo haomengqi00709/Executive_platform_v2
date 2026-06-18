@@ -33,7 +33,7 @@ except ImportError:
     openpyxl = None
 
 from src.graph import GraphClient
-from src.ai import AIClient
+from src.ai import AIClient, set_usage_context
 
 _EXCEL_HEADERS = [
     "Date", "Vendor", "Amount", "Currency", "GST_HST", "Net_Amount",
@@ -234,6 +234,10 @@ def run(
             progress(msg)
 
     data_dir = Path(data_dir)
+    # Attribute every Gemini call in this run to expenses + this user, so the raw-client
+    # classify calls land in the per-user budget tally (not feature=unknown). Mirrors
+    # email_monitor's set_usage_context and covers every caller of run(), not just the poll.
+    set_usage_context("expenses", data_dir.name)
     expenses_dir = data_dir / "expenses"
     expenses_dir.mkdir(parents=True, exist_ok=True)
     results_dir = data_dir / "results"
@@ -322,6 +326,11 @@ def run(
             # Gemini extraction + classification
             extracted = _extract_document(ai, file_bytes, att_name)
             seen[seen_key] = True
+            # Persist the "classified" mark IMMEDIATELY. The end-of-run save (below) is too
+            # late: if any later step (Excel append / OneDrive upload / next fetch) raises and
+            # aborts the run, seen would never persist and this attachment would be
+            # re-classified every cycle — the root cause of the expense token burn.
+            _save_json(seen_path, seen)
 
             if not extracted:
                 continue
@@ -374,7 +383,10 @@ def run(
                 except Exception as up_err:
                     log(f"    OneDrive upload failed (kept Excel row): {up_err}")
 
-                _append_excel(excel_path, item)
+                try:
+                    _append_excel(excel_path, item)
+                except Exception as xl_err:
+                    log(f"    Excel append failed (kept seen + item): {xl_err}")
                 log(f"    Receipt: {item['vendor']} {item['amount']} {item['currency']} [{item['category']}]")
             elif doc_type == "invoice":
                 log(f"    Invoice: {item['vendor']} {item['amount']} {item['currency']} due {item.get('due_date') or '?'}")
