@@ -657,10 +657,8 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
     # set, so they are still handled. This is what makes "no new email -> 0 AI" true.
     fresh = [m for m in raw_emails if (m.get("id") or "") not in seen_msg_ids]
 
-    if not fresh:
-        print(f"[EmailMonitor] DIAG uid={data_dir.name[:8]} last_ts={last_ts} "
-              f"fetched={len(raw_emails)} fresh=0 (all already screened — 0 AI)")
-
+    # Quiet cycles (no new email) log nothing — the DIAG below fires only when
+    # there's actual work. Job liveness is tracked by the scheduler/ops dashboard.
     if fresh:
         # Build ignored_emails from CRM
         ignored_emails: set = set()
