@@ -315,6 +315,7 @@ def reply(
         f"  get_recent_emails          → 'show my emails', 'what did X send', 'unread messages'\n"
         f"  get_upcoming_meetings      → 'what meetings do I have', 'who is in my next call'\n"
         f"  get_contact_history        → 'history with X', 'last email from John'\n"
+        f"  find_contacts_by_name      → resolve a NAME → contact/email ('who is Daniel', 'email for Tingcheng'); call BEFORE create_reply_draft / create_calendar_event when you don't have the email\n"
         f"  get_email_frequency_report → 'who do I email most', 'most active contacts'\n"
         f"  read_module_result         → 'what did the briefing say', 'show last email analysis'\n"
         f"  check_email_handling       → 'did I reply to Sarah?', 'what happened with the Acme email?', 'has the X thread been handled?'\n"
@@ -501,6 +502,23 @@ def reply(
             ])
             print(f"[Bot] get_email_frequency_report({days_back}d) → {len(result)} contacts")
             return json.dumps(result, ensure_ascii=False)
+        except Exception as e:
+            return f"Error: {e}"
+
+    def find_contacts_by_name(name: str) -> str:
+        """Look up CRM contacts by a person's NAME (partial ok) — returns their email,
+        company, and role. Use this to resolve a name to an email address BEFORE
+        create_reply_draft or create_calendar_event when the user names someone but you
+        don't have their email. Also matches email and company text. Up to 10 best matches."""
+        if not data_dir:
+            return "No data directory available."
+        try:
+            from src.modules.crm import find_contacts_by_name as _crm_find
+            matches = _crm_find(data_dir, name)
+            print(f"[Bot] find_contacts_by_name({name!r}) → {len(matches)}")
+            if not matches:
+                return f"No CRM contact matching '{name}'. Ask the user for the email address."
+            return json.dumps(matches, ensure_ascii=False)
         except Exception as e:
             return f"Error: {e}"
 
@@ -1375,6 +1393,7 @@ def reply(
         get_recent_emails,
         get_upcoming_meetings,
         get_contact_history,
+        find_contacts_by_name,
         get_email_frequency_report,
         read_module_result,
         check_email_handling,

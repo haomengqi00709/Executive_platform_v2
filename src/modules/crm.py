@@ -418,6 +418,42 @@ def find_contacts_by_tag_exact(data_dir: Path, tag: str) -> list:
     ]
 
 
+def find_contacts_by_name(data_dir: Path, query: str, limit: int = 10) -> list:
+    """Search CRM contacts by name (also matches email local-part and company),
+    case-insensitive substring, best matches first. Mirrors find_contacts_by_tag.
+    Ranks: exact name > name prefix > name substring > email/company substring.
+    Returns up to `limit` compact dicts: {email, name, company, role, tags}."""
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    crm = load_crm(data_dir)
+    scored: list = []
+    for email, c in (crm.get("contacts") or {}).items():
+        name = (c.get("name") or "").strip()
+        nl   = name.lower()
+        el   = (email or "").lower()
+        comp = (c.get("company") or "").lower()
+        if nl == q:
+            score = 0
+        elif nl.startswith(q):
+            score = 1
+        elif q in nl:
+            score = 2
+        elif q in el or q in comp:
+            score = 3
+        else:
+            continue
+        scored.append((score, nl, {
+            "email":   c.get("email") or email,
+            "name":    name,
+            "company": c.get("company") or "",
+            "role":    c.get("role") or "",
+            "tags":    c.get("tags") or [],
+        }))
+    scored.sort(key=lambda x: (x[0], x[1]))
+    return [c for _, _, c in scored[:limit]]
+
+
 def list_groups(data_dir: Path) -> list:
     """Return [{tag, count}, ...] of every distinct tag and how many contacts
     carry it, sorted by count desc then name. Lets callers answer "what groups
