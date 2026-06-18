@@ -25,7 +25,7 @@ try:
 except ImportError:
     openpyxl = None
 
-from src.graph import GraphClient
+from src.graph import GraphClient, _ensure_html
 from src.ai import AIClient
 from src.modules.profile import load_profile_context, get_user_signature, append_signature_to_body
 
@@ -34,6 +34,12 @@ _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 _PDF_EXTS   = {".pdf"}
 _CSV_EXTS   = {".csv"}
 _XLSX_EXTS  = {".xlsx", ".xls"}
+
+# Hard ceiling on real sends per bulk run. Drafts are unbounded (harmless until
+# the user hits send in Outlook); real sends go out of the user's own mailbox,
+# where M365 throttles and the domain's reputation is on the line — so a single
+# "Send now" batch is capped. The /api/outreach/bulk route re-checks this.
+BULK_SEND_CAP = 50
 
 
 def _load_state(data_dir: Path) -> dict:
@@ -92,6 +98,7 @@ If a field is missing, use empty string. If this is NOT a business card, return 
                 prompt,
             ],
         )
+        ai.record_external_usage(response)
         raw = (response.text or "").strip()
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
@@ -134,6 +141,7 @@ Skip rows without an email. If no contacts found, return {"contacts": []}."""
                 prompt,
             ],
         )
+        ai.record_external_usage(response)
         raw = (response.text or "").strip()
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
@@ -222,7 +230,8 @@ def _extract_from_xlsx(file_bytes: bytes) -> list[dict]:
 
 def _generate_draft(ai: AIClient, contact: dict, context_note: str,
                     display_name: str, business_context: str,
-                    writing_style: str) -> dict | None:
+                    writing_style: str, contact_style: str = "",
+                    contact_history: str = "", intent: str = "") -> dict | None:
     """Generate subject + body for one contact. Returns None on failure.
 
     business_context already includes the user's Personal Profile, Business Profile,
@@ -235,19 +244,27 @@ def _generate_draft(ai: AIClient, contact: dict, context_note: str,
     same signature treatment without each path duplicating logic.
     """
     bc_block = f"User profile (personal + business + market):\n{business_context.strip()}\n\n" if business_context.strip() else ""
-    style_block = f"Writing style to match:\n{writing_style.strip()}\n\n" if writing_style.strip() else ""
+    # Per-contact style (extracted from the user's replies to THIS person) beats
+    # the user's generic writing_style when available — that's what makes a bulk
+    # send read as personal rather than templated.
+    effective_style = (contact_style or "").strip() or (writing_style or "").strip()
+    style_block = f"Writing style to match:\n{effective_style}\n\n" if effective_style else ""
+    history_block = f"Prior relationship/history with this contact (reference it specifically, don't invent):\n{contact_history.strip()}\n\n" if (contact_history or "").strip() else ""
     ctx_block = f"How the user knows this contact:\n{context_note.strip()}\n\n" if context_note.strip() else ""
     notes_block = f"Specific notes from past interaction with this contact:\n{contact.get('notes', '')}\n\n" if (contact.get('notes') or '').strip() else ""
+    # The point of the email — in bulk mode this is what the user typed once and
+    # wants every recipient's version to be about, rewritten in their voice.
+    intent_block = f"Core message this email MUST convey (this is the point — build the email around it, in the user's voice):\n{intent.strip()}\n\n" if (intent or "").strip() else ""
 
     prompt = f"""You are drafting a personal outreach email on behalf of {display_name}.
 
-{bc_block}{style_block}{ctx_block}Contact info:
+{bc_block}{style_block}{history_block}{ctx_block}Contact info:
   Name: {contact.get('name', '')}
   Email: {contact.get('email', '')}
   Company: {contact.get('company', '')}
   Role: {contact.get('role', '')}
 
-{notes_block}Write a personalized outreach email with these requirements:
+{notes_block}{intent_block}Write a personalized outreach email with these requirements:
 
 1. STRUCTURE — 2-3 short paragraphs:
    • Opening: greeting on its own line, then 1-2 sentences referencing the meeting context (or how you know them).
@@ -278,6 +295,256 @@ Return JSON only: {{"subject": "...", "body": "<p>...</p><p>...</p><p>...</p>"}}
     return None
 
 
+def _fill_template(subject: str, body: str, contact: dict) -> tuple:
+    """Substitute {name}/{first_name}/{company}/{role} placeholders for a
+    'same message to everyone' (non-personalized) bulk send. Missing name
+    falls back to 'there' so we never emit 'Hi ,'."""
+    name = (contact.get("name") or "").strip()
+    first = name.split()[0] if name else ""
+    repl = {
+        "{name}":       name or "there",
+        "{first_name}": first or "there",
+        "{company}":    (contact.get("company") or "").strip(),
+        "{role}":       (contact.get("role") or "").strip(),
+    }
+
+    def _sub(s: str) -> str:
+        for k, v in repl.items():
+            s = (s or "").replace(k, v)
+        return s
+
+    return _sub(subject), _sub(body)
+
+
+# ── CRM bulk email: two-phase (generate preview → user edits → commit) ──────
+#
+# Phase 1 generate_bulk() produces editable previews and touches NOTHING in
+# Outlook. Phase 2 commit_bulk() takes the user-edited previews and only THEN
+# saves drafts / sends. This is the human-review gate the one-shot path lacked.
+
+_BULK_SKILL_FILE = Path(__file__).parent.parent / "skills" / "bulk_email" / "skill.md"
+
+
+def _generate_bulk_email(ai: AIClient, contact: dict, intent: str,
+                         display_name: str, business_context: str,
+                         user_instruction: str = "") -> dict | None:
+    """Intent-led counterpart to _generate_draft for CRM bulk email: build the
+    email AROUND the user's message (intent), adapt tone/structure to the
+    contact's relationship status, use the contact's own writing_style + summary.
+    Does NOT impose the cold-outreach 'how we met / what I offer / book a call'
+    skeleton. Body comes back WITHOUT a signature (commit_bulk appends it).
+    Returns None on failure — never silently falls back to cold outreach."""
+    skill_text = _BULK_SKILL_FILE.read_text() if _BULK_SKILL_FILE.exists() else ""
+    if not skill_text:
+        print("[Outreach] bulk_email/skill.md missing — cannot generate intent-led email")
+        return None
+
+    prompt = (
+        skill_text
+        .replace("{display_name}",     display_name or "the executive")
+        .replace("{business_context}", (business_context or "").strip() or "(no profile available)")
+        .replace("{intent}",           (intent or "").strip())
+        .replace("{contact_name}",     contact.get("name", "") or "")
+        .replace("{contact_company}",  contact.get("company", "") or "")
+        .replace("{contact_role}",     contact.get("role", "") or "")
+        .replace("{contact_status}",   contact.get("status", "") or "other")
+        .replace("{contact_style}",    (contact.get("writing_style", "") or "").strip() or "(no per-contact style on file)")
+        .replace("{contact_history}",  (contact.get("summary", "") or "").strip() or "(no relationship notes on file)")
+        .replace("{user_instruction}", (user_instruction or "").strip() or "(none)")
+    )
+    try:
+        raw = ai.generate(prompt).strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            data = json.loads(match.group())
+            if data.get("subject") and data.get("body"):
+                return {"subject": data["subject"], "body": data["body"]}
+    except Exception as e:
+        print(f"[Outreach] Bulk email gen failed for {contact.get('email')}: {e}")
+    return None
+
+
+def _save_preview(data_dir: Path, preview: dict) -> None:
+    out_dir = Path(data_dir) / "outreach"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    f = out_dir / "preview.json"
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(preview, indent=2, ensure_ascii=False))
+    tmp.replace(f)
+
+
+def generate_bulk(ai: AIClient, data_dir: Path, settings: dict,
+                  emails: list, subject: str = "", body: str = "",
+                  personalize: bool = True, context_note: str = "",
+                  write_files: bool = True, progress=None) -> dict:
+    """Phase 1 — generate per-contact email previews. No Outlook calls at all
+    (no draft, no send). Writes outreach/preview.json incrementally so the UI
+    can poll, then render each item editable before the user commits.
+
+    Bodies come back WITHOUT a signature — commit_bulk appends it, so the user
+    edits clean text and the signature stays consistent across the batch."""
+    def log(msg: str):
+        print(f"[Outreach] {msg}")
+        if progress:
+            progress(msg)
+
+    from src.modules.crm import find_contacts_by_emails
+    data_dir = Path(data_dir)
+    display_name     = settings.get("display_name", "the executive")
+    business_context = load_profile_context(data_dir) if data_dir else ""
+    use_template     = not personalize
+    instruction_path = data_dir / "instructions" / "bulk_email.md"
+    user_instruction = instruction_path.read_text().strip() if instruction_path.exists() else ""
+
+    contacts = find_contacts_by_emails(data_dir, emails)
+    items: list = []
+    skipped: list = []
+    log(f"Generating {len(contacts)} preview(s) (personalize={personalize})")
+
+    def _preview(done: bool) -> dict:
+        return {
+            "status": "fresh" if done else "running",
+            "last_run": datetime.now(timezone.utc).isoformat(),
+            "personalize": bool(personalize),
+            "total": len(contacts),
+            "context_note": context_note,
+            "items": items,
+            "skipped": skipped,
+        }
+
+    if write_files:
+        _save_preview(data_dir, _preview(done=False))
+
+    for i, contact in enumerate(contacts):
+        email = (contact.get("email") or "").strip()
+        if not email or "@" not in email:
+            skipped.append({"reason": "no_email", "contact": contact})
+            continue
+
+        if use_template:
+            subj, bod = _fill_template(subject, body, contact)
+            if not subj.strip() or not bod.strip():
+                skipped.append({"reason": "empty_template", "contact": contact})
+                continue
+        else:
+            draft = _generate_bulk_email(
+                ai, contact, intent=body,
+                display_name=display_name, business_context=business_context,
+                user_instruction=user_instruction,
+            )
+            if not draft:
+                skipped.append({"reason": "draft_gen_failed", "contact": contact})
+                continue
+            # User-typed subject wins (consistent line, {name}/{company} filled);
+            # otherwise the AI's per-contact subject.
+            subj = _fill_template(subject, "", contact)[0] if subject.strip() else draft["subject"]
+            bod = draft["body"]
+
+        items.append({
+            "to": email,
+            "name": contact.get("name", ""),
+            "company": contact.get("company", ""),
+            "subject": subj,
+            "body": bod,
+        })
+        if write_files and (i + 1) % 3 == 0:
+            _save_preview(data_dir, _preview(done=False))
+
+    preview = _preview(done=True)
+    if write_files:
+        _save_preview(data_dir, preview)
+    log(f"Preview ready — {len(items)} generated, {len(skipped)} skipped")
+    return preview
+
+
+def commit_bulk(graph: GraphClient, data_dir: Path, settings: dict,
+                items: list, send: bool = False, write_files: bool = True,
+                progress=None) -> dict:
+    """Phase 2 — commit the (user-edited) previews. Appends the signature, then
+    saves to Outlook Drafts (send=False, the default) or sends for real
+    (send=True, capped). `items` = [{to, name, company, subject, body}].
+    Writes outreach/results.json (polled by the UI)."""
+    def log(msg: str):
+        print(f"[Outreach] {msg}")
+        if progress:
+            progress(msg)
+
+    data_dir = Path(data_dir)
+    user_signature = get_user_signature(settings)
+    items = items or []
+
+    if send and len(items) > BULK_SEND_CAP:
+        result = {
+            "status": "not_run", "last_run": datetime.now(timezone.utc).isoformat(),
+            "mode": "bulk", "send": True,
+            "error": (f"Send batch too large: {len(items)} recipients > cap "
+                      f"{BULK_SEND_CAP}. Reduce the selection or save as drafts instead."),
+            "drafts_created": [], "files_processed": [], "contacts_skipped": [], "errors": [],
+            "summary": {"drafts": 0, "sent": 0, "files": 0, "skipped": 0, "errors": 0},
+        }
+        if write_files:
+            _save_result(data_dir, result)
+        return result
+
+    drafts_created: list = []
+    errors: list = []
+
+    def _result(done: bool) -> dict:
+        sent_n = sum(1 for d in drafts_created if d.get("sent"))
+        return {
+            "status": "fresh" if done else "running",
+            "last_run": datetime.now(timezone.utc).isoformat(),
+            "mode": "bulk", "send": bool(send), "total": len(items),
+            "drafts_created": drafts_created, "files_processed": [],
+            "contacts_skipped": [], "errors": errors,
+            "summary": {
+                "drafts": len(drafts_created) - sent_n, "sent": sent_n,
+                "files": 0, "skipped": 0, "errors": len(errors),
+            },
+        }
+
+    if write_files:
+        _save_result(data_dir, _result(done=False))
+
+    for i, it in enumerate(items):
+        email = (it.get("to") or "").strip()
+        subj = (it.get("subject") or "")
+        bod = (it.get("body") or "")
+        if not email or "@" not in email or not subj.strip() or not bod.strip():
+            errors.append({"contact": email, "error": "missing to / subject / body"})
+            continue
+        final_body = append_signature_to_body(bod, user_signature)
+        try:
+            if send:
+                graph.send_mail(to=email, subject=subj, html=_ensure_html(final_body))
+                web_link = ""
+            else:
+                gr = graph.create_draft(subject=subj, body=final_body, to=email)
+                web_link = gr.get("webLink", "")
+            drafts_created.append({
+                "to": email, "name": it.get("name", ""), "company": it.get("company", ""),
+                "subject": subj, "web_link": web_link, "sent": bool(send),
+                "source_file": "CRM:bulk",
+            })
+            log(f"  ✅ {'Sent' if send else 'Draft'}: {email}")
+        except Exception as e:
+            errors.append({"contact": email, "error": str(e)})
+
+        if write_files and (i + 1) % 5 == 0:
+            _save_result(data_dir, _result(done=False))
+        if send:
+            time.sleep(0.5)  # gentle pacing — let M365 throttling breathe
+
+    result = _result(done=True)
+    if write_files:
+        _save_result(data_dir, result)
+    log(f"Commit done — {len(drafts_created)} created "
+        f"({sum(1 for d in drafts_created if d.get('sent'))} sent), {len(errors)} errors")
+    return result
+
+
 # ── Main entry ─────────────────────────────────────────────────────────────
 
 def run(graph: GraphClient, ai: AIClient, data_dir: Path, settings: dict,
@@ -291,6 +558,7 @@ def run(graph: GraphClient, ai: AIClient, data_dir: Path, settings: dict,
       recent_hours — pull contacts from CRM added in the last N hours, draft.
 
     Defaults to folder mode if none specified. context_note is injected into each draft prompt.
+    (CRM multi-select bulk email is a separate two-phase flow — see generate_bulk / commit_bulk.)
     """
     def log(msg: str):
         print(f"[Outreach] {msg}")

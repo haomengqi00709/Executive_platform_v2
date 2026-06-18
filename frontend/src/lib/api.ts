@@ -1,6 +1,6 @@
 // Typed API wrappers for the FastAPI backend.
 
-import type { SectionResult, OutreachLastRun, ProfileStatus } from './types';
+import type { SectionResult, OutreachLastRun, ProfileStatus, FeedsConfig, FeedsResponse } from './types';
 
 const BASE = ''; // proxied via Vite to :8000
 
@@ -30,6 +30,20 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
 
 export function getSection(sectionId: string): Promise<SectionResult> {
   return fetchJson<SectionResult>(`/api/sections/${sectionId}`);
+}
+
+// ── Feeds (market_intelligence sources) ───────────────────
+
+export function getFeeds(): Promise<FeedsResponse> {
+  return fetchJson<FeedsResponse>('/api/feeds');
+}
+
+export function saveFeeds(cfg: Partial<FeedsConfig>): Promise<FeedsConfig> {
+  return fetchJson<FeedsConfig>('/api/feeds', { method: 'PATCH', body: JSON.stringify(cfg) });
+}
+
+export function applyFeedPreset(key: string): Promise<FeedsConfig> {
+  return fetchJson<FeedsConfig>(`/api/feeds/preset/${key}`, { method: 'POST' });
 }
 
 export function runSection(sectionId: string): Promise<{ ok: boolean }> {
@@ -223,6 +237,52 @@ export function getOutreachLast(): Promise<OutreachLastRun> {
   return fetchJson<OutreachLastRun>(`/api/outreach/last`);
 }
 
+export interface BulkPreviewItem {
+  to: string;
+  name?: string;
+  company?: string;
+  subject: string;
+  body: string;
+}
+
+export interface BulkPreview {
+  status?: 'running' | 'fresh' | 'error' | 'not_run';
+  personalize?: boolean;
+  total?: number;
+  error?: string;
+  last_run?: string;
+  items: BulkPreviewItem[];
+  skipped?: { reason: string; contact?: { name?: string; email?: string } }[];
+}
+
+/** Phase 1 — generate editable per-contact previews. Touches NOTHING in
+ *  Outlook. Runs in the background; poll getBulkPreview() for the result. */
+export function bulkGenerate(payload: {
+  emails: string[]; subject: string; body: string;
+  personalize: boolean; context_note?: string;
+}): Promise<{ ok: boolean; total: number }> {
+  return fetchJson(`/api/outreach/bulk/generate`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getBulkPreview(): Promise<BulkPreview> {
+  return fetchJson<BulkPreview>(`/api/outreach/bulk/preview`);
+}
+
+/** Phase 2 — commit the (user-edited) previews: save to Outlook Drafts
+ *  (send=false) or send for real (send=true, capped). Background; poll
+ *  getOutreachLast() for progress + result. */
+export function bulkCommit(payload: {
+  items: BulkPreviewItem[]; send: boolean;
+}): Promise<{ ok: boolean; total: number }> {
+  return fetchJson(`/api/outreach/bulk/commit`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 // ── Settings (read-only here for sidebar / dashboard) ─────
 
 export function getSettings(): Promise<Record<string, unknown>> {
@@ -247,6 +307,7 @@ export interface CrmContact {
   last_contact?: string;
   ignore?: boolean;
   notes?: string;
+  tags?: string[];          // double as bulk-email groups
   updated_at?: string;
 }
 
@@ -272,6 +333,14 @@ export function createCrmContact(contact: Partial<CrmContact> & { email: string 
   return fetchJson<CrmContact>(`/api/crm`, {
     method: 'POST',
     body: JSON.stringify(contact),
+  });
+}
+
+/** Add or remove a tag (group) across many contacts in one atomic call. */
+export function tagCrmContacts(emails: string[], tag: string, op: 'add' | 'remove' = 'add'): Promise<{ ok: boolean; changed: number }> {
+  return fetchJson(`/api/crm/tag`, {
+    method: 'POST',
+    body: JSON.stringify({ emails, tag, op }),
   });
 }
 

@@ -1,14 +1,18 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Users, FolderKanban, Building2, Sparkles } from 'lucide-react';
 import CrmTab from './records/CrmTab';
 import ProjectsTab from './records/ProjectsTab';
 import CompanyTab from './records/CompanyTab';
 import CleanupTab from './records/CleanupTab';
+import { useBulkEmail } from '../lib/bulkEmail';
 
 type Tab = 'crm' | 'projects' | 'companies' | 'cleanup';
 
 export default function RecordsPage() {
   const [tab, setTab] = useState<Tab>('crm');
+  const { resumeRequested } = useBulkEmail();
+  // A bulk-email "Open" from the console must land on CRM (where the modal lives).
+  useEffect(() => { if (resumeRequested) setTab('crm'); }, [resumeRequested]);
 
   return (
     <div className="p-8 max-w-7xl mx-auto space-y-6">

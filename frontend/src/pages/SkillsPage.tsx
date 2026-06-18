@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react';
-import { Loader2, CalendarClock, Zap, Sliders } from 'lucide-react';
+import { Loader2, CalendarClock, Zap, Sliders, Rss } from 'lucide-react';
 import { getSchedules } from '../lib/api';
 import type { SchedulesResponse } from '../lib/api';
 import BriefingsTab from './skills/BriefingsTab';
 import AutoTriggerTab from './skills/AutoTriggerTab';
 import CustomizeTab from './skills/CustomizeTab';
+import FeedsTab from './skills/FeedsTab';
 
-type Tab = 'briefings' | 'autotrigger' | 'customize';
+type Tab = 'briefings' | 'autotrigger' | 'customize' | 'feeds';
 
 interface SkillsPageProps {
   initialSectionId?: string;
@@ -43,6 +44,7 @@ export default function SkillsPage({ initialSectionId, onClearInitial }: SkillsP
         <TabBtn active={tab === 'briefings'}   onClick={() => setTab('briefings')}   icon={<CalendarClock size={14} />}>Scheduled Briefings</TabBtn>
         <TabBtn active={tab === 'autotrigger'} onClick={() => setTab('autotrigger')} icon={<Zap size={14} />}>Auto-triggered</TabBtn>
         <TabBtn active={tab === 'customize'}   onClick={() => setTab('customize')}   icon={<Sliders size={14} />}>Customize Skills</TabBtn>
+        <TabBtn active={tab === 'feeds'}        onClick={() => setTab('feeds')}        icon={<Rss size={14} />}>Intel Feeds</TabBtn>
       </div>
 
       {loading || !schedules ? (
@@ -54,6 +56,7 @@ export default function SkillsPage({ initialSectionId, onClearInitial }: SkillsP
           {tab === 'briefings'   && <BriefingsTab schedules={schedules} onChange={refresh} />}
           {tab === 'autotrigger' && <AutoTriggerTab schedules={schedules} onChange={refresh} />}
           {tab === 'customize'   && <CustomizeTab initialSectionId={initialSectionId} onClearInitial={onClearInitial} />}
+          {tab === 'feeds'       && <FeedsTab />}
         </>
       )}
     </div>

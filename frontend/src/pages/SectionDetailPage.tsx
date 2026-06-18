@@ -15,7 +15,7 @@ import { SECTION_BY_ID } from '../lib/sections';
 import { useActivity } from '../components/ActivityDrawer';
 import type {
   SectionResult, ReplyNeededItem, FollowupItem, CommitmentItem,
-  MeetingTodayItem, ProjectItem, RelationshipItem,
+  MeetingTodayItem, ProjectItem, RelationshipItem, IntelItem,
 } from '../lib/types';
 
 interface Props {
@@ -264,6 +264,9 @@ function renderCard(
       return <ProjectCard item={item as unknown as ProjectItem} onActioned={onActioned} />;
     case 'relationship_health':
       return <RelationshipCard item={item as unknown as RelationshipItem} onActioned={onActioned} />;
+    case 'market_intelligence':
+    case 'company_intelligence':
+      return <IntelCard item={item as unknown as IntelItem} />;
     default:
       return <GenericCard item={item} />;
   }
@@ -623,6 +626,88 @@ function RelationshipCard({ item, onActioned }: { item: RelationshipItem; onActi
           Ignore contact
         </Btn>
       </ActionBar>
+    </Card>
+  );
+}
+
+function ScoreBadge({ score }: { score?: number }) {
+  if (typeof score !== 'number') return null;
+  const tone =
+    score >= 8 ? 'bg-rose-400/15 text-rose-300 border-rose-400/30'
+    : score >= 6 ? 'bg-amber-400/15 text-amber-300 border-amber-400/30'
+    : 'bg-executive-border text-executive-muted border-executive-border';
+  return (
+    <span className={`text-[10px] px-1.5 py-0.5 rounded font-semibold border ${tone}`} title="Relevance score (0-10)">
+      {score.toFixed(1)}
+    </span>
+  );
+}
+
+function IntelCard({ item }: { item: IntelItem }) {
+  const refs = item.references ?? [];
+  const metaParts = [item.signal_type, item.published_date, item.source].filter(Boolean);
+  return (
+    <Card>
+      <div className="flex items-start justify-between gap-3 mb-1.5">
+        <div className="min-w-0 flex-1">
+          {item.company && (
+            <p className="text-[11px] uppercase tracking-wide text-executive-accent/80 font-semibold mb-0.5">
+              {item.company}
+            </p>
+          )}
+          <h3 className="text-sm font-semibold text-executive-text leading-snug">{item.headline}</h3>
+        </div>
+        <div className="flex items-center gap-1.5 flex-shrink-0">
+          <ScoreBadge score={item.ai_score} />
+          <PriorityBadge priority={item.priority} />
+        </div>
+      </div>
+
+      {item.summary && <p className="text-sm text-executive-text/85">{item.summary}</p>}
+
+      {item.background && (
+        <p className="text-xs text-executive-muted mt-2">
+          <span className="font-semibold text-executive-text/70">Background: </span>{item.background}
+        </p>
+      )}
+      {item.community_view && (
+        <p className="text-xs text-executive-muted mt-2">
+          <span className="font-semibold text-executive-text/70">Market view: </span>{item.community_view}
+        </p>
+      )}
+      {item.relevance && (
+        <p className="text-xs text-executive-accent/90 mt-2">
+          <span className="font-semibold">Why it matters: </span>{item.relevance}
+        </p>
+      )}
+
+      {metaParts.length > 0 && (
+        <p className="text-[11px] text-executive-muted mt-2">{metaParts.join(' · ')}</p>
+      )}
+
+      {refs.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {refs.map((r, i) => (
+            <a
+              key={i}
+              href={r.url}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded border border-executive-border text-executive-muted hover:text-executive-text hover:bg-executive-border/30"
+            >
+              <ExternalLink size={10} />{(r.title || 'source').slice(0, 40)}
+            </a>
+          ))}
+        </div>
+      )}
+
+      {item.source_url && (
+        <ActionBar>
+          <Btn href={item.source_url} icon={<ExternalLink size={12} />} variant="primary">
+            Open source
+          </Btn>
+        </ActionBar>
+      )}
     </Card>
   );
 }

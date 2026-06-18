@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   Loader2, Search, ChevronDown, ChevronRight, Plus, EyeOff, Save, X, Star,
-  Phone, Linkedin, Mail, Building2, Briefcase, Archive, GitMerge, RefreshCw, Upload, Globe, Download,
+  Phone, Linkedin, Mail, Building2, Briefcase, Archive, GitMerge, RefreshCw, Upload, Globe, Download, Tag,
 } from 'lucide-react';
-import { getCrm, patchCrmContact, createCrmContact, relativeTime, archiveRecord, scanCrm, crmExportXlsxUrl } from '../../lib/api';
+import { getCrm, patchCrmContact, createCrmContact, relativeTime, archiveRecord, scanCrm, crmExportXlsxUrl, getBulkPreview, getOutreachLast, tagCrmContacts } from '../../lib/api';
 import type { CrmContact } from '../../lib/api';
+import { useActivity, normalizeStatus } from '../../components/ActivityDrawer';
+import { useBulkEmail } from '../../lib/bulkEmail';
 import MergePicker from './MergePicker';
 import BulkUploadModal from './BulkUploadModal';
+import BulkEmailModal from './BulkEmailModal';
 
 const STATUS_OPTIONS = ['client', 'prospect', 'partner', 'investor', 'vendor', 'internal', 'other'];
 const PRIORITY_OPTIONS = ['high', 'medium', 'low', 'ignore'];
@@ -39,8 +42,37 @@ export default function CrmTab() {
   const [savingEmail, setSavingEmail] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [mergeSource, setMergeSource] = useState<CrmContact | null>(null);
-  const [scanning, setScanning] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [emailOpen, setEmailOpen] = useState(false);
+  const [emailResume, setEmailResume] = useState(false);
+  const [groupModalOpen, setGroupModalOpen] = useState(false);
+
+  const { startJob, stop, isActive } = useActivity();
+  const { resumeRequested, requestResume, clearResume } = useBulkEmail();
+
+  const toggleSel = (email: string) =>
+    setSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(email)) next.delete(email); else next.add(email);
+      return next;
+    });
+
+  // Groups are just CRM tags — distinct across all contacts.
+  const allGroups = useMemo(() => {
+    const s = new Set<string>();
+    contacts.forEach(c => (c.tags || []).forEach(t => s.add(t)));
+    return Array.from(s).sort((a, b) => a.localeCompare(b));
+  }, [contacts]);
+
+  const selectGroup = (group: string) =>
+    setSelected(new Set(contacts.filter(c => (c.tags || []).includes(group)).map(c => c.email)));
+
+  const saveAsGroup = async (name: string) => {
+    await tagCrmContacts(Array.from(selected), name, 'add');
+    setGroupModalOpen(false);
+    refresh();   // pull the updated tags so the new group shows up
+  };
 
   const refresh = () => {
     setLoading(true);
@@ -53,6 +85,17 @@ export default function CrmTab() {
   };
 
   useEffect(refresh, []);
+
+  // Resume the bulk-email modal when the task console's "Open" was clicked.
+  useEffect(() => {
+    if (resumeRequested) {
+      stop('bulk-email');          // remove the console card; modal takes over polling
+      setEmailResume(true);
+      setEmailOpen(true);
+      clearResume();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resumeRequested]);
 
   const update = async (email: string, patch: Partial<CrmContact>) => {
     setSavingEmail(email);
@@ -83,30 +126,27 @@ export default function CrmTab() {
       'phone / LinkedIn / website are also AI-refreshed but kept as-is when AI returns nothing.\n\n' +
       'May take a few minutes. Continue?'
     )) return;
-    setScanning(true);
+    const before = lastScan;
     try {
-      const before = lastScan;
       await scanCrm();
-      // Poll until last_scan timestamp changes
-      const start = Date.now();
-      const tick = async () => {
-        if (Date.now() - start > 20 * 60 * 1000) { setScanning(false); return; }
-        try {
-          const d = await getCrm();
-          if (d.last_scan && d.last_scan !== before) {
-            setContacts(d.contacts || []);
-            setLastScan(d.last_scan);
-            setScanning(false);
-            return;
-          }
-        } catch {}
-        setTimeout(tick, 5000);
-      };
-      setTimeout(tick, 5000);
     } catch (e: any) {
       alert(`Scan failed: ${e?.message || 'unknown error'}`);
-      setScanning(false);
+      return;
     }
+    startJob({
+      id: 'crm-rescan',
+      label: 'CRM re-scan',
+      kind: 'rescan',
+      poll: async () => {
+        const d = await getCrm();
+        if (d.last_scan && d.last_scan !== before) {
+          setContacts(d.contacts || []);
+          setLastScan(d.last_scan);
+          return { status: 'done', last_run: d.last_scan };
+        }
+        return { status: 'running' };
+      },
+    });
   };
 
   const visible = useMemo(() => {
@@ -165,6 +205,17 @@ export default function CrmTab() {
               className="pl-7 pr-3 py-1.5 text-xs bg-executive-bg border border-executive-border rounded-lg w-64 focus:outline-none focus:border-executive-accent/60"
             />
           </div>
+          {allGroups.length > 0 && (
+            <select
+              value=""
+              onChange={e => { if (e.target.value) selectGroup(e.target.value); }}
+              title="Select everyone in a group"
+              className="px-2 py-1.5 text-xs bg-executive-bg border border-executive-border rounded-lg focus:outline-none focus:border-executive-accent/60"
+            >
+              <option value="">Groups…</option>
+              {allGroups.map(g => <option key={g} value={g}>{g}</option>)}
+            </select>
+          )}
           <select
             value={statusFilter}
             onChange={e => setStatusFilter(e.target.value)}
@@ -200,12 +251,12 @@ export default function CrmTab() {
           </a>
           <button
             onClick={rescan}
-            disabled={scanning}
+            disabled={isActive('crm-rescan')}
             className="flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg border border-executive-border text-executive-muted hover:text-executive-text hover:bg-executive-border/40 disabled:opacity-50"
             title="Re-scan last 6 months of inbox"
           >
-            {scanning ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-            {scanning ? 'Scanning…' : 'Re-scan'}
+            {isActive('crm-rescan') ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+            {isActive('crm-rescan') ? 'Scanning…' : 'Re-scan'}
           </button>
           <button
             onClick={() => setCreating(true)}
@@ -215,6 +266,37 @@ export default function CrmTab() {
           </button>
         </div>
       </header>
+
+      {selected.size > 0 && (
+        <div className="flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-executive-accent/10 border border-executive-accent/30">
+          <div className="flex items-center gap-3 text-xs">
+            <span className="text-executive-text font-medium">{selected.size} selected</span>
+            <button
+              onClick={() => setSelected(new Set(visible.map(c => c.email)))}
+              className="text-executive-muted hover:text-executive-text"
+            >
+              Select all {visible.length}
+            </button>
+            <button onClick={() => setSelected(new Set())} className="text-executive-muted hover:text-executive-text">
+              Clear
+            </button>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setGroupModalOpen(true)}
+              className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md border border-executive-border text-executive-muted hover:text-executive-text"
+            >
+              <Tag size={12} /> Save as group
+            </button>
+            <button
+              onClick={() => { setEmailResume(false); setEmailOpen(true); }}
+              className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-executive-accent text-white hover:opacity-90"
+            >
+              <Mail size={12} /> Email ({selected.size})
+            </button>
+          </div>
+        </div>
+      )}
 
       {loading ? (
         <div className="flex items-center justify-center py-12 text-executive-muted">
@@ -227,12 +309,24 @@ export default function CrmTab() {
       ) : (
         <div className="bg-executive-card border border-executive-border rounded-xl overflow-hidden">
           {visible.map(c => (
-            <div key={c.email} className={`border-b border-executive-border/60 last:border-b-0 ${c.ignore ? 'opacity-50' : ''}`}>
+            <div key={c.email} className={`border-b border-executive-border/60 last:border-b-0 ${c.ignore ? 'opacity-50' : ''} ${selected.has(c.email) ? 'bg-executive-accent/5' : ''}`}>
               {/* Row */}
-              <button
-                onClick={() => setExpandedEmail(expandedEmail === c.email ? null : c.email)}
-                className="w-full flex items-center gap-3 px-3 py-2.5 hover:bg-executive-border/10 text-left"
-              >
+              <div className="flex items-stretch">
+                <label
+                  onClick={e => e.stopPropagation()}
+                  className="flex items-center pl-3 pr-1 cursor-pointer"
+                >
+                  <input
+                    type="checkbox"
+                    checked={selected.has(c.email)}
+                    onChange={() => toggleSel(c.email)}
+                    className="accent-executive-accent"
+                  />
+                </label>
+                <button
+                  onClick={() => setExpandedEmail(expandedEmail === c.email ? null : c.email)}
+                  className="flex-1 min-w-0 flex items-center gap-3 pr-3 py-2.5 hover:bg-executive-border/10 text-left"
+                >
                 <span className="text-executive-muted shrink-0">
                   {expandedEmail === c.email ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                 </span>
@@ -259,7 +353,8 @@ export default function CrmTab() {
                     {c.last_contact || '—'}
                   </div>
                 </div>
-              </button>
+                </button>
+              </div>
 
               {expandedEmail === c.email && (
                 <ContactDetail
@@ -302,6 +397,122 @@ export default function CrmTab() {
           onCommitted={() => refresh()}
         />
       )}
+
+      {emailOpen && (
+        <BulkEmailModal
+          recipients={contacts.filter(c => selected.has(c.email))}
+          resumeMode={emailResume}
+          onClose={() => { setEmailOpen(false); setEmailResume(false); }}
+          onCommit={() => stop('bulk-email')}
+          onMinimize={(hint) => {
+            startJob({
+              id: 'bulk-email',
+              label: hint === 'committing' ? 'Bulk email — saving' : 'Bulk email — generating',
+              kind: 'bulk-email',
+              poll: async () => {
+                if (hint === 'committing') {
+                  const r = await getOutreachLast();
+                  const s = r.summary;
+                  const done = (s?.drafts ?? 0) + (s?.sent ?? 0) + (s?.errors ?? 0);
+                  return {
+                    status: normalizeStatus(String(r.status ?? '')),
+                    progress: r.total ? { current: done, total: r.total } : undefined,
+                    error: r.status === 'error' ? (r.error || 'Commit failed') : undefined,
+                    last_run: r.last_run,
+                  };
+                }
+                const p = await getBulkPreview();
+                return {
+                  status: normalizeStatus(String(p.status ?? '')),
+                  progress: p.total ? { current: p.items?.length ?? 0, total: p.total } : undefined,
+                  error: p.status === 'error' ? (p.error || 'Generation failed') : undefined,
+                  last_run: p.last_run,
+                };
+              },
+              onRestore: requestResume,
+            });
+          }}
+        />
+      )}
+
+      {groupModalOpen && (
+        <GroupModal
+          count={selected.size}
+          existingGroups={allGroups}
+          onSubmit={saveAsGroup}
+          onClose={() => setGroupModalOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+// ───────────────────────────────────────────────────────────
+
+function GroupModal({
+  count, existingGroups, onSubmit, onClose,
+}: {
+  count: number;
+  existingGroups: string[];
+  onSubmit: (name: string) => Promise<void>;
+  onClose: () => void;
+}) {
+  const [name, setName] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  const submit = async (g: string) => {
+    const v = g.trim();
+    if (!v) return;
+    setSaving(true);
+    try { await onSubmit(v); } finally { setSaving(false); }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} className="bg-executive-card border border-executive-border rounded-xl max-w-sm w-full p-6 shadow-xl">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-lg font-semibold text-executive-text">Add {count} to a group</h2>
+          <button onClick={onClose} className="text-executive-muted hover:text-executive-text"><X size={18} /></button>
+        </div>
+
+        <Label>New group</Label>
+        <div className="flex gap-2 mb-4">
+          <input
+            type="text"
+            value={name}
+            autoFocus
+            onChange={e => setName(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') submit(name); }}
+            placeholder="e.g. Investors"
+            className="flex-1 px-3 py-2 text-sm bg-executive-bg border border-executive-border rounded-md focus:outline-none focus:border-executive-accent/60"
+          />
+          <button
+            onClick={() => submit(name)}
+            disabled={!name.trim() || saving}
+            className="flex items-center gap-1.5 px-3 py-2 text-sm rounded-md bg-executive-accent text-white hover:opacity-90 disabled:opacity-40"
+          >
+            {saving ? <Loader2 size={14} className="animate-spin" /> : 'Add'}
+          </button>
+        </div>
+
+        {existingGroups.length > 0 && (
+          <>
+            <Label>Or add to existing</Label>
+            <div className="flex flex-wrap gap-1.5">
+              {existingGroups.map(g => (
+                <button
+                  key={g}
+                  onClick={() => submit(g)}
+                  disabled={saving}
+                  className="text-xs px-2.5 py-1 rounded-full border border-executive-border text-executive-muted hover:text-executive-text hover:border-executive-accent/60 disabled:opacity-40"
+                >
+                  {g}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 }

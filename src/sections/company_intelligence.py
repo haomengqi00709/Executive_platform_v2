@@ -23,6 +23,8 @@ from src.modules.intel_dedup import (
     filter_exact_duplicates, assign_ids,
     format_history_for_validator,
 )
+from src.modules.intel_score import score_items
+from src.modules.intel_enrich import enrich_items
 
 _SKILLS_DIR = Path(__file__).parent.parent / "skills" / "company_intelligence"
 _RESULT_ID = "company_intelligence"
@@ -88,6 +90,15 @@ _STATUS_RANK   = {
 # focus. If a user has a genuine vendor they want monitored, they change
 # that contact's CRM status to "prospect" / "partner" (already supported).
 _MONITORED_STATUSES = frozenset({"client", "prospect", "partner", "investor"})
+
+# Per-company top-K quota (Horizon balanced-digest analog). Guarantees every
+# tracked company keeps coverage and no single company floods the brief.
+_PER_COMPANY_CAP = 3
+_MAX_ITEMS = 15
+# Enrichment is distributed per-company (each company's top N, global cap) so the
+# background+refs depth isn't monopolized by the newsiest company.
+_ENRICH_PER_COMPANY = 2
+_ENRICH_CAP = 8
 
 
 def _load_skill_doc() -> str:
@@ -226,6 +237,47 @@ def _normalise(items: list[dict]) -> list[dict]:
     return out
 
 
+def _apply_company_quota(items: list[dict]) -> list[dict]:
+    """Keep each tracked company's top-K items (round-robin by rank), capped at
+    _MAX_ITEMS total. Items must be pre-sorted by ai_score desc (score_items
+    guarantees this), so each company's list is already best-first.
+
+    Round-robin (every company's #1 before any company's #2) is what guarantees
+    no tracked company gets zeroed — the company-level analog of Horizon's
+    balanced-digest anti-domination quota. Returns survivors sorted by score desc.
+    """
+    groups: dict[str, list[dict]] = {}
+    for it in items:
+        groups.setdefault(it.get("company") or "?", []).append(it)
+    kept: list[dict] = []
+    for rank in range(_PER_COMPANY_CAP):
+        for lst in groups.values():
+            if rank < len(lst):
+                kept.append(lst[rank])
+                if len(kept) >= _MAX_ITEMS:
+                    kept.sort(key=lambda x: x.get("ai_score", 0.0), reverse=True)
+                    return kept
+    kept.sort(key=lambda x: x.get("ai_score", 0.0), reverse=True)
+    return kept
+
+
+def _select_for_enrichment(items: list[dict]) -> list[dict]:
+    """Pick each company's top _ENRICH_PER_COMPANY items (by score), capped at
+    _ENRICH_CAP total. Returns references into `items`, so enriching them in place
+    updates the main list. Spreads enrichment depth across companies."""
+    groups: dict[str, list[dict]] = {}
+    for it in sorted(items, key=lambda x: x.get("ai_score", 0.0), reverse=True):
+        groups.setdefault(it.get("company") or "?", []).append(it)
+    selected: list[dict] = []
+    for rank in range(_ENRICH_PER_COMPANY):
+        for lst in groups.values():
+            if rank < len(lst):
+                selected.append(lst[rank])
+                if len(selected) >= _ENRICH_CAP:
+                    return selected
+    return selected
+
+
 def run(
     graph: GraphClient,
     ai: AIClient,
@@ -354,6 +406,22 @@ Return ONLY a JSON array — no markdown, no preamble. Skip companies with no so
         }
 
     items = _normalise(all_items)
+
+    # Score 0-10 by MATERIALITY (how significant the development is for that
+    # company). We do NOT relevance-gate here: the companies are already
+    # user-curated, so gating would drop a company the user deliberately tracks.
+    # The score drives ranking, priority, and which items get enriched.
+    items = score_items(items, ai, reader_context=business_context,
+                        instruction=user_instruction, display_name=display_name,
+                        purpose="materiality")
+
+    # Per-company top-K (Horizon balanced-digest analog): guarantee every tracked
+    # company keeps coverage and no single company floods the brief.
+    before = len(items)
+    items = _apply_company_quota(items)
+    _p(f"scored {before} items → per-company quota kept {len(items)} "
+       f"(≤{_PER_COMPANY_CAP}/company, ≤{_MAX_ITEMS} total)")
+
     _p(f"{len(items)} valid items before dedup")
     items = _resolve_urls(items, _p)
 
@@ -370,6 +438,12 @@ Return ONLY a JSON array — no markdown, no preamble. Skip companies with no so
     _p(f"{len(items)} new items after md5 dedup")
 
     items = assign_ids(items)
+
+    # Per-company enrichment: enrich each company's top signals (global cap), so
+    # background + real references are spread across tracked companies rather than
+    # monopolized by the newsiest one. Shared dict refs → updates `items` in place.
+    to_enrich = _select_for_enrichment(items)
+    enrich_items(to_enrich, ai, top_n=len(to_enrich), display_name=display_name, log=_p)
 
     # Layer 2: AI semantic dedup at validator stage — sees previously-
     # surfaced headlines (from prior runs only) and drops items describing

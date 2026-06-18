@@ -10,3 +10,5 @@ apscheduler
 google-genai
 openpyxl
 pyyaml
+feedparser>=6.0.11
+ddgs>=7.0.0

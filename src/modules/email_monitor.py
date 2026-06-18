@@ -581,6 +581,8 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
         return
 
     data_dir = Path(data_dir)
+    from src.ai import set_usage_context
+    set_usage_context("email_monitor", data_dir.name)
 
     # Label every AI call in this poll as email_monitor + this user (was logged as
     # feature=unknown), and instrument the cycle below. Diagnostics only — no behavior change.

@@ -4,7 +4,7 @@ Macro market signals via Gemini Google Search grounding.
 Structured items: headline (point-form) + summary + source_url + 7-day dedup.
 """
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from src.ai import AIClient
@@ -17,9 +17,19 @@ from src.modules.intel_dedup import (
     filter_exact_duplicates, assign_ids,
     format_history_for_validator,
 )
+from src.modules.intel_score import score_items, DEFAULT_THRESHOLD
+from src.modules.feed_rewrite import rewrite_feed_items
+from src.modules.intel_enrich import enrich_items
+from src.modules.feeds_config import load_feeds
+from src.modules.feeds_fetch import fetch_feed_items
 
 _SKILLS_DIR = Path(__file__).parent.parent / "skills" / "market_intelligence"
 _RESULT_ID = "market_intelligence"
+_FEED_LOOKBACK_DAYS = 30  # recency window for feed items — wider than grounding's
+                          # 14d because niche B2B verticals publish less often;
+                          # relevance scoring gates them regardless of age
+_QUOTA_PER_SIGNAL = 4     # max items kept per signal_type (anti-flood)
+_MAX_ITEMS = 15           # global cap on the brief size
 
 _DEFAULT_INSTRUCTION = """\
 # Market Intelligence — Search Instruction
@@ -148,8 +158,27 @@ def _normalise(items: list[dict]) -> list[dict]:
             "published_date": str(item.get("published_date") or "")[:10],
             "relevance":     str(item.get("relevance") or "")[:200],
             "priority":      item.get("priority") if item.get("priority") in ("high", "medium", "low") else "medium",
+            "origin":        item.get("origin") or "grounding",
         })
     return out
+
+
+def _apply_signal_quota(items: list[dict]) -> list[dict]:
+    """Keep at most _QUOTA_PER_SIGNAL items per signal_type and _MAX_ITEMS total,
+    so one category can't dominate the brief. Assumes items are pre-sorted by
+    ai_score descending (score_items guarantees this), so the highest-scored item
+    in each category survives. Preserves order."""
+    kept: list[dict] = []
+    per_signal: dict[str, int] = {}
+    for item in items:
+        sig = item.get("signal_type") or "other"
+        if per_signal.get(sig, 0) >= _QUOTA_PER_SIGNAL:
+            continue
+        kept.append(item)
+        per_signal[sig] = per_signal.get(sig, 0) + 1
+        if len(kept) >= _MAX_ITEMS:
+            break
+    return kept
 
 
 def run(
@@ -235,10 +264,25 @@ Return the 3-5 most relevant items as a JSON array — no markdown, no preamble.
         except Exception as e:
             _p(f"  → topic '{topic_label}' failed: {e}")
 
-    # Hard error only if EVERY topic failed — partial results are fine (mirrors
-    # company_intelligence, which keeps whatever batches succeeded).
-    if ok_batches == 0:
-        _p("All topic searches failed")
+    # Merge configured feed sources (RSS / Google News / HN / Reddit), if the
+    # user has opted in. Feed items enter the SAME schema and pipeline; the
+    # scoring gate below filters them to this reader's relevance. Per-source
+    # isolation lives inside fetch_feed_items — a bad feed can't sink the run.
+    feed_items: list[dict] = []
+    try:
+        feeds_cfg = load_feeds(data_dir)
+        since = datetime.now(timezone.utc) - timedelta(days=_FEED_LOOKBACK_DAYS)
+        feed_items = fetch_feed_items(feeds_cfg, since, log=_p)
+        if feed_items:
+            all_raw_items.extend(feed_items)
+            _p(f"feeds: +{len(feed_items)} items merged")
+    except Exception as e:
+        _p(f"feeds: fetch failed: {e}")
+
+    # Hard error only if grounding produced nothing AND no feed items either —
+    # partial results are fine (mirrors company_intelligence).
+    if ok_batches == 0 and not feed_items:
+        _p("All topic searches failed and no feed items")
         return {
             "id": _RESULT_ID, "status": "error",
             "error": "all market-intelligence topic searches failed (timeout/grounding)",
@@ -248,6 +292,22 @@ Return the 3-5 most relevant items as a JSON array — no markdown, no preamble.
 
     _p("Parsing results...")
     items = _normalise(all_raw_items)
+
+    # Score 0-10 by relevance to THIS reader's business, then gate. Grounding
+    # items arrive already targeted; this mainly drops off-target feed noise and
+    # weak signals before the expensive URL-resolve + enrichment passes run.
+    items = score_items(items, ai, reader_context=business_context,
+                         instruction=user_instruction, display_name=display_name)
+    above = [it for it in items if it.get("ai_score", 0.0) >= DEFAULT_THRESHOLD]
+    _p(f"scored {len(items)} → {len(above)} above threshold {DEFAULT_THRESHOLD}")
+    items = above
+
+    # Reshape surviving feed (raw-news) items into the brief's strategic-insight
+    # format so the validator treats them like grounding items instead of
+    # dropping them for "not a strategic insight / signal_type=other".
+    items = rewrite_feed_items(items, ai, display_name=display_name,
+                               reader_context=business_context, log=_p)
+
     items = _resolve_urls(items, _p)
 
     if not items:
@@ -273,6 +333,20 @@ Return the 3-5 most relevant items as a JSON array — no markdown, no preamble.
     _p(f"{len(items)} new items after md5 dedup")
 
     items = assign_ids(items)
+
+    # Category quota: cap per signal_type + global size before the expensive
+    # enrichment pass, so one category (e.g. a feed-heavy 'technology' bucket)
+    # can't crowd out the brief.
+    before_quota = len(items)
+    items = _apply_signal_quota(items)
+    if len(items) < before_quota:
+        _p(f"quota: {before_quota} → {len(items)} items (≤{_QUOTA_PER_SIGNAL}/signal, ≤{_MAX_ITEMS} total)")
+
+    # Enrichment second-pass: for the top-N (highest-scored) items, add
+    # web-grounded background + community_view + REAL reference URLs via ddgs.
+    # Runs after dedup (don't enrich items we're about to drop) and before the
+    # validator. Degrades to empty fields if ddgs is unavailable — never fatal.
+    items = enrich_items(items, ai, display_name=display_name, log=_p)
 
     # Layer 2: AI semantic dedup at validator stage — sees previously-
     # surfaced headlines (from prior runs only) and drops items describing
