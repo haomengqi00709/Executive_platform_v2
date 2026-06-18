@@ -609,7 +609,7 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
 
     monitor_state = _load_monitor_state(data_dir)
     processed_ids = set(monitor_state.get("processed_conv_ids") or [])
-    _seen_before = set(processed_ids)   # DIAG: snapshot to count re-fetched already-seen emails
+    seen_msg_ids = set(monitor_state.get("seen_msg_ids") or [])
 
     # Prune priority followups that have already been replied to
     followups = monitor_state.get("pending_priority_followup") or []
@@ -651,10 +651,17 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
         default=last_ts,
     )
 
-    if not raw_emails:
-        print(f"[EmailMonitor] DIAG uid={data_dir.name[:8]} last_ts={last_ts} fetched=0 (no new email — quiet, healthy)")
+    # Message-id dedup BEFORE any AI runs. The 'ge' filter re-fetches the boundary
+    # email every cycle; without this it is re-screened forever (the burn). New emails
+    # — including ones arriving at the same second as the boundary — are not in the
+    # set, so they are still handled. This is what makes "no new email -> 0 AI" true.
+    fresh = [m for m in raw_emails if (m.get("id") or "") not in seen_msg_ids]
 
-    if raw_emails:
+    if not fresh:
+        print(f"[EmailMonitor] DIAG uid={data_dir.name[:8]} last_ts={last_ts} "
+              f"fetched={len(raw_emails)} fresh=0 (all already screened — 0 AI)")
+
+    if fresh:
         # Build ignored_emails from CRM
         ignored_emails: set = set()
         try:
@@ -672,7 +679,7 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
         # Screen (CLAUDE.md Principle 5)
         try:
             screened = screen_emails(
-                messages=raw_emails,
+                messages=fresh,
                 ai=ai,
                 ignored_emails=ignored_emails,
                 business_context=load_profile_context(data_dir),
@@ -681,7 +688,7 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
             visible = [m for m in screened if not m.get("screened_out")]
         except Exception as e:
             print(f"[EmailMonitor] Screener error: {e}")
-            visible = raw_emails
+            visible = fresh
 
         # Rule-based noise filter
         filtered = _noise_filter(visible, processed_ids)
@@ -764,23 +771,29 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
                 # which the digest reads. No separate pending_digest queue.
                 notified.append(summary)
 
-        _already_seen = sum(
-            1 for m in raw_emails
-            if (m.get("conversationId") or m.get("id", "")) in _seen_before
-        )
+        # Mark every email screened this cycle so the ge-boundary re-fetch never
+        # re-screens them next cycle. Capped sliding window (same bound as conv ids).
+        for m in fresh:
+            _mid = m.get("id") or ""
+            if _mid:
+                seen_msg_ids.add(_mid)
+        if len(seen_msg_ids) > _MAX_PROCESSED_IDS:
+            seen_msg_ids = set(list(seen_msg_ids)[-_MAX_PROCESSED_IDS:])
+
         print(
             f"[EmailMonitor] DIAG uid={data_dir.name[:8]} last_ts={last_ts} "
-            f"fetched={len(raw_emails)} already_seen={_already_seen} "
-            f"screener_out={len(raw_emails) - len(visible)} "
+            f"fetched={len(raw_emails)} fresh={len(fresh)} "
+            f"screener_out={len(fresh) - len(visible)} "
             f"seen/noise_removed={len(visible) - len(filtered)} "
             f"triaged={len(triaged)}(crm={len(crm_classified)},ai={len(ai_triaged)}) "
-            f"pushed={_pushed} newest_ts={newest_ts} ts_advanced={newest_ts != last_ts}"
+            f"pushed={_pushed} newest_ts={newest_ts}"
         )
 
         if len(processed_ids) > _MAX_PROCESSED_IDS:
             processed_ids = set(list(processed_ids)[-_MAX_PROCESSED_IDS:])
 
         monitor_state["processed_conv_ids"] = list(processed_ids)
+        monitor_state["seen_msg_ids"] = list(seen_msg_ids)
         monitor_state["last_notified_emails"] = notified[-20:]
 
         # Refresh reply_needed.json now so the digest + frontend reflect this batch.
