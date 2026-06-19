@@ -41,6 +41,7 @@ def _record_bot_usage(response, feature: str, is_search: bool = False) -> None:
 MAX_ROUNDS   = 12          # was 8; with 27 tools the model needs room to research AND act
 HISTORY_LIMIT = 20
 BUDGET_NUDGE_AT = 2        # rounds-remaining threshold to push the model to act instead of read
+MAX_CORRECTIONS = 2        # completion gate: how many times we re-drive an unfinished action
 HONEST_FALLBACK = "I looked into that but didn't finish — want me to try again?"
 
 # Tools that DO something (mutate state / create a resource) vs. read tools. Mirrors the
@@ -917,18 +918,25 @@ def reply(
         except Exception as e:
             return f"Error updating CRM contact: {e}"
 
-    def create_calendar_event(subject: str, start_iso: str, end_iso: str,
+    def create_calendar_event(subject: str, start_iso: str, end_iso: str = "",
                               attendee_emails: str = "",
                               location: str = "",
                               is_online_meeting: bool = False) -> str:
         """Create a calendar event in the user's Outlook calendar.
-        start_iso / end_iso: ISO 8601 format in the user's local timezone
-          e.g. '2026-05-30T14:00:00' — convert natural language time using the timezone in your context.
+        start_iso: ISO 8601 in the user's local timezone, e.g. '2026-05-30T14:00:00'
+          — convert natural-language time using the timezone in your context.
+        end_iso: optional; if omitted, defaults to 30 minutes after start. Set it only when
+          the user gave a duration or end time. (So 'schedule X at 5:30pm' is enough to book.)
         attendee_emails: comma-separated email addresses (leave empty for solo blocks).
         is_online_meeting: set true to add a Teams meeting link."""
         if owner_graph is None:
             return "Owner account not available."
         try:
+            if not (end_iso or "").strip():
+                try:
+                    end_iso = (datetime.fromisoformat(start_iso) + timedelta(minutes=30)).isoformat()
+                except Exception:
+                    return "⚠️ Need a valid start time to schedule this — what time should it start?"
             attendees = [a.strip() for a in attendee_emails.split(",") if a.strip()] if attendee_emails else []
             result = owner_graph.create_event(
                 subject=subject,
@@ -1434,99 +1442,140 @@ def reply(
     fn_map   = {f.__name__: f for f in all_tools}
 
     final_text     = ""
-    rounds_used    = 0
     tools_called   = []
     action_results = {}          # action tool name -> succeeded at least once this turn
-    finish_mode    = "normal"    # normal | forced | fallback
-    for i in range(MAX_ROUNDS):
-        rounds_used = i + 1
-        response = client.models.generate_content(
-            model   = MODEL,
-            contents= contents,
-            config  = types.GenerateContentConfig(
-                system_instruction = system,
-                tools              = all_tools,
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-            ),
-        )
-        _record_bot_usage(response, "bot")
+    finish_mode    = "normal"    # normal | redrive | needs_user | exhausted | fallback
+    total_rounds   = 0
 
-        candidate  = response.candidates[0] if response.candidates else None
-        parts      = (candidate.content.parts if candidate and candidate.content else None) or []
-        fn_calls   = [p for p in parts if p.function_call]
-        text_parts = [p.text for p in parts if p.text]
-
-        if not fn_calls:
-            final_text = "\n".join(t for t in text_parts if t).strip()
-            break
-
-        response_parts = []
-        for part in fn_calls:
-            fc   = part.function_call
-            fn   = fn_map.get(fc.name)
-            args = dict(fc.args) if fc.args else {}
-            print(f"[Bot] → {fc.name}({args})")
-            try:
-                result = fn(**args) if fn else f"Unknown tool: {fc.name}"
-            except Exception as e:
-                result = f"Tool error: {e}"
-            print(f"[Bot] ← {str(result)[:150]}")
-            tools_called.append(fc.name)
-            if fc.name in ACTION_TOOLS:
-                ok = isinstance(result, str) and not result.startswith(
-                    ("Error", "⚠️", "Owner account", "No pending",
-                     "Unknown tool", "Tool error", "Couldn't"))
-                action_results[fc.name] = action_results.get(fc.name, False) or ok
-            response_parts.append(
-                types.Part(function_response=types.FunctionResponse(
-                    name=fc.name,
-                    response={"result": result},
-                ))
-            )
-
-        # Budget pressure: when few rounds remain, push the model to ACT rather than research
-        # forever (the cause of the hollow "Done." — it burned every round on read tools). The
-        # text part rides alongside the function responses, so every function_call is still
-        # answered (Gemini's protocol requirement stays intact).
-        rounds_left = MAX_ROUNDS - (i + 1)
-        if 0 < rounds_left <= BUDGET_NUDGE_AT:
-            response_parts.append(types.Part(text=(
-                f"[system] You have {rounds_left} tool call(s) left this turn. "
-                f"If the user asked you to DO something (draft/reply/schedule/update/tag/run), "
-                f"call that action tool NOW with the info you already have — the target "
-                f"email/contact is usually already in the context above. Stop gathering information."
-            )))
-
-        contents.append(types.Content(role="model", parts=parts))
-        contents.append(types.Content(role="user",  parts=response_parts))
-
-    # Loop ran out of rounds without the model producing a final text answer. Do NOT fake
-    # "Done." — force one tool-free turn so the model must honestly state what it did/didn't do.
-    if not final_text:
-        finish_mode = "forced"
-        force_note = (
-            "\n\nYou have run out of tool calls for this turn. Do NOT call any function. "
-            "In 1-3 sentences, tell the user plainly what you actually accomplished and what is "
-            "still incomplete. If you did NOT successfully save a draft / create an event / make "
-            "the change, say so explicitly and offer to continue — never imply success you did "
-            "not achieve."
-        )
-        try:
-            forced = client.models.generate_content(
+    def _run_agent_rounds(max_rounds: int) -> str:
+        """Run the function-calling loop until the model returns a text answer (no tool call)
+        or the round budget runs out. Mutates tools_called / action_results / contents in place.
+        Returns the model's final text ('' if it never produced one)."""
+        nonlocal total_rounds
+        for _j in range(max_rounds):
+            total_rounds += 1
+            response = client.models.generate_content(
                 model   = MODEL,
                 contents= contents,
-                config  = types.GenerateContentConfig(system_instruction=system + force_note),
+                config  = types.GenerateContentConfig(
+                    system_instruction = system,
+                    tools              = all_tools,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                ),
             )
-            _record_bot_usage(forced, "bot")
-            fcand  = forced.candidates[0] if forced.candidates else None
-            fparts = (fcand.content.parts if fcand and fcand.content else None) or []
-            final_text = "\n".join(p.text for p in fparts if p.text).strip()
-        except Exception as e:
-            print(f"[Bot] forced-finish call failed: {e}")
-            final_text = ""
-        if not final_text:
-            finish_mode = "fallback"
-            final_text = HONEST_FALLBACK
+            _record_bot_usage(response, "bot")
+            candidate  = response.candidates[0] if response.candidates else None
+            parts      = (candidate.content.parts if candidate and candidate.content else None) or []
+            fn_calls   = [p for p in parts if p.function_call]
+            text_parts = [p.text for p in parts if p.text]
+            if not fn_calls:
+                return "\n".join(t for t in text_parts if t).strip()
+            response_parts = []
+            for part in fn_calls:
+                fc   = part.function_call
+                fn   = fn_map.get(fc.name)
+                args = dict(fc.args) if fc.args else {}
+                print(f"[Bot] → {fc.name}({args})")
+                try:
+                    result = fn(**args) if fn else f"Unknown tool: {fc.name}"
+                except Exception as e:
+                    result = f"Tool error: {e}"
+                print(f"[Bot] ← {str(result)[:150]}")
+                tools_called.append(fc.name)
+                if fc.name in ACTION_TOOLS:
+                    ok = isinstance(result, str) and not result.startswith(
+                        ("Error", "⚠️", "Owner account", "No pending",
+                         "Unknown tool", "Tool error", "Couldn't"))
+                    action_results[fc.name] = action_results.get(fc.name, False) or ok
+                response_parts.append(
+                    types.Part(function_response=types.FunctionResponse(
+                        name=fc.name, response={"result": result})))
+            contents.append(types.Content(role="model", parts=parts))
+            contents.append(types.Content(role="user",  parts=response_parts))
+        return ""
+
+    def _verify_completion(candidate_reply: str) -> dict:
+        """Completion gate (function 1): given the user's request + the GROUND-TRUTH of what the
+        agent actually did this turn (tools_called / succeeded actions), decide whether the request
+        was really fulfilled. Trust ONLY action_results, never the draft reply's own claims.
+        Returns {verdict, missing, user_message}; fail-safe to 'done' so a checker error never
+        blocks the turn."""
+        succeeded = [n for n, ok in action_results.items() if ok]
+        check_prompt = (
+            "You are a completion checker for an executive assistant bot. Decide whether the bot "
+            "ACTUALLY completed what the user asked THIS turn. Trust ONLY the ground-truth below — "
+            "NOT what the draft reply claims it did.\n\n"
+            f"User's request: {text}\n\n"
+            f"Tools the bot called this turn: {tools_called or 'none'}\n"
+            f"ACTION tools that SUCCEEDED (an action counts as DONE only if listed here): {succeeded or 'none'}\n"
+            f"Draft reply the bot wants to send: {(candidate_reply or '')[:600]}\n\n"
+            "Pick exactly one verdict:\n"
+            "- \"done\": the request was chat/informational (no action needed), OR the user asked for an "
+            "action and it IS in the SUCCEEDED list.\n"
+            "- \"incomplete_actionable\": the user asked the bot to DO something (schedule/draft/reply/"
+            "update/tag/run/send) and it is NOT in SUCCEEDED, yet everything needed is already known in "
+            "the conversation (recipient/contact/time resolved). The bot dropped the ball — it should "
+            "just call the action tool.\n"
+            "- \"incomplete_needs_user\": the action is genuinely blocked on info only the user can give "
+            "(missing duration/time, a confirmation, an ambiguous target).\n\n"
+            "Return ONLY JSON: {\"verdict\":\"done|incomplete_actionable|incomplete_needs_user\","
+            "\"missing\":\"<the action to call, or what to ask the user>\","
+            "\"user_message\":\"<if not done: ONE honest sentence telling the user it is NOT done yet and "
+            "what is needed; empty string if done>\"}"
+        )
+        try:
+            resp = client.models.generate_content(
+                model=MODEL, contents=check_prompt,
+                config=types.GenerateContentConfig())
+            _record_bot_usage(resp, "bot")
+            raw = (resp.text or "").strip()
+            s, e = raw.find("{"), raw.rfind("}")
+            if s != -1 and e > s:
+                obj = json.loads(raw[s:e + 1])
+                if obj.get("verdict") in ("done", "incomplete_actionable", "incomplete_needs_user"):
+                    return obj
+        except Exception as ce:
+            print(f"[Bot] completion check failed: {ce}")
+        return {"verdict": "done"}   # fail-safe: never block the turn
+
+    # ── Run the agent, then the completion gate ────────────
+    # The user receives NOTHING until the gate converges: either the action truly succeeded,
+    # or we honestly tell them it is not done and what is needed. No hollow "Done", no dropped tail.
+    final_text = _run_agent_rounds(MAX_ROUNDS)
+
+    verdict     = "done"
+    corrections = 0
+    while True:
+        v = _verify_completion(final_text)
+        verdict = v.get("verdict", "done")
+        if verdict == "done":
+            break
+        if verdict == "incomplete_needs_user":
+            finish_mode = "needs_user"
+            final_text = (v.get("user_message") or final_text or HONEST_FALLBACK).strip()
+            break
+        # incomplete_actionable — re-drive the same agent if budget allows
+        if corrections >= MAX_CORRECTIONS or total_rounds >= MAX_ROUNDS:
+            finish_mode = "exhausted"
+            final_text = ((v.get("user_message") or "").strip()
+                          or (f"I haven't completed that yet — {v.get('missing','')}").strip()
+                          or HONEST_FALLBACK)
+            break
+        corrections += 1
+        finish_mode = "redrive"
+        contents.append(types.Content(role="user", parts=[types.Part(text=(
+            f"[system] You did NOT actually complete this: {v.get('missing','the requested action')}. "
+            "The information you need is already in this conversation above. Call the appropriate "
+            "ACTION tool NOW to really do it — do not just describe it, ask again, or report what you found."
+        ))]))
+        new_text = _run_agent_rounds(max(1, MAX_ROUNDS - total_rounds))
+        if new_text:
+            final_text = new_text
+
+    # If the model never produced any text at all, fall back honestly (don't send empty).
+    if not final_text:
+        finish_mode = "fallback"
+        final_text = HONEST_FALLBACK
 
     # Append Outlook draft link if create_reply_draft saved one this turn
     web_link = state.pop("_last_draft_web_link", None)
@@ -1536,7 +1585,8 @@ def reply(
 
     actions_ok   = [n for n, ok in action_results.items() if ok]
     actions_fail = [n for n, ok in action_results.items() if not ok]
-    print(f"[Bot] turn done — rounds={rounds_used}/{MAX_ROUNDS} finish={finish_mode} "
+    print(f"[Bot] turn done — rounds={total_rounds}/{MAX_ROUNDS} finish={finish_mode} "
+          f"verdict={verdict} corrections={corrections} "
           f"tools={tools_called} actions_ok={actions_ok} actions_failed={actions_fail}")
 
     _save_turn(db_path, text, final_text)
