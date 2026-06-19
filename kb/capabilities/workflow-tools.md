@@ -3,7 +3,7 @@ title: Workflow Tools (Outreach / Draft Composer)
 describes_files:
   - src/modules/outreach.py
   - src/bot.py
-derived_from_commit: b86951a
+derived_from_commit: e7562a3
 last_synced: 2026-06-19
 ---
 
