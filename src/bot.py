@@ -1567,7 +1567,10 @@ def reply(
             break
         if verdict == "incomplete_needs_user":
             finish_mode = "needs_user"
-            final_text = (v.get("user_message") or final_text or HONEST_FALLBACK).strip()
+            # needs_user means the agent is honestly ASKING the user — its own reply carries the
+            # rich question (e.g. the [#N] candidate list). Prefer it; the verifier's one-liner is a
+            # lossy summary ("specify which Daniel from the list" drops the list) — fallback only.
+            final_text = (final_text or v.get("user_message") or HONEST_FALLBACK).strip()
             break
         # incomplete_actionable — re-drive the same agent if budget allows
         if corrections >= MAX_CORRECTIONS or total_rounds >= MAX_ROUNDS:
