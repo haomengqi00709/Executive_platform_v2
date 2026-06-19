@@ -312,11 +312,20 @@ def reply(
         f"  subjects, recipients, or names from memory — copy them from the JSON output.\n\n"
         f"  If the user says #N but no recent list is visible in this conversation,\n"
         f"  ask which list they mean (or re-run the appropriate read tool first).\n\n"
+        f"DISAMBIGUATION — LOOK BEFORE YOU ASK:\n"
+        f"  When the user names a person/target for an action (schedule a meeting, draft, email\n"
+        f"  someone) and you don't already have the exact one, you must LOOK FIRST — call the\n"
+        f"  relevant lookup tool (find_contacts_by_name for people) BEFORE asking anything. Then:\n"
+        f"    - exactly one match  → proceed with it, don't ask.\n"
+        f"    - several matches    → show them as a [#N] list (name — company — email) and ask\n"
+        f"      which one; the user picks by number. NEVER reply a vague 'I found a few named X,\n"
+        f"      please specify' WITHOUT first looking them up and listing them.\n"
+        f"    - no match           → say so and ask for the email.\n\n"
         f"TOOL ROUTING:\n"
         f"  get_recent_emails          → 'show my emails', 'what did X send', 'unread messages'\n"
         f"  get_upcoming_meetings      → 'what meetings do I have', 'who is in my next call'\n"
         f"  get_contact_history        → 'history with X', 'last email from John'\n"
-        f"  find_contacts_by_name      → resolve a NAME → contact/email ('who is Daniel', 'email for Tingcheng'); call BEFORE create_reply_draft / create_calendar_event when you don't have the email\n"
+        f"  find_contacts_by_name      → resolve a NAME → contact/email ('who is Daniel', 'email for Tingcheng'). Call this FIRST whenever the user names someone for an action and you don't have their email — see DISAMBIGUATION above: one match → proceed, several → list as [#N] and ask, never ask blindly\n"
         f"  get_email_frequency_report → 'who do I email most', 'most active contacts'\n"
         f"  read_module_result         → 'what did the briefing say', 'show last email analysis'\n"
         f"  check_email_handling       → 'did I reply to Sarah?', 'what happened with the Acme email?', 'has the X thread been handled?'\n"
@@ -519,7 +528,7 @@ def reply(
             print(f"[Bot] find_contacts_by_name({name!r}) → {len(matches)}")
             if not matches:
                 return f"No CRM contact matching '{name}'. Ask the user for the email address."
-            return json.dumps(matches, ensure_ascii=False)
+            return json.dumps(_with_indices(matches), ensure_ascii=False)
         except Exception as e:
             return f"Error: {e}"
 
@@ -1016,7 +1025,7 @@ def reply(
         if not groups:
             return ("You don't have any contact groups yet. Tag contacts in the CRM "
                     "(or use 'Save as group' after selecting people) to create one.")
-        return json.dumps({"groups": groups}, ensure_ascii=False)
+        return json.dumps({"groups": _with_indices(groups)}, ensure_ascii=False)
 
     def list_group_members(group: str) -> str:
         """List the contacts in a CRM group (tag) — name, email, company — so the
@@ -1515,9 +1524,15 @@ def reply(
             "- \"incomplete_actionable\": the user asked the bot to DO something (schedule/draft/reply/"
             "update/tag/run/send) and it is NOT in SUCCEEDED, yet everything needed is already known in "
             "the conversation (recipient/contact/time resolved). The bot dropped the ball — it should "
-            "just call the action tool.\n"
+            "just call the action tool. ALSO use this when the draft reply asks the user to pick among "
+            "candidates (which person/contact/email/meeting) but NO lookup tool (e.g. find_contacts_by_name) "
+            "is in 'Tools the bot called this turn' — the bot asked BLIND; it must look first, then present "
+            "the real matches as a [#N] list.\n"
             "- \"incomplete_needs_user\": the action is genuinely blocked on info only the user can give "
-            "(missing duration/time, a confirmation, an ambiguous target).\n\n"
+            "(missing duration/time, a confirmation) — OR the bot ALREADY looked up the candidates this "
+            "turn (a lookup tool IS in the called list) and several genuinely match, so it correctly lists "
+            "them as [#N] and asks which. A blind 'please specify' with no lookup is NOT this — it is "
+            "incomplete_actionable.\n\n"
             "Return ONLY JSON: {\"verdict\":\"done|incomplete_actionable|incomplete_needs_user\","
             "\"missing\":\"<the action to call, or what to ask the user>\","
             "\"user_message\":\"<if not done: ONE honest sentence telling the user it is NOT done yet and "
@@ -1564,9 +1579,12 @@ def reply(
         corrections += 1
         finish_mode = "redrive"
         contents.append(types.Content(role="user", parts=[types.Part(text=(
-            f"[system] You did NOT actually complete this: {v.get('missing','the requested action')}. "
-            "The information you need is already in this conversation above. Call the appropriate "
-            "ACTION tool NOW to really do it — do not just describe it, ask again, or report what you found."
+            f"[system] You did NOT actually complete this. Next step: "
+            f"{v.get('missing','call the action tool the user asked for')}. "
+            "Do it NOW with the tools. If you need to resolve a named person/target first, call the lookup "
+            "tool (find_contacts_by_name) BEFORE anything else, then either complete the action or — only if "
+            "several candidates genuinely match — list them as a [#N] list and ask which one. Do not just "
+            "describe it, claim it is done, or ask the user to specify without first looking them up."
         ))]))
         new_text = _run_agent_rounds(max(1, MAX_ROUNDS - total_rounds))
         if new_text:
