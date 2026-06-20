@@ -456,90 +456,6 @@ def reply(
         except Exception as e:
             return f"Error: {e}"
 
-    def get_contact_history(email: str) -> str:
-        """Get email and meeting history with a specific contact by their email address."""
-        try:
-            result = {"email": email, "emails": [], "meetings": []}
-            if wiki_dir and wiki_dir.exists():
-                index_path = wiki_dir / "_index.json"
-                if index_path.exists():
-                    index = json.loads(index_path.read_text())
-                    for proj_id, proj in index.items():
-                        participants = proj.get("participants") or []
-                        if any(
-                            email.lower() in (p.lower() if isinstance(p, str) else "")
-                            for p in participants
-                        ):
-                            proj_path = wiki_dir / f"{proj_id}.json"
-                            if proj_path.exists():
-                                proj_data = json.loads(proj_path.read_text())
-                                result["meetings"].extend(proj_data.get("meetings", [])[:5])
-                                result["emails"].extend(proj_data.get("emails", [])[:5])
-            # Attach CRM writing style if available — used by Gemini when drafting emails to this contact
-            if data_dir:
-                try:
-                    from src.modules.crm import load_crm
-                    crm = load_crm(data_dir)
-                    contact = crm.get("contacts", {}).get(email.lower(), {})
-                    ws = contact.get("writing_style", "").strip()
-                    if ws:
-                        result["writing_style_note"] = ws
-                except Exception:
-                    pass
-            # Independent 1-based index on each sub-list so the user can say
-            # "tell me about meeting #2" or "draft for email #3".
-            result["emails"]   = _with_indices(result["emails"])
-            result["meetings"] = _with_indices(result["meetings"])
-            print(f"[Bot] get_contact_history({email})")
-            return json.dumps(result, ensure_ascii=False)
-        except Exception as e:
-            return f"Error: {e}"
-
-    def get_email_frequency_report(days_back: int = 30, top_n: int = 10) -> str:
-        """Analyze email frequency by sender over the past N days. Shows who you communicate with most."""
-        if owner_graph is None:
-            return "Owner account not available."
-        try:
-            msgs   = owner_graph.get_messages(top=200)
-            cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
-            counts: Counter = Counter()
-            for m in msgs:
-                recv = m.get("receivedDateTime", "")
-                try:
-                    dt = datetime.fromisoformat(recv.replace("Z", "+00:00"))
-                    if dt < cutoff:
-                        continue
-                except Exception:
-                    pass
-                sender = m.get("from", {}).get("emailAddress", {}).get("address", "")
-                if sender:
-                    counts[sender] += 1
-            result = _with_indices([
-                {"email": email, "email_count": count}
-                for email, count in counts.most_common(top_n)
-            ])
-            print(f"[Bot] get_email_frequency_report({days_back}d) → {len(result)} contacts")
-            return json.dumps(result, ensure_ascii=False)
-        except Exception as e:
-            return f"Error: {e}"
-
-    def find_contacts_by_name(name: str) -> str:
-        """Look up CRM contacts by a person's NAME (partial ok) — returns their email,
-        company, and role. Use this to resolve a name to an email address BEFORE
-        create_reply_draft or create_calendar_event when the user names someone but you
-        don't have their email. Also matches email and company text. Up to 10 best matches."""
-        if not data_dir:
-            return "No data directory available."
-        try:
-            from src.modules.crm import find_contacts_by_name as _crm_find
-            matches = _crm_find(data_dir, name)
-            print(f"[Bot] find_contacts_by_name({name!r}) → {len(matches)}")
-            if not matches:
-                return f"No CRM contact matching '{name}'. Ask the user for the email address."
-            return json.dumps(_with_indices(matches), ensure_ascii=False)
-        except Exception as e:
-            return f"Error: {e}"
-
     # --- Action tools ---
 
     def create_reply_draft(to: str, subject: str, body: str) -> str:
@@ -983,9 +899,6 @@ def reply(
     all_tools = _reg_tools + [
         # Query
         get_recent_emails,
-        get_contact_history,
-        find_contacts_by_name,
-        get_email_frequency_report,
         check_email_handling,
         # Action
         create_reply_draft,
