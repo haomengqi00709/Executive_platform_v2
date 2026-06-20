@@ -52,7 +52,7 @@ HONEST_FALLBACK = "I looked into that but didn't finish — want me to try again
 ACTION_TOOLS = frozenset({
     "create_reply_draft", "approve_draft", "skip_draft",
     "dismiss_email_followup",
-    "update_crm_contact", "create_calendar_event", "run_outreach",
+    "update_crm_contact", "run_outreach",
     "tag_recent_contacts",
     "draft_group_email", "confirm_group_email", "cancel_group_email",
 })
@@ -456,40 +456,6 @@ def reply(
         except Exception as e:
             return f"Error: {e}"
 
-    def get_upcoming_meetings(hours_ahead: int = 24) -> str:
-        """Get calendar meetings in the next N hours. Each item carries `index` and
-        `event_id` (canonical Graph calendar event id) so the user can refer to a
-        meeting by #N and you can call get_meeting_summary with the event_id."""
-        if owner_graph is None:
-            return "Owner account not available."
-        try:
-            now    = datetime.now(timezone.utc)
-            end_dt = now + timedelta(hours=hours_ahead)
-            events = owner_graph.get_calendar_view(
-                start_dt=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                end_dt=end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                top=20,
-            )
-            result = []
-            for e in events:
-                attendees = [
-                    a.get("emailAddress", {}).get("address", "")
-                    for a in (e.get("attendees") or [])
-                ]
-                result.append({
-                    "event_id":  e.get("id", ""),
-                    "title":     e.get("subject", ""),
-                    "start":     (e.get("start") or {}).get("dateTime", "")[:16],
-                    "end":       (e.get("end") or {}).get("dateTime", "")[:16],
-                    "attendees": attendees,
-                    "location":  e.get("location", {}).get("displayName", ""),
-                })
-            result = _with_indices(result)
-            print(f"[Bot] get_upcoming_meetings({hours_ahead}h) → {len(result)}")
-            return json.dumps(result, ensure_ascii=False)
-        except Exception as e:
-            return f"Error: {e}"
-
     def get_contact_history(email: str) -> str:
         """Get email and meeting history with a specific contact by their email address."""
         try:
@@ -683,46 +649,6 @@ def reply(
             return f"✅ Updated {field} for {email}: {value}"
         except Exception as e:
             return f"Error updating CRM contact: {e}"
-
-    def create_calendar_event(subject: str, start_iso: str, end_iso: str = "",
-                              attendee_emails: str = "",
-                              location: str = "",
-                              is_online_meeting: bool = False) -> str:
-        """Create a calendar event in the user's Outlook calendar.
-        start_iso: ISO 8601 in the user's local timezone, e.g. '2026-05-30T14:00:00'
-          — convert natural-language time using the timezone in your context.
-        end_iso: optional; if omitted, defaults to 30 minutes after start. Set it only when
-          the user gave a duration or end time. (So 'schedule X at 5:30pm' is enough to book.)
-        attendee_emails: comma-separated email addresses (leave empty for solo blocks).
-        is_online_meeting: set true to add a Teams meeting link."""
-        if owner_graph is None:
-            return "Owner account not available."
-        try:
-            if not (end_iso or "").strip():
-                try:
-                    end_iso = (datetime.fromisoformat(start_iso) + timedelta(minutes=30)).isoformat()
-                except Exception:
-                    return "⚠️ Need a valid start time to schedule this — what time should it start?"
-            attendees = [a.strip() for a in attendee_emails.split(",") if a.strip()] if attendee_emails else []
-            result = owner_graph.create_event(
-                subject=subject,
-                start=start_iso,
-                end=end_iso,
-                attendees=attendees or None,
-                location=location or None,
-                timezone=settings.get("timezone", "UTC"),
-                is_online=is_online_meeting,
-            )
-            event_id = result.get("id", "")
-            web_link = result.get("webLink", "")
-            msg = f"✅ Event created: '{subject}' from {start_iso} to {end_iso}"
-            if attendees:
-                msg += f" · Invites sent to: {', '.join(attendees)}"
-            if web_link:
-                state["_last_draft_web_link"] = web_link
-            return msg
-        except Exception as e:
-            return f"Error creating event: {e}"
 
     def run_outreach(context_note: str = "", folder: str = "",
                      tag: str = "", recent_hours: int = 0) -> str:
@@ -1054,120 +980,13 @@ def reply(
             }, ensure_ascii=False)
         return json.dumps({"matches": _with_indices(unique[:8])}, ensure_ascii=False)
 
-    def get_meeting_summary(event_id_or_subject: str) -> str:
-        """Look up a meeting summary. Tries (a) wiki by exact meeting_id or title substring;
-        falls back to (b) live calendar event for unrecorded scheduled meetings (no summary).
-
-        Use when the user asks 'what was discussed in the Q3 meeting?',
-        'summarize my meeting with John', 'recap last week's sync'.
-
-        event_id_or_subject: Graph calendar event id (long), wiki meeting_id (ondrive_*/mock_*),
-                             or any substring of the meeting title."""
-        if not data_dir:
-            return "No data directory available."
-        q = (event_id_or_subject or "").strip()
-        if not q:
-            return "Please provide an event id or subject keyword."
-        q_low = q.lower()
-        q_norm = normalize_subject(q)
-
-        # (1) Wiki search — exact meeting_id or title substring
-        if wiki_dir and wiki_dir.exists():
-            try:
-                idx = load_index(wiki_dir)
-                meetings = idx.get("meetings", {}) or {}
-                # Exact meeting_id match
-                if q in meetings:
-                    full = load_meeting(wiki_dir, q)
-                    if full:
-                        print(f"[Bot] get_meeting_summary({q}) → wiki exact id")
-                        return json.dumps({
-                            "source":      "wiki",
-                            "meeting_id":  q,
-                            "title":       full.get("title", ""),
-                            "date":        full.get("date", ""),
-                            "summary":     full.get("summary", ""),
-                            "decisions":   full.get("decisions", []),
-                            "action_items": full.get("action_items", []),
-                            "attendee_emails": full.get("attendee_emails", []),
-                        }, ensure_ascii=False)
-                # Title substring match
-                for mid, meta in meetings.items():
-                    title = (meta.get("title") or "")
-                    title_low = title.lower()
-                    if q_low in title_low or (q_norm and q_norm in normalize_subject(title)):
-                        full = load_meeting(wiki_dir, mid)
-                        if full:
-                            print(f"[Bot] get_meeting_summary({q}) → wiki title match {mid}")
-                            return json.dumps({
-                                "source":      "wiki",
-                                "meeting_id":  mid,
-                                "title":       full.get("title", ""),
-                                "date":        full.get("date", ""),
-                                "summary":     full.get("summary", ""),
-                                "decisions":   full.get("decisions", []),
-                                "action_items": full.get("action_items", []),
-                                "attendee_emails": full.get("attendee_emails", []),
-                            }, ensure_ascii=False)
-            except Exception as e:
-                print(f"[Bot] wiki lookup failed: {e}")
-
-        # (2) Calendar fallback — scheduled but unrecorded
-        if owner_graph is None:
-            return json.dumps({
-                "source":  "none",
-                "message": f"No wiki meeting matches '{q}', and calendar is not available.",
-            }, ensure_ascii=False)
-        try:
-            now = datetime.now(timezone.utc)
-            start = (now - timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            end = (now + timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            events = owner_graph.get_calendar_view(start, end, top=100)
-            # Exact event.id match
-            evt = next((e for e in events if e.get("id") == q), None)
-            if evt is None:
-                # Subject substring match — most recent first
-                events_sorted = sorted(
-                    events,
-                    key=lambda e: (e.get("start") or {}).get("dateTime", ""),
-                    reverse=True,
-                )
-                for e in events_sorted:
-                    subj = (e.get("subject") or "")
-                    if q_low in subj.lower() or (q_norm and q_norm in normalize_subject(subj)):
-                        evt = e
-                        break
-            if evt:
-                print(f"[Bot] get_meeting_summary({q}) → calendar match")
-                return json.dumps({
-                    "source":   "calendar",
-                    "event_id": evt.get("id", ""),
-                    "subject":  evt.get("subject", ""),
-                    "start":    (evt.get("start") or {}).get("dateTime", ""),
-                    "end":      (evt.get("end") or {}).get("dateTime", ""),
-                    "attendees": [
-                        ((a.get("emailAddress") or {}).get("address") or "")
-                        for a in (evt.get("attendees") or [])
-                    ],
-                    "note": "Meeting has no summary yet — scheduled but not recorded.",
-                }, ensure_ascii=False)
-        except Exception as e:
-            print(f"[Bot] calendar fallback failed: {e}")
-
-        return json.dumps({
-            "source":  "none",
-            "message": f"No wiki record or calendar event matches '{q}'.",
-        }, ensure_ascii=False)
-
     all_tools = _reg_tools + [
         # Query
         get_recent_emails,
-        get_upcoming_meetings,
         get_contact_history,
         find_contacts_by_name,
         get_email_frequency_report,
         check_email_handling,
-        get_meeting_summary,
         # Action
         create_reply_draft,
         list_pending_drafts,
@@ -1175,7 +994,6 @@ def reply(
         skip_draft,
         dismiss_email_followup,
         update_crm_contact,
-        create_calendar_event,
         run_outreach,
         tag_recent_contacts,
         list_my_groups,
