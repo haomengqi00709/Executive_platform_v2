@@ -3,7 +3,7 @@ title: Workflow Tools (Outreach / Draft Composer)
 describes_files:
   - src/modules/outreach.py
   - src/bot.py
-derived_from_commit: 5d17b31
+derived_from_commit: b08e40c
 last_synced: 2026-06-20
 ---
 
@@ -41,6 +41,27 @@ the chat**. The user then:
 
 Only on save is anything written to Outlook. **Nothing is ever sent** — there is no
 send capability; the drafts-only safety boundary holds.
+
+### Conversational behavior rules (system prompt)
+The bot's system prompt encodes a few standing rules, in addition to the [#N] /
+disambiguation / completion-gate rules above:
+- **Act, don't ask** — when it can reasonably proceed it does, then shows the
+  result: it composes a draft from context rather than asking "what should it
+  say"; it auto-books a *solo* calendar block at a sensible default time. A
+  meeting *with other attendees* and a vague time is the exception — it proposes a
+  specific slot and waits, so no invite goes out at a guessed time.
+- **Multiple requests in one message** — "do X and also Y" is handled in full this
+  turn, not just the first half.
+- **[#N] binds by type** — `snooze/mark N` → commitments list, `reply N` → email
+  list, `meeting N` → meetings list, `contact N` → contacts list, regardless of
+  which list was shown most recently.
+- **When it can't** — for actions with no tool (cancel/reschedule a meeting,
+  forward/delete email, out-of-office, SMS, filter a group by role) it says so
+  plainly and offers the closest supported alternative; it never fakes success
+  (creating a new event is not "moving" an existing one).
+- **Empty-response retry** — the agent loop retries a blank (`out=0`) model
+  response a few times before falling back, so a transient blank doesn't surface
+  as "I looked into that but didn't finish".
 
 ## Conversational bot — list & pick, look before you ask
 The Teams bot (`src/bot.py` `reply()`) shares one **[#N] convention** across every
