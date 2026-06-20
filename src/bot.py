@@ -265,10 +265,13 @@ def reply(
         to    = pending_draft.get("to", "")
         extra = f" ({len(pending_queue)} more in queue)" if pending_queue else ""
         pending_note += (
-            f"\n\n⚠️ PENDING EMAIL DRAFT — Subject: '{subj}', To: {to}{extra}. "
-            f"If the user is clearly responding to THIS draft (approve/yes/send/ok) → call approve_draft(). "
-            f"If they clearly want to skip THIS draft (skip/no/not now, with no item numbers) → call skip_draft(). "
-            f"If the user mentions item numbers or commitments, they are NOT responding to the draft — handle accordingly."
+            f"\n\n⚠️ STAGED EMAIL DRAFT (shown to the user, NOT saved yet) — Subject: '{subj}', To: {to}{extra}. "
+            f"Decide what the user's message means for THIS draft:\n"
+            f"  • Save it ('1' / 'save' / 'yes' / 'looks good' / 'save it') → call approve_draft() to save it to Outlook Drafts.\n"
+            f"  • Revise it ('make it warmer', 'add …', 'shorter', 'change the subject') → call create_reply_draft() AGAIN "
+            f"with the updated subject/body to re-stage, then show the new version. Never say you 'can't edit a saved draft' — just re-compose.\n"
+            f"  • Discard it ('no' / 'skip' / 'discard' / 'cancel') → call skip_draft().\n"
+            f"  • If they change topic or reference item numbers from a different list, they are NOT acting on the draft — handle that instead."
         )
 
     if pending_expense:
@@ -786,28 +789,27 @@ def reply(
         return f"🗑️ Skipped: \"{desc}\""
 
     def create_reply_draft(to: str, subject: str, body: str) -> str:
-        """Compose and immediately save a new email draft to Outlook Drafts.
-        Call this when the user asks to draft, write, or compose an email reply.
+        """Compose an email draft and STAGE it for the user to review in Teams — it is
+        NOT saved to Outlook yet. Call this whenever the user asks to draft, write,
+        compose, OR REVISE an email; to revise, call it AGAIN with the updated
+        subject/body and it re-stages the new version (there is no 'editing a saved
+        draft' — you simply re-compose).
         to: recipient email address
-        subject: email subject line (prefix 'Re: ' for replies)
-        body: email body in the user's writing style — do NOT write a sign-off.
-              A signature (user's real one, extracted from sent history) is
-              appended automatically; writing your own creates a double sign-off.
-        IMPORTANT: after this tool succeeds, respond with ONE short sentence only —
-        e.g. 'Done, draft saved to your Outlook Drafts.' Do NOT repeat To/Subject/Body.
-        Do NOT generate any links or URLs yourself — a link is appended automatically."""
-        if owner_graph is None:
-            return "Owner account not available."
-        try:
-            final_body = append_signature_to_body(body, get_user_signature(settings))
-            result = owner_graph.create_draft(to=to, subject=subject, body=final_body)
-            web_link = result.get("webLink", "")
-            print(f"[Bot] create_reply_draft saved → '{subject}'")
-            if web_link:
-                state["_last_draft_web_link"] = web_link
-            return f"✅ Draft saved to Outlook Drafts: '{subject}' to {to}."
-        except Exception as e:
-            return f"Error saving draft: {e}"
+        subject: subject line (prefix 'Re: ' for replies)
+        body: body in the user's writing style — do NOT write a sign-off (a signature
+              is appended automatically when the draft is saved).
+        After this returns, SHOW the user the full draft (To, Subject, and the Body
+        verbatim), then tell them to reply '1' (or 'save') to save it to Outlook
+        Drafts, or to say what to change. Do NOT claim it is saved — it is only saved
+        after the user confirms and approve_draft() runs."""
+        nonlocal state
+        state = {**state, "pending_draft": {"to": to, "subject": subject, "body": body}}
+        print(f"[Bot] create_reply_draft staged → '{subject}' to {to}")
+        return json.dumps({
+            "staged": True, "to": to, "subject": subject, "body": body,
+            "next": "Show the user this draft (To, Subject, Body verbatim). Then ask them to "
+                    "reply '1' or 'save' to save it to Outlook Drafts, or tell you what to change.",
+        }, ensure_ascii=False)
 
     def list_pending_drafts() -> str:
         """List all pending email drafts waiting for approval. Returns JSON with
