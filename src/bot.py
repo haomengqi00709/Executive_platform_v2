@@ -50,9 +50,8 @@ HONEST_FALLBACK = "I looked into that but didn't finish — want me to try again
 # `# Action` block of all_tools in reply() (list_pending_drafts is read-only, so excluded).
 # Keep in sync when adding an action tool — used only for per-turn success telemetry.
 ACTION_TOOLS = frozenset({
-    "mark_commitment_done", "snooze_commitment", "dismiss_commitment",
     "create_reply_draft", "approve_draft", "skip_draft",
-    "confirm_expense", "discard_expense", "dismiss_email_followup",
+    "dismiss_email_followup",
     "update_crm_contact", "create_calendar_event", "run_outreach",
     "tag_recent_contacts",
     "draft_group_email", "confirm_group_email", "cancel_group_email",
@@ -385,8 +384,6 @@ def reply(
         f"                               Always pair with section_id. First read_skill_instruction, then append new rule.\n"
         f"                               After updating, call run_skill(section_id) so changes take effect immediately.\n"
         f"  run_skill                  → 'run morning briefing now', 'refresh my emails section'\n"
-        f"  dismiss_commitment         → 'skip 2', 'skip 3 4', 'skip 2 3 4' — skip means permanent dismiss\n"
-        f"  snooze_commitment          → 'snooze 2', 'remind me in 3 days about 3', 'snooze 2 3 4 for 5 days'\n"
         f"  create_reply_draft         → 'draft a reply to X', 'write an email to Y', 'compose a response'\n"
         f"                               The target email is usually ALREADY in your context (the Reply-needed\n"
         f"                               list, your most recent get_recent_emails output, or a pending draft shown\n"
@@ -394,7 +391,6 @@ def reply(
         f"                               it isn't already visible, then compose the full body and save. Do NOT chain\n"
         f"                               several read tools before drafting. Draft saves immediately — no approval.\n"
         f"  approve_draft / skip_draft → only when a pending draft is shown above\n"
-        f"  confirm_expense / discard_expense → only when a pending expense is shown above\n"
         f"  update_crm_contact         → 'mark X as high priority', 'add note to Sarah', 'set company for John'\n"
         f"  create_calendar_event      → 'schedule meeting with X', 'block my calendar Friday', 'create Teams call'\n"
         f"  run_outreach               → 'draft outreach for the people I met at X', 'batch email contacts from OneDrive folder', 'draft outreach for everyone tagged Y'\n"
@@ -713,105 +709,6 @@ def reply(
 
     # --- Action tools ---
 
-    def _resolve_commitment(index_or_hint: str) -> tuple[str | None, str]:
-        """Return (commitment_id, description) by 1-based index or keyword match."""
-        try:
-            path = data_dir / "results" / "commitments_extract.json"
-            if not path.exists():
-                return None, ""
-            data = json.loads(path.read_text())
-            items = data.get("items", [])
-            try:
-                idx = int(index_or_hint) - 1
-                if 0 <= idx < len(items):
-                    return items[idx]["id"], items[idx].get("description", "")
-            except ValueError:
-                hint = index_or_hint.lower()
-                for item in items:
-                    if hint in (item.get("description") or "").lower():
-                        return item["id"], item.get("description", "")
-        except Exception:
-            pass
-        return None, ""
-
-    def mark_commitment_done(index_or_hint: str) -> str:
-        """Mark a commitment as completed so it no longer appears in the commitments list.
-        index_or_hint: the number shown in the commitments list (e.g. "2"), or a keyword from the description.
-        Use "all" to mark everything currently flagged as stale as done."""
-        from src.modules.commitments_state import mark_done as _mark_done, load_state as _load_state
-        if index_or_hint.strip().lower() == "all":
-            state = _load_state(data_dir)
-            asked_ids = list(state.get("asked", {}).keys())
-            for cid in asked_ids:
-                _mark_done(data_dir, cid, method="user")
-            print(f"[Bot] mark_commitment_done(all) → {len(asked_ids)} items")
-            return f"✅ Marked {len(asked_ids)} commitments as done."
-        cid, desc = _resolve_commitment(index_or_hint)
-        if not cid:
-            return f"⚠️ Couldn't find commitment '{index_or_hint}'. Run commitments_extract first."
-        _mark_done(data_dir, cid, method="user")
-        print(f"[Bot] mark_commitment_done({index_or_hint!r}) → {cid}")
-        return f"✅ Done: \"{desc}\""
-
-    def snooze_commitment(index_or_hint: str, days: int = 3) -> str:
-        """Snooze one or more commitments — hide them for N days, then resurface automatically.
-        index_or_hint: single number, space/comma-separated numbers ("2 3 4"), or keyword.
-        days: how many days to snooze (default 3)."""
-        from src.modules.commitments_state import mark_snoozed as _mark_snoozed
-        from datetime import date, timedelta
-        # Support multiple indices: "2 3 4" or "2,3,4"
-        tokens = [t.strip() for t in index_or_hint.replace(",", " ").split() if t.strip()]
-        if len(tokens) > 1 and all(t.isdigit() for t in tokens):
-            snoozed = []
-            for t in tokens:
-                cid, desc = _resolve_commitment(t)
-                if cid:
-                    _mark_snoozed(data_dir, cid, days=days)
-                    snoozed.append(desc)
-            if not snoozed:
-                return f"⚠️ Couldn't find commitments '{index_or_hint}'."
-            until = (date.today() + timedelta(days=days)).strftime("%B %d")
-            print(f"[Bot] snooze_commitment({tokens}, {days}d)")
-            return f"⏰ Snoozed {len(snoozed)} commitments until {until}."
-        cid, desc = _resolve_commitment(index_or_hint)
-        if not cid:
-            return f"⚠️ Couldn't find commitment '{index_or_hint}'."
-        _mark_snoozed(data_dir, cid, days=days)
-        print(f"[Bot] snooze_commitment({index_or_hint!r}, {days}d) → {cid}")
-        until = (date.today() + timedelta(days=days)).strftime("%B %d")
-        return f"⏰ Snoozed until {until}: \"{desc}\""
-
-    def dismiss_commitment(index_or_hint: str) -> str:
-        """Permanently remove one or more commitments — they will never appear again.
-        Use for 'skip X', 'skip 2 3 4', or when a commitment is cancelled/irrelevant.
-        index_or_hint: number, space/comma-separated numbers ("2 3 4"), keyword, or "all"."""
-        from src.modules.commitments_state import mark_done as _mark_done, load_state as _load_state
-        if index_or_hint.strip().lower() == "all":
-            state = _load_state(data_dir)
-            asked_ids = list(state.get("asked", {}).keys())
-            for cid in asked_ids:
-                _mark_done(data_dir, cid, method="user_dismissed")
-            return f"✅ Dismissed {len(asked_ids)} commitments."
-        # Support multiple indices: "2 3 4" or "2,3,4"
-        tokens = [t.strip() for t in index_or_hint.replace(",", " ").split() if t.strip()]
-        if len(tokens) > 1 and all(t.isdigit() for t in tokens):
-            dismissed = []
-            for t in tokens:
-                cid, desc = _resolve_commitment(t)
-                if cid:
-                    _mark_done(data_dir, cid, method="user_dismissed")
-                    dismissed.append(desc)
-            if not dismissed:
-                return f"⚠️ Couldn't find commitments '{index_or_hint}'."
-            print(f"[Bot] dismiss_commitment({tokens})")
-            return f"🗑️ Skipped {len(dismissed)} commitments."
-        cid, desc = _resolve_commitment(index_or_hint)
-        if not cid:
-            return f"⚠️ Couldn't find commitment '{index_or_hint}'."
-        _mark_done(data_dir, cid, method="user_dismissed")
-        print(f"[Bot] dismiss_commitment({index_or_hint!r}) → {cid}")
-        return f"🗑️ Skipped: \"{desc}\""
-
     def create_reply_draft(to: str, subject: str, body: str) -> str:
         """Compose an email draft and STAGE it for the user to review in Teams — it is
         NOT saved to Outlook yet. ALWAYS compose your best version from context (the
@@ -901,37 +798,6 @@ def reply(
         print(f"[Bot] skip_draft → '{draft.get('subject')}'")
         nxt = f"\n\nNext draft ready: '{next_draft.get('subject')}'" if next_draft else ""
         return f"Skipped: '{draft.get('subject')}'{nxt}"
-
-    def confirm_expense() -> str:
-        """Confirm and record the pending duplicate expense as a new entry."""
-        pending = state.get("pending_expense")
-        if not pending:
-            return "No pending expense to confirm."
-        try:
-            import openpyxl
-            from pathlib import Path as _Path
-            master_file  = _Path(pending["master_file"])
-            expenses_dir = _Path(pending["expenses_dir"])
-            hashes_file  = _Path(pending["hashes_file"]) if pending.get("hashes_file") else None
-
-            expenses_dir.mkdir(parents=True, exist_ok=True)
-            from src.modules.m05_expense import _append_row, _init_workbook, _load_hashes, _save_hashes
-            wb = openpyxl.load_workbook(master_file) if master_file.exists() else _init_workbook()
-            _append_row(wb.active, pending["new_row"])
-            wb.save(master_file)
-            if hashes_file and pending.get("hash") and not pending.get("is_hash_dup"):
-                hashes = _load_hashes(hashes_file)
-                hashes[pending["hash"]] = pending["new_row"].get("Attachment", "")
-                _save_hashes(hashes, hashes_file)
-            state["pending_expense"] = None
-            return "✅ Expense recorded as a new entry."
-        except Exception as e:
-            return f"Error confirming expense: {e}"
-
-    def discard_expense() -> str:
-        """Discard the pending duplicate expense without recording it."""
-        state["pending_expense"] = None
-        return "Expense discarded."
 
     def update_crm_contact(email: str, field: str, value: str) -> str:
         """Update a field on a CRM contact. Creates the contact if it doesn't exist.
@@ -1444,15 +1310,10 @@ def reply(
         # Trigger
         run_skill,
         # Action
-        mark_commitment_done,
-        snooze_commitment,
-        dismiss_commitment,
         create_reply_draft,
         list_pending_drafts,
         approve_draft,
         skip_draft,
-        confirm_expense,
-        discard_expense,
         dismiss_email_followup,
         update_crm_contact,
         create_calendar_event,
