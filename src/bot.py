@@ -309,12 +309,17 @@ def reply(
         f"  Tool outputs already include an `index` field and a canonical ID\n"
         f"  (email_id / event_id / draft_id / id / etc.) on each item.\n\n"
         f"  When the user later says \"#N\", \"number N\", or just \"N\" referring to a list,\n"
-        f"  look up item N in the MOST RECENT list-returning tool output above in this\n"
-        f"  conversation. Read its canonical ID from the JSON and pass that ID (or the\n"
-        f"  to/subject/etc fields off that item) into the action tool. NEVER retype\n"
-        f"  subjects, recipients, or names from memory — copy them from the JSON output.\n\n"
-        f"  If the user says #N but no recent list is visible in this conversation,\n"
-        f"  ask which list they mean (or re-run the appropriate read tool first).\n\n"
+        f"  resolve it against the most recent list whose TYPE matches the action — NOT simply\n"
+        f"  whatever list was shown most recently:\n"
+        f"    - snooze/skip/dismiss/mark/done N  → your most recent COMMITMENTS list\n"
+        f"    - reply to / draft N               → your most recent EMAIL list\n"
+        f"    - meeting N / who's in N           → your most recent MEETINGS list\n"
+        f"    - schedule with / contact N        → your most recent CONTACTS list\n"
+        f"  even if a different kind of list was shown after it. For commitment index operations\n"
+        f"  just call the commitment tool with N (it resolves against the commitments list).\n"
+        f"  Read the canonical ID off that item's JSON and pass it (or its to/subject fields)\n"
+        f"  into the action tool — NEVER retype subjects, recipients, or names from memory.\n"
+        f"  If no list of the matching type is visible, re-run the appropriate read tool first.\n\n"
         f"DISAMBIGUATION — LOOK BEFORE YOU ASK:\n"
         f"  When the user names a person/target for an action (schedule a meeting, draft, email\n"
         f"  someone) and you don't already have the exact one, you must LOOK FIRST — call the\n"
@@ -324,6 +329,33 @@ def reply(
         f"      which one; the user picks by number. NEVER reply a vague 'I found a few named X,\n"
         f"      please specify' WITHOUT first looking them up and listing them.\n"
         f"    - no match           → say so and ask for the email.\n\n"
+        f"ACT, DON'T ASK (when you can reasonably proceed):\n"
+        f"  - Drafting an email: if you know the recipient and the gist, COMPOSE your best draft\n"
+        f"    NOW from context (the email thread, the user's writing style, the stated intent) and\n"
+        f"    stage it — drafts are shown for review and are fully editable, so asking 'what should\n"
+        f"    it say?' is unnecessary and unwanted. Only ask if you genuinely don't know WHO it\n"
+        f"    goes to. 'draft a reply to X's email' → draft it; don't ask for the body.\n"
+        f"  - Scheduling a SOLO block (no other attendees) with a vague time: pick a sensible\n"
+        f"    default (morning→09:00, afternoon→14:00, 30 min unless stated; nearest matching day),\n"
+        f"    CREATE it, and tell the user the slot so they can move it. Don't ask for a time you\n"
+        f"    can reasonably default.\n"
+        f"  - Scheduling a meeting WITH other attendees and a vague time: do NOT guess-and-invite.\n"
+        f"    PROPOSE a specific slot ('I'll set it for Mon 9:00–9:30 with X — sound good?') and\n"
+        f"    create it only after the user confirms, so a real invite never goes out at a guessed\n"
+        f"    time. If the time is already specific, just create it.\n"
+        f"  - In general prefer doing-then-showing over interrogating; the user can correct you.\n\n"
+        f"MULTIPLE REQUESTS IN ONE MESSAGE:\n"
+        f"  If the user asks for more than one thing ('do X and also Y', 'A and B'), handle ALL of\n"
+        f"  them THIS turn — call each needed tool in sequence — then give one combined reply.\n"
+        f"  Never address only the first and silently drop the rest. If one part needs the user,\n"
+        f"  do the parts you can and clearly state what is still pending.\n\n"
+        f"WHEN YOU CAN'T DO SOMETHING:\n"
+        f"  If the user asks for an action you have NO tool for (cancel or reschedule a calendar\n"
+        f"  event, forward or delete an email, set out-of-office, send a text, filter a group by\n"
+        f"  role), say plainly you can't, and offer the closest thing you CAN do (e.g. 'I can't\n"
+        f"  move calendar events, but I can draft a reschedule note'; 'I can't filter by role —\n"
+        f"  here are the members, tell me who to include'). NEVER fake success or claim you did\n"
+        f"  something you didn't — creating a NEW event is not 'moving' an existing one.\n\n"
         f"TOOL ROUTING:\n"
         f"  get_recent_emails          → 'show my emails', 'what did X send', 'unread messages'\n"
         f"  get_upcoming_meetings      → 'what meetings do I have', 'who is in my next call'\n"
@@ -790,8 +822,10 @@ def reply(
 
     def create_reply_draft(to: str, subject: str, body: str) -> str:
         """Compose an email draft and STAGE it for the user to review in Teams — it is
-        NOT saved to Outlook yet. Call this whenever the user asks to draft, write,
-        compose, OR REVISE an email; to revise, call it AGAIN with the updated
+        NOT saved to Outlook yet. ALWAYS compose your best version from context (the
+        thread, writing style, the user's stated intent) right away — do NOT ask 'what
+        should it say'; the user refines after seeing it. Call this whenever the user
+        asks to draft, write, compose, OR REVISE an email; to revise, call it AGAIN with the updated
         subject/body and it re-stages the new version (there is no 'editing a saved
         draft' — you simply re-compose).
         to: recipient email address
@@ -1465,18 +1499,26 @@ def reply(
         nonlocal total_rounds
         for _j in range(max_rounds):
             total_rounds += 1
-            response = client.models.generate_content(
-                model   = MODEL,
-                contents= contents,
-                config  = types.GenerateContentConfig(
-                    system_instruction = system,
-                    tools              = all_tools,
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                ),
-            )
-            _record_bot_usage(response, "bot")
-            candidate  = response.candidates[0] if response.candidates else None
-            parts      = (candidate.content.parts if candidate and candidate.content else None) or []
+            # Gemini intermittently returns an empty candidate (out=0, no parts) under load.
+            # Retry a few times before treating it as 'no output', so a transient blank doesn't
+            # surface to the user as a hollow "I looked into that but didn't finish" fallback.
+            parts = []
+            for _attempt in range(3):
+                response = client.models.generate_content(
+                    model   = MODEL,
+                    contents= contents,
+                    config  = types.GenerateContentConfig(
+                        system_instruction = system,
+                        tools              = all_tools,
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                    ),
+                )
+                _record_bot_usage(response, "bot")
+                candidate = response.candidates[0] if response.candidates else None
+                parts     = (candidate.content.parts if candidate and candidate.content else None) or []
+                if parts:
+                    break
+                print(f"[Bot] empty model response (attempt {_attempt + 1}/3) — retrying")
             fn_calls   = [p for p in parts if p.function_call]
             text_parts = [p.text for p in parts if p.text]
             if not fn_calls:
