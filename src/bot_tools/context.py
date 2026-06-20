@@ -20,3 +20,5 @@ class BotContext:
     settings: dict
     data_dir: Path
     wiki_dir: Path
+    user_model: dict = None       # ignored_senders / behavioral_rules / …; mutate in place
+    user_model_path: Path = None
