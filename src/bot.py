@@ -19,6 +19,8 @@ from src.modules.db_helpers import open_sqlite
 from src.modules.profile import load_profile_context, get_user_signature, append_signature_to_body
 from src.modules.subject_match import normalize_subject
 from src.modules.wiki import load_index, load_meeting
+from src.bot_tools.context import BotContext
+from src.bot_tools import registry
 
 MODEL        = DEFAULT_GEMINI_MODEL
 
@@ -225,6 +227,13 @@ def reply(
     history    = _load_history(db_path)
     user_model = _load_user_model(user_model_path)
 
+    # Migrated tools live in src/bot_tools/<domain>/<tool>/ and bind to a context
+    # sharing this turn's mutable `state`. Tools still defined inline below are merged
+    # with these in `all_tools`; their routing lines are appended to TOOL ROUTING.
+    _ctx = BotContext(state=state, owner_graph=owner_graph, graph=graph,
+                      settings=settings, data_dir=data_dir, wiki_dir=wiki_dir)
+    _reg_tools, _reg_actions, _reg_routing = registry.build(_ctx)
+
     # ── System prompt ──────────────────────────────────────
     display_name     = settings.get("display_name", "the executive")
     business_context  = load_profile_context(data_dir)
@@ -393,7 +402,8 @@ def reply(
         f"  draft_group_email          → 'draft/write an email about X to the GROUP/everyone tagged Y' — personalized per contact, draft-only; stages first, then confirm_group_email after the user agrees\n"
         f"                               Three modes (pick one): folder= (OneDrive), tag= (CRM by tag), recent_hours= (CRM by recency)\n"
         f"  tag_recent_contacts        → 'tag everyone I just added as X', 'group these contacts as Calgary Summit 2026'\n\n"
-        f"AVAILABLE SECTIONS (use these exact section_id values for run_skill, "
+        + "".join(_reg_routing)
+        + f"AVAILABLE SECTIONS (use these exact section_id values for run_skill, "
         f"read_skill_instruction, update_skill_instruction):\n"
         + "".join(
             f"  {sid:30s} → {desc.split(' — ', 1)[1] if ' — ' in desc else desc}\n"
@@ -594,24 +604,6 @@ def reply(
             return json.dumps(data, ensure_ascii=False)
         except Exception as e:
             return f"Error reading {section_id}: {e}"
-
-    def search_web(query: str) -> str:
-        """Search the web for current news, market data, or any information not in the user's inbox/calendar."""
-        try:
-            client = _client()
-            resp   = client.models.generate_content(
-                model=MODEL,
-                contents=query,
-                config=types.GenerateContentConfig(
-                    tools=[types.Tool(google_search=types.GoogleSearch())],
-                ),
-            )
-            _record_bot_usage(resp, "bot_search", is_search=True)
-            result = resp.text or "No results found."
-            print(f"[Bot] search_web → {len(result)} chars")
-            return result
-        except Exception as e:
-            return f"Search error: {e}"
 
     # --- Config tools ---
 
@@ -836,8 +828,7 @@ def reply(
         verbatim), then tell them to reply '1' (or 'save') to save it to Outlook
         Drafts, or to say what to change. Do NOT claim it is saved — it is only saved
         after the user confirms and approve_draft() runs."""
-        nonlocal state
-        state = {**state, "pending_draft": {"to": to, "subject": subject, "body": body}}
+        state["pending_draft"] = {"to": to, "subject": subject, "body": body}
         print(f"[Bot] create_reply_draft staged → '{subject}' to {to}")
         return json.dumps({
             "staged": True, "to": to, "subject": subject, "body": body,
@@ -850,7 +841,6 @@ def reply(
         `index` per item — index 1 is the CURRENT draft (the one approve_draft /
         skip_draft will act on), indices 2+ are the queued drafts behind it.
         Each item carries `to`, `subject`, `body` (truncated)."""
-        nonlocal state
         queue   = list(state.get("pending_queue") or [])
         current = state.get("pending_draft")
         if not current and not queue:
@@ -873,7 +863,6 @@ def reply(
 
     def approve_draft() -> str:
         """Approve and save the current pending email draft to the user's Outlook Drafts folder."""
-        nonlocal state
         draft = state.get("pending_draft")
         if not draft:
             return "No pending draft to approve."
@@ -888,7 +877,8 @@ def reply(
             )
             queue      = list(state.get("pending_queue") or [])
             next_draft = queue[0] if queue else None
-            state = {**state, "pending_draft": next_draft, "pending_queue": queue[1:] if queue else []}
+            state["pending_draft"] = next_draft
+            state["pending_queue"] = queue[1:] if queue else []
             print(f"[Bot] approve_draft → '{draft.get('subject')}'")
             web_link = result.get("webLink", "")
             nxt = f"\n\nNext draft ready: '{next_draft.get('subject')}'" if next_draft else ""
@@ -901,20 +891,19 @@ def reply(
 
     def skip_draft() -> str:
         """Skip/dismiss the current pending email draft without saving it."""
-        nonlocal state
         draft = state.get("pending_draft")
         if not draft:
             return "No pending draft to skip."
         queue      = list(state.get("pending_queue") or [])
         next_draft = queue[0] if queue else None
-        state = {**state, "pending_draft": next_draft, "pending_queue": queue[1:] if queue else []}
+        state["pending_draft"] = next_draft
+        state["pending_queue"] = queue[1:] if queue else []
         print(f"[Bot] skip_draft → '{draft.get('subject')}'")
         nxt = f"\n\nNext draft ready: '{next_draft.get('subject')}'" if next_draft else ""
         return f"Skipped: '{draft.get('subject')}'{nxt}"
 
     def confirm_expense() -> str:
         """Confirm and record the pending duplicate expense as a new entry."""
-        nonlocal state
         pending = state.get("pending_expense")
         if not pending:
             return "No pending expense to confirm."
@@ -934,15 +923,14 @@ def reply(
                 hashes = _load_hashes(hashes_file)
                 hashes[pending["hash"]] = pending["new_row"].get("Attachment", "")
                 _save_hashes(hashes, hashes_file)
-            state = {**state, "pending_expense": None}
+            state["pending_expense"] = None
             return "✅ Expense recorded as a new entry."
         except Exception as e:
             return f"Error confirming expense: {e}"
 
     def discard_expense() -> str:
         """Discard the pending duplicate expense without recording it."""
-        nonlocal state
-        state = {**state, "pending_expense": None}
+        state["pending_expense"] = None
         return "Expense discarded."
 
     def update_crm_contact(email: str, field: str, value: str) -> str:
@@ -1100,7 +1088,6 @@ def reply(
         'email everyone tagged Clients about Y'. After calling this, relay the
         returned text to the user and WAIT — do not call confirm_group_email until
         the user agrees."""
-        nonlocal state
         if not data_dir:
             return "No data directory available."
         try:
@@ -1126,10 +1113,10 @@ def reply(
 
             emails = [c["email"].strip() for c in valid]
             names  = [c.get("name") or c["email"] for c in valid]
-            state = {**state, "pending_group_email": {
+            state["pending_group_email"] = {
                 "tag": tag, "intent": message, "context_note": context_note,
                 "emails": emails, "names": names,
-            }}
+            }
             shown = ", ".join(names[:10]) + (f", and {len(names) - 10} more" if len(names) > 10 else "")
             return (f"I'll draft a personalized email about '{message}' to the {len(emails)} "
                     f"people in '{tag}': {shown}. Reply 'go ahead' to create the drafts — "
@@ -1142,7 +1129,6 @@ def reply(
         personalized drafts. Runs in the background and pings the user in Teams when
         the drafts are in their Outlook Drafts. NEVER sends — drafts only. Only call
         when a group email is staged and the user agreed (go ahead / yes / do it)."""
-        nonlocal state
         pending = state.get("pending_group_email")
         if not pending:
             return "There's no group email staged right now."
@@ -1151,7 +1137,7 @@ def reply(
         intent = pending.get("intent", "")
         cnote  = pending.get("context_note", "")
         emails = list(pending.get("emails") or [])
-        state = {**state, "pending_group_email": None}
+        state["pending_group_email"] = None
         if not emails:
             return "That staged group email had no recipients — cleared it."
 
@@ -1202,11 +1188,10 @@ def reply(
     def cancel_group_email() -> str:
         """Cancel the staged group email without creating any drafts. Call when a
         group email is staged and the user backs out (cancel / no / never mind)."""
-        nonlocal state
         if not state.get("pending_group_email"):
             return "There's no group email staged to cancel."
         tag = (state.get("pending_group_email") or {}).get("tag", "")
-        state = {**state, "pending_group_email": None}
+        state["pending_group_email"] = None
         return f"Cancelled the group email{f' to {tag}' if tag else ''}."
 
     def tag_recent_contacts(tag: str, hours: int = 24) -> str:
@@ -1441,7 +1426,7 @@ def reply(
             "message": f"No wiki record or calendar event matches '{q}'.",
         }, ensure_ascii=False)
 
-    all_tools = [
+    all_tools = _reg_tools + [
         # Query
         get_recent_emails,
         get_upcoming_meetings,
@@ -1451,7 +1436,6 @@ def reply(
         read_module_result,
         check_email_handling,
         get_meeting_summary,
-        search_web,
         # Config
         read_settings,
         update_setting,
@@ -1485,6 +1469,7 @@ def reply(
     client   = _client()
     contents = list(history) + [types.Content(role="user", parts=[types.Part(text=text)])]
     fn_map   = {f.__name__: f for f in all_tools}
+    _action_set = set(ACTION_TOOLS) | _reg_actions   # inline frozenset + migrated tools
 
     final_text     = ""
     tools_called   = []
@@ -1535,7 +1520,7 @@ def reply(
                     result = f"Tool error: {e}"
                 print(f"[Bot] ← {str(result)[:150]}")
                 tools_called.append(fc.name)
-                if fc.name in ACTION_TOOLS:
+                if fc.name in _action_set:
                     ok = isinstance(result, str) and not result.startswith(
                         ("Error", "⚠️", "Owner account", "No pending",
                          "Unknown tool", "Tool error", "Couldn't"))
