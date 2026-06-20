@@ -230,7 +230,8 @@ def reply(
     # sharing this turn's mutable `state`. Tools still defined inline below are merged
     # with these in `all_tools`; their routing lines are appended to TOOL ROUTING.
     _ctx = BotContext(state=state, owner_graph=owner_graph, graph=graph,
-                      settings=settings, data_dir=data_dir, wiki_dir=wiki_dir)
+                      settings=settings, data_dir=data_dir, wiki_dir=wiki_dir,
+                      user_model=user_model, user_model_path=user_model_path)
     _reg_tools, _reg_actions, _reg_routing = registry.build(_ctx)
 
     # ── System prompt ──────────────────────────────────────
@@ -602,66 +603,6 @@ def reply(
             return f"Error reading {section_id}: {e}"
 
     # --- Config tools ---
-
-    def read_settings(key: str = None) -> str:
-        """Read current settings and user preferences. Optionally pass a key to get one value.
-        Top-level keys include: display_name, timezone, check_interval_hours.
-        Business profile and market segments live in profile/business_profile.md and profile/market_segments.md.
-        User model keys include: ignored_senders, behavioral_rules, key_relationships."""
-        combined = {**settings, "user_model": user_model}
-        if key:
-            if key in settings:
-                return json.dumps({key: settings[key]}, ensure_ascii=False)
-            if key in user_model:
-                return json.dumps({key: user_model[key]}, ensure_ascii=False)
-            return f"Key '{key}' not found in settings or user model."
-        print(f"[Bot] read_settings()")
-        return json.dumps(combined, ensure_ascii=False)
-
-    def update_setting(key: str, value: str) -> str:
-        """Update a user preference. Writes to user_model.json.
-        Supported keys: ignored_senders (JSON list of emails), behavioral_rules (JSON list of strings),
-        key_relationships (JSON dict of email→note), check_interval_hours (number as string),
-        briefing_style (string),
-        email_digest_interval_hours (number as string, 0=disable digest, default 2),
-        email_realtime_push (true/false — whether priority emails push immediately).
-        Pass lists/dicts as JSON strings, e.g. '["a@b.com"]'."""
-        nonlocal user_model
-        import json as _j
-        try:
-            parsed = _j.loads(value)
-        except Exception:
-            parsed = value
-        user_model = {**user_model, key: parsed}
-        _save_user_model(user_model_path, user_model)
-        print(f"[Bot] update_setting({key}={parsed!r})")
-        return f"✅ Preference updated: {key}"
-
-    def read_skill_instruction(section_id: str) -> str:
-        """Read the current custom instructions for a section. Always call this BEFORE updating,
-        so you can append new rules rather than overwrite existing ones.
-
-        section_id must be one of:
-          ai_summary           — Morning Briefing (daily summary of calendar, emails, priorities)
-          market_intelligence  — Market Intelligence (industry news, competitor updates)
-          company_intelligence — Company Intelligence (targeted signals on monitored companies)
-          reply_needed         — Emails Awaiting Reply (inbox emails waiting for your response)
-          followup_needed      — Sent — No Response (emails you sent, other party hasn't replied)
-          commitments_extract  — Commitments Extracted (promises and deadlines from emails)
-          upcoming_commitments — Upcoming Commitments (deadlines and commitments in next 2 weeks)
-          recent_meetings      — Recent Meetings (summaries from recorded meetings)
-          meeting_action_items — Meeting Action Items (open action items from meetings)
-          relationship_health  — Relationship Health (health scores for key business contacts)
-          business_insights    — Business Insights (AI analysis of business patterns)
-          expenses             — Expense Capture (receipts and invoices)
-          email_monitor        — Email Monitor Triage (rules for priority/review/skip classification)
-        """
-        if section_id not in SECTION_IDS:
-            return f"Unknown section '{section_id}'. Available: {', '.join(SECTION_IDS)}"
-        path = data_dir / "instructions" / f"{section_id}.md"
-        content = path.read_text().strip() if path.exists() else ""
-        print(f"[Bot] read_skill_instruction({section_id})")
-        return content if content else "(no custom instructions yet)"
 
     def update_skill_instruction(section_id: str, content: str) -> str:
         """Update the custom instructions for a section. These instructions override the default
@@ -1303,9 +1244,6 @@ def reply(
         check_email_handling,
         get_meeting_summary,
         # Config
-        read_settings,
-        update_setting,
-        read_skill_instruction,
         update_skill_instruction,
         # Trigger
         run_skill,
