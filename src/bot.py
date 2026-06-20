@@ -52,9 +52,8 @@ HONEST_FALLBACK = "I looked into that but didn't finish — want me to try again
 ACTION_TOOLS = frozenset({
     "create_reply_draft", "approve_draft", "skip_draft",
     "dismiss_email_followup",
-    "update_crm_contact", "run_outreach",
-    "tag_recent_contacts",
-    "draft_group_email", "confirm_group_email", "cancel_group_email",
+    "run_outreach",
+    "cancel_group_email",
 })
 
 
@@ -548,24 +547,6 @@ def reply(
         nxt = f"\n\nNext draft ready: '{next_draft.get('subject')}'" if next_draft else ""
         return f"Skipped: '{draft.get('subject')}'{nxt}"
 
-    def update_crm_contact(email: str, field: str, value: str) -> str:
-        """Update a field on a CRM contact. Creates the contact if it doesn't exist.
-        Fields:
-          priority    — high / medium / low / none
-          notes       — free text, APPENDED with date stamp (not overwritten)
-          company     — company name string
-          name        — display name string
-          ignore      — true / false (blocks email notifications from this sender)
-        Use get_contact_history first to confirm the correct email address."""
-        if not data_dir:
-            return "No data directory available."
-        try:
-            from src.modules.crm import update_contact
-            contact = update_contact(data_dir, email, field, value)
-            return f"✅ Updated {field} for {email}: {value}"
-        except Exception as e:
-            return f"Error updating CRM contact: {e}"
-
     def run_outreach(context_note: str = "", folder: str = "",
                      tag: str = "", recent_hours: int = 0) -> str:
         """Batch-generate personalized email drafts. Three modes — use ONE:
@@ -613,153 +594,6 @@ def reply(
         except Exception as e:
             return f"Error running outreach: {e}"
 
-    def list_my_groups() -> str:
-        """List the user's contact groups (CRM tags) and how many contacts each
-        has. Use when the user asks 'what groups do I have?' or to help them pick
-        a group before a group email."""
-        if not data_dir:
-            return "No data directory available."
-        from src.modules.crm import list_groups
-        groups = list_groups(data_dir)
-        if not groups:
-            return ("You don't have any contact groups yet. Tag contacts in the CRM "
-                    "(or use 'Save as group' after selecting people) to create one.")
-        return json.dumps({"groups": _with_indices(groups)}, ensure_ascii=False)
-
-    def list_group_members(group: str) -> str:
-        """List the contacts in a CRM group (tag) — name, email, company — so the
-        user can confirm who would receive a group email. Use when they ask
-        'who's in group X?' or 'show me the X group'."""
-        if not data_dir:
-            return "No data directory available."
-        from src.modules.crm import resolve_group
-        res = resolve_group(data_dir, group)
-        if res["mode"] == "none":
-            groups = res["all_groups"]
-            if not groups:
-                return f"You don't have any groups yet, so there's no group '{group}'."
-            listing = ", ".join(f"{g['tag']} ({g['count']})" for g in groups[:20])
-            return f"No group named '{group}'. Your groups are: {listing}."
-        if res["mode"] == "substring" and len(res["candidate_tags"]) > 1:
-            cands = ", ".join(f"{g['tag']} ({g['count']})" for g in res["candidate_tags"])
-            return f"'{group}' matches several groups: {cands}. Which one?"
-        tag = res["matched_tag"] or res["candidate_tags"][0]["tag"]
-        members = [{"name": c.get("name") or c.get("email"), "email": c.get("email"),
-                    "company": c.get("company", "")} for c in res["contacts"]]
-        return json.dumps({"group": tag, "count": len(members),
-                           "members": _with_indices(members)}, ensure_ascii=False)
-
-    def draft_group_email(group: str, message: str, context_note: str = "") -> str:
-        """Stage a personalized bulk email to a CRM group (a CRM tag). Does NOT
-        create drafts yet — it resolves the group, shows exactly who will receive
-        it, and waits for the user to confirm.
-
-        group:   the group/tag name the user named, e.g. 'Investors', 'Clients'.
-        message: what the email is about, in the user's words, e.g. 'the Q3 roadmap
-                 and our new pricing'. Becomes the core message of every draft.
-        context_note: optional extra context for the drafter (rarely needed).
-
-        Use when the user says 'draft an email about X to the Investors group' or
-        'email everyone tagged Clients about Y'. After calling this, relay the
-        returned text to the user and WAIT — do not call confirm_group_email until
-        the user agrees."""
-        if not data_dir:
-            return "No data directory available."
-        try:
-            from src.modules.crm import resolve_group
-            res = resolve_group(data_dir, group)
-
-            if res["mode"] == "none":
-                groups = res["all_groups"]
-                if not groups:
-                    return f"You don't have any contact groups yet, so there's no group named '{group}'."
-                listing = ", ".join(f"{g['tag']} ({g['count']})" for g in groups[:20])
-                return f"I couldn't find a group named '{group}'. Your groups are: {listing}. Which one did you mean?"
-
-            if res["mode"] == "substring" and len(res["candidate_tags"]) > 1:
-                cands = ", ".join(f"{g['tag']} ({g['count']})" for g in res["candidate_tags"])
-                return f"'{group}' matches several groups: {cands}. Which one should I draft to?"
-
-            tag = res["matched_tag"] or res["candidate_tags"][0]["tag"]
-            valid = [c for c in res["contacts"]
-                     if (c.get("email") or "").strip() and "@" in (c.get("email") or "")]
-            if not valid:
-                return f"The group '{tag}' has no contacts with a usable email address."
-
-            emails = [c["email"].strip() for c in valid]
-            names  = [c.get("name") or c["email"] for c in valid]
-            state["pending_group_email"] = {
-                "tag": tag, "intent": message, "context_note": context_note,
-                "emails": emails, "names": names,
-            }
-            shown = ", ".join(names[:10]) + (f", and {len(names) - 10} more" if len(names) > 10 else "")
-            return (f"I'll draft a personalized email about '{message}' to the {len(emails)} "
-                    f"people in '{tag}': {shown}. Reply 'go ahead' to create the drafts — "
-                    f"they'll go to your Outlook Drafts to review, and nothing sends automatically.")
-        except Exception as e:
-            return f"Error preparing group email: {e}"
-
-    def confirm_group_email() -> str:
-        """Confirm the staged group email (from draft_group_email) and create the
-        personalized drafts. Runs in the background and pings the user in Teams when
-        the drafts are in their Outlook Drafts. NEVER sends — drafts only. Only call
-        when a group email is staged and the user agreed (go ahead / yes / do it)."""
-        pending = state.get("pending_group_email")
-        if not pending:
-            return "There's no group email staged right now."
-        owner_uid = state.get("owner_uid", "")
-        tag    = pending.get("tag", "")
-        intent = pending.get("intent", "")
-        cnote  = pending.get("context_note", "")
-        emails = list(pending.get("emails") or [])
-        state["pending_group_email"] = None
-        if not emails:
-            return "That staged group email had no recipients — cleared it."
-
-        _settings = settings
-        _data_dir = data_dir
-        _owner_graph = owner_graph
-
-        def _run():
-            try:
-                from src.modules.outreach import generate_bulk, commit_bulk
-                from src.ai import AIClient
-                ai = AIClient()
-                preview = generate_bulk(
-                    ai=ai, data_dir=_data_dir, settings=_settings,
-                    emails=emails, subject="", body=intent,
-                    personalize=True, context_note=cnote, write_files=False,
-                )
-                items = preview.get("items", [])
-                # Fresh token/GraphClient INSIDE the thread — the closure's
-                # owner_graph token can expire before a big batch finishes.
-                if owner_uid:
-                    from src import auth
-                    from src.graph import GraphClient
-                    graph = GraphClient(auth.get_valid_access_token(owner_uid))
-                else:
-                    graph = _owner_graph
-                result = commit_bulk(
-                    graph=graph, data_dir=_data_dir, settings=_settings,
-                    items=items, send=False, write_files=False,
-                )
-                n    = result.get("summary", {}).get("drafts", 0)
-                errs = result.get("summary", {}).get("errors", 0)
-                msg = (f"✅ {n} draft{'s' if n != 1 else ''} for '{tag}' are in your "
-                       f"Outlook Drafts — review and send each from there.")
-                if errs:
-                    msg += f" ({errs} couldn't be created.)"
-                _notify_owner(owner_uid, msg)
-            except Exception as e:
-                print(f"[Bot] confirm_group_email error: {e}")
-                _notify_owner(owner_uid, f"I hit an error drafting the '{tag}' group email: {e}")
-
-        import threading
-        threading.Thread(target=_run, daemon=True).start()
-        n = len(emails)
-        return (f"Drafting {n} personalized email{'s' if n != 1 else ''} for '{tag}' in the "
-                f"background — I'll ping you here when they're in your Drafts.")
-
     def cancel_group_email() -> str:
         """Cancel the staged group email without creating any drafts. Call when a
         group email is staged and the user backs out (cancel / no / never mind)."""
@@ -768,22 +602,6 @@ def reply(
         tag = (state.get("pending_group_email") or {}).get("tag", "")
         state["pending_group_email"] = None
         return f"Cancelled the group email{f' to {tag}' if tag else ''}."
-
-    def tag_recent_contacts(tag: str, hours: int = 24) -> str:
-        """Tag all contacts added to CRM in the last N hours with a group label.
-        Use when the user says 'tag everyone I just added as X' or similar.
-        Existing tags are preserved (this adds to the list, not replaces).
-        Returns the count of contacts tagged."""
-        if not data_dir:
-            return "No data directory available."
-        try:
-            from src.modules.crm import tag_contacts_added_since
-            n = tag_contacts_added_since(data_dir, tag, hours)
-            if n == 0:
-                return f"No contacts found added in the last {hours}h."
-            return f"✅ Tagged {n} contact{'s' if n != 1 else ''} with '{tag}'."
-        except Exception as e:
-            return f"Error tagging contacts: {e}"
 
     def dismiss_email_followup(from_name_or_subject: str) -> str:
         """Remove a specific email from the unreplied follow-up reminder list.
@@ -906,13 +724,7 @@ def reply(
         approve_draft,
         skip_draft,
         dismiss_email_followup,
-        update_crm_contact,
         run_outreach,
-        tag_recent_contacts,
-        list_my_groups,
-        list_group_members,
-        draft_group_email,
-        confirm_group_email,
         cancel_group_email,
     ]
 
