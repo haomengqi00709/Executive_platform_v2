@@ -3,8 +3,8 @@ title: Workflow Tools (Outreach / Draft Composer)
 describes_files:
   - src/modules/outreach.py
   - src/bot.py
-derived_from_commit: e7562a3
-last_synced: 2026-06-19
+derived_from_commit: 212022c
+last_synced: 2026-06-20
 ---
 
 # Workflow Tools (Outreach / Draft Composer)
@@ -45,6 +45,15 @@ tools actually succeeded), not the draft reply's own claims. A blind "please
 specify" with no lookup is treated as *actionable* and re-driven to look + list;
 the bot only stops to ask the user when info is genuinely user-only (a time, a
 confirmation) or several candidates genuinely match after a lookup.
+
+**The gate only runs when there is something to verify.** A deterministic
+pre-filter enters the gate only when (1) an action tool was attempted, (2) the
+reply claims an action it may not have performed, or (3) the bot asked the user
+to pick among candidates without looking them up. Pure reads ("show my emails",
+"my commitments"), chat, and honest questions skip the gate entirely — earlier,
+running the flaky checker on reads occasionally re-drove them and overwrote the
+correct answer with a false "I was unable to retrieve…". Reads now resolve in
+one pass with no verifier call.
 
 ## The hard rule
 **Drafts are never auto-sent.** Everything the AI writes is saved to Outlook Drafts;
