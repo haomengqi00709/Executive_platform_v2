@@ -3,7 +3,7 @@ title: Workflow Tools (Outreach / Draft Composer)
 describes_files:
   - src/modules/outreach.py
   - src/bot.py
-derived_from_commit: 212022c
+derived_from_commit: 5d17b31
 last_synced: 2026-06-20
 ---
 
@@ -25,6 +25,22 @@ Batch-generates personalized outreach email drafts for a group of contacts.
 Single-email AI drafting + multi-turn refine, embedded in Reply Needed, Followup
 Needed, CRM, etc. The user clicks "Draft reply", the AI writes a draft, and the
 user can iterate ("more formal", "add a thank-you") before saving.
+
+### Conversational draft flow (Teams bot — stage, refine, then save)
+When the user asks the bot to "draft / write / compose an email", `create_reply_draft`
+does **not** save to Outlook immediately. It **stages** the draft in conversation
+state (`pending_draft`) and the bot **shows the full draft (To / Subject / Body) in
+the chat**. The user then:
+- **refines by talking** — "make it warmer", "add a line", "shorter" → the bot
+  re-composes and re-stages the new version (no "editing a saved draft"; it simply
+  re-drafts). This replaced an earlier dead end where the bot refused to revise an
+  already-saved draft.
+- **saves** — replies `1` (or "save" / "looks good") → `approve_draft()` writes it to
+  **Outlook Drafts**.
+- **discards** — "no" / "skip" → `skip_draft()`.
+
+Only on save is anything written to Outlook. **Nothing is ever sent** — there is no
+send capability; the drafts-only safety boundary holds.
 
 ## Conversational bot — list & pick, look before you ask
 The Teams bot (`src/bot.py` `reply()`) shares one **[#N] convention** across every

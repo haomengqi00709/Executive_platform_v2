@@ -6,3 +6,4 @@ Append-only. One line per event. Grep recent: `grep '^## \[' kb/log.md | tail -5
 ## [2026-06-19] sync | workflow-tools — bot [#N] list convention + look-before-you-ask disambiguation + completion gate @b86951a
 ## [2026-06-19] sync | workflow-tools — needs_user sends agent's listed reply not verifier one-liner @e7562a3
 ## [2026-06-20] sync | workflow-tools — completion gate skips pure reads (relevance pre-filter) @212022c
+## [2026-06-20] sync | workflow-tools — conversational draft flow: stage in Teams → refine → 1 saves to Drafts @5d17b31
