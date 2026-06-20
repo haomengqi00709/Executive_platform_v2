@@ -574,80 +574,6 @@ def reply(
         except Exception as e:
             return f"Error: {e}"
 
-    def read_module_result(section_id: str) -> str:
-        """Read the latest cached result for a section. If the result contains an
-        `items` list, each item gets a 1-based `index` field added so the user can
-        refer to items by #N. Canonical IDs (email_id / id / project_id …) stay on
-        each item so you can call action tools with them.
-
-        section_id must be one of: ai_summary, market_intelligence, company_intelligence,
-        reply_needed, followup_needed, commitments_extract, upcoming_commitments,
-        recent_meetings, meeting_action_items, relationship_health, business_insights, expenses"""
-        if section_id not in SECTION_IDS:
-            return f"Unknown section '{section_id}'. Available: {', '.join(SECTION_IDS)}"
-        result_path = data_dir / "results" / f"{section_id}.json"
-        if not result_path.exists():
-            return f"No results for '{section_id}' yet. Run the section first with run_skill()."
-        try:
-            data = json.loads(result_path.read_text())
-            # Decorate items[] in place with index. Sidecar lists like handled[]
-            # also get indexed so `check_email_handling` and follow-up references
-            # stay consistent.
-            if isinstance(data.get("items"), list):
-                data["items"] = _with_indices(data["items"])
-            if isinstance(data.get("handled"), list):
-                data["handled"] = _with_indices(data["handled"])
-            print(f"[Bot] read_module_result({section_id})")
-            return json.dumps(data, ensure_ascii=False)
-        except Exception as e:
-            return f"Error reading {section_id}: {e}"
-
-    # --- Config tools ---
-
-    def update_skill_instruction(section_id: str, content: str) -> str:
-        """Update the custom instructions for a section. These instructions override the default
-        AI behavior for that section on the next run. IMPORTANT: always call read_skill_instruction
-        first, then append your new rules to the existing content — do not discard prior rules.
-
-        section_id must be one of the keys in SECTION_IDS — see the TOOL ROUTING list
-        above for the catalog of available sections.
-        """
-        if section_id not in SECTION_IDS:
-            return f"Unknown section '{section_id}'. Available: {', '.join(SECTION_IDS)}"
-        path = data_dir / "instructions" / f"{section_id}.md"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
-        print(f"[Bot] update_skill_instruction({section_id}) → {len(content)} chars")
-        return f"✅ Instructions updated for: {SECTION_IDS[section_id].split(' — ')[0]}"
-
-    # --- Trigger tool ---
-
-    def run_skill(section_id: str) -> str:
-        """Trigger a section to run immediately in the background. When done, the
-        formatted result is auto-pushed to Teams chat AND written to the dashboard.
-
-        section_id must be one of the keys in SECTION_IDS — see the TOOL ROUTING
-        list above for the catalog of available sections."""
-        if section_id not in SECTION_IDS:
-            return f"Unknown section '{section_id}'. Available: {', '.join(SECTION_IDS)}"
-
-        owner_uid = state.get("owner_uid", "")
-        if not owner_uid:
-            return "Cannot run section — owner user ID not found in bot state."
-
-        def _run():
-            try:
-                from src.server import _run_section_for_user
-                _run_section_for_user(owner_uid, section_id)
-            except Exception as e:
-                print(f"[Bot] run_skill {section_id} error: {e}")
-
-        import threading
-        threading.Thread(target=_run, daemon=True).start()
-        label = SECTION_IDS[section_id].split(" — ")[0]
-        print(f"[Bot] run_skill({section_id}) → started")
-        return f"✅ {label} is running. Results will appear in your dashboard shortly."
-
     # --- Action tools ---
 
     def create_reply_draft(to: str, subject: str, body: str) -> str:
@@ -1240,13 +1166,8 @@ def reply(
         get_contact_history,
         find_contacts_by_name,
         get_email_frequency_report,
-        read_module_result,
         check_email_handling,
         get_meeting_summary,
-        # Config
-        update_skill_instruction,
-        # Trigger
-        run_skill,
         # Action
         create_reply_draft,
         list_pending_drafts,
