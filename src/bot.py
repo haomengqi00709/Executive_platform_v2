@@ -1512,27 +1512,40 @@ def reply(
         succeeded = [n for n, ok in action_results.items() if ok]
         check_prompt = (
             "You are a completion checker for an executive assistant bot. Decide whether the bot "
-            "ACTUALLY completed what the user asked THIS turn. Trust ONLY the ground-truth below — "
-            "NOT what the draft reply claims it did.\n\n"
+            "ACTUALLY did what the user asked THIS turn. Trust the ground-truth facts below, NOT what "
+            "the draft reply claims.\n\n"
             f"User's request: {text}\n\n"
             f"Tools the bot called this turn: {tools_called or 'none'}\n"
-            f"ACTION tools that SUCCEEDED (an action counts as DONE only if listed here): {succeeded or 'none'}\n"
+            f"ACTION tools that SUCCEEDED: {succeeded or 'none'}\n"
             f"Draft reply the bot wants to send: {(candidate_reply or '')[:600]}\n\n"
-            "Pick exactly one verdict:\n"
-            "- \"done\": the request was chat/informational (no action needed), OR the user asked for an "
-            "action and it IS in the SUCCEEDED list.\n"
-            "- \"incomplete_actionable\": the user asked the bot to DO something (schedule/draft/reply/"
-            "update/tag/run/send) and it is NOT in SUCCEEDED, yet everything needed is already known in "
-            "the conversation (recipient/contact/time resolved). The bot dropped the ball — it should "
-            "just call the action tool. ALSO use this when the draft reply asks the user to pick among "
-            "candidates (which person/contact/email/meeting) but NO lookup tool (e.g. find_contacts_by_name) "
-            "is in 'Tools the bot called this turn' — the bot asked BLIND; it must look first, then present "
-            "the real matches as a [#N] list.\n"
-            "- \"incomplete_needs_user\": the action is genuinely blocked on info only the user can give "
-            "(missing duration/time, a confirmation) — OR the bot ALREADY looked up the candidates this "
-            "turn (a lookup tool IS in the called list) and several genuinely match, so it correctly lists "
-            "them as [#N] and asks which. A blind 'please specify' with no lookup is NOT this — it is "
-            "incomplete_actionable.\n\n"
+            "STEP 1 — classify the request:\n"
+            "  READ  = the user only wants to SEE / SHOW / LIST / FIND / CHECK / SUMMARIZE information "
+            "(emails, meetings, contacts, commitments, history, 'who/what/when/did I…'). No state change.\n"
+            "  ACTION = the user wants the bot to CHANGE or SEND something: schedule/create an event, "
+            "draft/send an email, update/tag a contact, snooze/dismiss/mark a commitment, run outreach, "
+            "draft a group email, OR run/refresh a section (run_skill).\n\n"
+            "STEP 2 — pick exactly one verdict:\n"
+            "- \"done\":\n"
+            "    • the request is chat/greeting; OR\n"
+            "    • the request is READ and the bot gave a relevant answer. CRITICAL: read/query tools "
+            "(get_recent_emails, get_upcoming_meetings, find_contacts_by_name, read_module_result, "
+            "check_email_handling, get_contact_history, get_email_frequency_report, list_my_groups, "
+            "get_meeting_summary, …) NEVER appear in SUCCEEDED — their absence is NOT incompleteness. "
+            "A READ request is done once answered; NEVER re-drive a read; OR\n"
+            "    • the request is ACTION and the action IS in SUCCEEDED, OR the bot called run_skill to "
+            "run/refresh the requested section (that runs in the background = done).\n"
+            "- \"incomplete_actionable\": the request is ACTION, it is NOT in SUCCEEDED and the bot did NOT "
+            "trigger it, yet everything needed is already known (recipient/contact/time resolved) — the bot "
+            "dropped the ball and should just call the action tool. ALSO use this when the reply asks the "
+            "user to pick among candidates (which person/contact/email/meeting) but NO lookup tool "
+            "(e.g. find_contacts_by_name) is in 'Tools the bot called this turn' — the bot asked BLIND; it "
+            "must look first, then present the matches as a [#N] list.\n"
+            "- \"incomplete_needs_user\": the request is ACTION and is genuinely blocked on info only the "
+            "user can give (a missing time/subject, a confirmation) — OR the bot ALREADY looked up candidates "
+            "this turn (a lookup tool IS in the called list) and several genuinely match, so it correctly "
+            "lists them as [#N] and asks which. A blind 'please specify' with no lookup is incomplete_actionable, NOT this.\n\n"
+            "A reply that CLAIMS an action is done while that action is NOT in SUCCEEDED (and was not a "
+            "run_skill trigger) is a FALSE claim → never 'done'.\n\n"
             "Return ONLY JSON: {\"verdict\":\"done|incomplete_actionable|incomplete_needs_user\","
             "\"missing\":\"<the action to call, or what to ask the user>\","
             "\"user_message\":\"<if not done: ONE honest sentence telling the user it is NOT done yet and "
@@ -1560,7 +1573,34 @@ def reply(
 
     verdict     = "done"
     corrections = 0
-    while True:
+
+    # ── Completion-gate relevance pre-filter (deterministic) ───────────────────
+    # The gate exists to catch exactly three things: (1) an ACTION tool was attempted
+    # — did it really succeed? (2) the reply CLAIMS an action it did not perform (a
+    # hollow "Done!"); (3) the bot asked the user to pick among candidates WITHOUT
+    # looking them up (a blind disambiguation). Pure reads / chat / honest questions
+    # have NOTHING to verify — running the flaky 2.5-flash checker on them only
+    # manufactured false "I couldn't retrieve…" failures and burned re-drive rounds.
+    # So only enter the gate when it is actually relevant.
+    _ft = (final_text or "").lower()
+    _CLAIM = ("scheduled", "booked", "event created", "created the event", "draft saved",
+              "saved to your", "invite sent", "invites sent", "invitation has been sent",
+              "has been sent", "email sent", "i've sent", "i have sent", "i've scheduled",
+              "i've created", "i've drafted", "i've saved", "i've updated", "i've tagged",
+              "i've added", "i've marked", "has been scheduled", "has been created",
+              "has been saved", "has been updated", "has been tagged", "has been marked",
+              "marked as", "snoozed", "dismissed", "✅")
+    _PICK = ("which daniel", "which one", "which of these", "which of them",
+             "please specify which", "specify which", "which contact", "which person",
+             "which meeting", "which email")
+    _action_attempted = any(t in ACTION_TOOLS for t in tools_called)
+    _lookup_called = any(t in ("find_contacts_by_name", "check_email_handling", "get_recent_emails",
+                               "get_contact_history", "list_group_members") for t in tools_called)
+    _claims_action = any(w in _ft for w in _CLAIM)
+    _blind_pick    = any(p in _ft for p in _PICK) and not _lookup_called
+    _gate_relevant = bool(_ft.strip()) and (_action_attempted or _claims_action or _blind_pick)
+
+    while _gate_relevant:
         v = _verify_completion(final_text)
         verdict = v.get("verdict", "done")
         if verdict == "done":
