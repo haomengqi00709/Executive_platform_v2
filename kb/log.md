@@ -9,3 +9,4 @@ Append-only. One line per event. Grep recent: `grep '^## \[' kb/log.md | tail -5
 ## [2026-06-20] sync | workflow-tools — conversational draft flow: stage in Teams → refine → 1 saves to Drafts @5d17b31
 ## [2026-06-20] sync | workflow-tools — act-don't-ask, compound, type-matched #N, honest no-tool, empty-retry @b08e40c
 ## [2026-06-22] sync | intelligence — market_intelligence fan-out search (planner-derived angles) + top-N cap + per-user recency filter @ad23782
+## [2026-06-22] sync | intelligence — market_intelligence drops unresolvable source_url (no google-search fallback link) @8a20893

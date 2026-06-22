@@ -8,7 +8,7 @@ describes_files:
   - src/skills/company_intelligence/skill.md
   - src/skills/business_insights/skill.md
   - src/modules/profile.py
-derived_from_commit: ad23782
+derived_from_commit: 8a20893
 last_synced: 2026-06-22
 volatile_pointers:
   - src/skills/market_intelligence/skill.md
