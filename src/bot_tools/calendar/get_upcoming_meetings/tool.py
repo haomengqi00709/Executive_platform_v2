@@ -6,7 +6,7 @@ IS_ACTION = False
 
 def build(ctx):
     def get_upcoming_meetings(hours_ahead: int = 24) -> str:
-        from src.bot import _with_indices
+        from src.bot import _with_indices, _register_list
         owner_graph = ctx.owner_graph
         if owner_graph is None:
             return "Owner account not available."
@@ -33,6 +33,9 @@ def build(ctx):
                     "location":  e.get("location", {}).get("displayName", ""),
                 })
             result = _with_indices(result)
+            _register_list(ctx, "meetings", result, "event_id",
+                           label_fn=lambda it: f'{it.get("title","")} ({it.get("start","")})',
+                           source="upcoming meetings")
             print(f"[Bot] get_upcoming_meetings({hours_ahead}h) → {len(result)}")
             return json.dumps(result, ensure_ascii=False)
         except Exception as e:

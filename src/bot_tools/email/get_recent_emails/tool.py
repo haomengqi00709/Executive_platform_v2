@@ -6,7 +6,7 @@ IS_ACTION = False
 
 def build(ctx):
     def get_recent_emails(hours_back: int = 48, top: int = 15) -> str:
-        from src.bot import _with_indices
+        from src.bot import _with_indices, _register_list
         owner_graph = ctx.owner_graph
         if owner_graph is None:
             return "Owner account not available."
@@ -32,6 +32,9 @@ def build(ctx):
                     "importance": m.get("importance", "normal"),
                 })
             result = _with_indices(result)
+            _register_list(ctx, "emails", result, "email_id",
+                           label_fn=lambda it: f'{it.get("from","")} — "{(it.get("subject") or "")[:50]}"',
+                           source="recent emails")
             print(f"[Bot] get_recent_emails({hours_back}h) → {len(result)}")
             return json.dumps(result, ensure_ascii=False)
         except Exception as e:

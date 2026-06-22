@@ -73,6 +73,79 @@ def _with_indices(items: list[dict]) -> list[dict]:
     canonical IDs (email_id / event_id / draft_id / …) on each item."""
     return [{"index": i + 1, **(it or {})} for i, it in enumerate(items or [])]
 
+
+def _register_list(ctx, list_type: str, items: list[dict], id_field: str,
+                   label_fn=None, source: str = None) -> None:
+    """Persist the list the bot just showed into ctx.state['_shown_lists'][list_type].
+
+    The [#N] convention only survives within the live turn — chat history is stored as
+    plain text (see _save_turn), so a list shown a few turns ago (or a pushed briefing)
+    loses its canonical ids and "#N" becomes unresolvable. This keeps {pos, id, label}
+    in the per-conversation state (persisted to teams_bot.json), so _build_current_views
+    can replay it next turn. `pos` mirrors the displayed [#N]; the bucket is replaced
+    wholesale and bounded. Best-effort: never raises into a tool."""
+    try:
+        if ctx is None or not items:
+            return
+        state = getattr(ctx, "state", None)
+        if state is None:
+            return
+        reg = []
+        for i, it in enumerate(items[:15]):
+            if not isinstance(it, dict):
+                continue
+            try:
+                label = (label_fn(it) if label_fn else "")[:80]
+            except Exception:
+                label = ""
+            reg.append({"pos": i + 1, "id": it.get(id_field), "label": label})
+        if not reg:
+            return
+        state.setdefault("_shown_lists", {})[list_type] = {
+            "ts": time.time(),
+            "source": source or list_type,
+            "id_field": id_field,
+            "items": reg,
+        }
+    except Exception:
+        pass
+
+
+def _build_current_views(state: dict) -> str:
+    """Compact snapshot of state['_shown_lists'] for the system prompt, so the model can
+    resolve "#N" against lists shown in PRIOR turns (history is text-only and drops ids).
+    Drops buckets older than 24h and caps size hard. Returns '' when nothing to show."""
+    try:
+        shown = (state or {}).get("_shown_lists") or {}
+        if not shown:
+            return ""
+        now = time.time()
+        blocks = []
+        for typ, bucket in list(shown.items())[:6]:
+            if not isinstance(bucket, dict) or now - float(bucket.get("ts") or 0) > 86400:
+                continue
+            items = bucket.get("items") or []
+            if not items:
+                continue
+            parts = []
+            for it in items[:15]:
+                idv = it.get("id")
+                lbl = (it.get("label") or "")[:60]
+                parts.append(f'{it.get("pos")}={idv} "{lbl}"' if idv else f'{it.get("pos")}. "{lbl}"')
+            src = bucket.get("source")
+            head = f"  {typ}" + (f" (from {src})" if src and src != typ else "") + ": "
+            blocks.append(head + "; ".join(parts))
+        if not blocks:
+            return ""
+        return (
+            "\n\nCURRENT VIEWS (lists already shown to the user in earlier turns — the canonical "
+            "ids are kept here because chat history only stores plain text). To act on a \"#N\", "
+            "resolve it against the bucket whose TYPE matches the action, read that item's id, and "
+            "pass it to the action tool; never retype names:\n" + "\n".join(blocks)
+        )
+    except Exception:
+        return ""
+
 SECTION_IDS = {
     "ai_summary":           "Morning Briefing — daily summary of calendar, emails, priorities, and key relationships",
     "market_intelligence":  "Market Intelligence — current industry news, competitor updates, market trends",
@@ -259,6 +332,9 @@ def reply(
     if session_ctx:
         session_ctx = f"\n\n{session_ctx}"
 
+    # Cross-turn addressing: replay lists shown in prior turns (history is text-only).
+    current_views = _build_current_views(state)
+
     pending_note = ""
     pending_draft   = state.get("pending_draft")
     pending_expense = state.get("pending_expense")
@@ -313,17 +389,26 @@ def reply(
         f"  Tool outputs already include an `index` field and a canonical ID\n"
         f"  (email_id / event_id / draft_id / id / etc.) on each item.\n\n"
         f"  When the user later says \"#N\", \"number N\", or just \"N\" referring to a list,\n"
-        f"  resolve it against the most recent list whose TYPE matches the action — NOT simply\n"
-        f"  whatever list was shown most recently:\n"
-        f"    - snooze/skip/dismiss/mark/done N  → your most recent COMMITMENTS list\n"
-        f"    - reply to / draft N               → your most recent EMAIL list\n"
-        f"    - meeting N / who's in N           → your most recent MEETINGS list\n"
-        f"    - schedule with / contact N        → your most recent CONTACTS list\n"
-        f"  even if a different kind of list was shown after it. For commitment index operations\n"
-        f"  just call the commitment tool with N (it resolves against the commitments list).\n"
-        f"  Read the canonical ID off that item's JSON and pass it (or its to/subject fields)\n"
-        f"  into the action tool — NEVER retype subjects, recipients, or names from memory.\n"
-        f"  If no list of the matching type is visible, re-run the appropriate read tool first.\n\n"
+        f"  resolve it against the list whose TYPE matches the action — NOT simply whatever\n"
+        f"  list was shown most recently:\n"
+        f"    - snooze/skip/dismiss/mark/done N  → a COMMITMENTS list\n"
+        f"    - reply to / draft N               → an EMAIL list\n"
+        f"    - meeting N / who's in N           → a MEETINGS list\n"
+        f"    - schedule with / contact N        → a CONTACTS list\n"
+        f"  The number means the item at THAT position in the list the user is looking at — i.e.\n"
+        f"  (1) the CURRENT VIEWS block below, then (2) a list visible in this conversation. Pass\n"
+        f"  the item's canonical id (commitments: its `id`) to the action tool; NEVER retype names.\n"
+        f"  If you have NOT shown the matching list in THIS conversation (e.g. the user is acting\n"
+        f"  on a pushed briefing), you MUST call read_module_result FIRST — a cheap, SYNCHRONOUS\n"
+        f"  read of the EXISTING snapshot (NOT run_skill, NOT a refresh) — BEFORE any\n"
+        f"  mark/snooze/dismiss, so the numbers line up with what the user actually saw. Pick the\n"
+        f"  section the user named: 'due today N' → due_today; 'upcoming N' → upcoming_commitments;\n"
+        f"  otherwise commitments_extract. Do NOT call a commitment tool with a bare number before\n"
+        f"  that read.\n"
+        f"  If you STILL cannot match N, do NOT run a section, do NOT say you are 'waiting' for\n"
+        f"  anything to refresh, and do NOT claim it is done. Reply honestly: \"I can't match #N\n"
+        f"  to your current list — here's what I have:\" and list that view (or say it's empty).\n"
+        f"  Asking the user which item is a COMPLETE answer, not a failure.\n\n"
         f"DISAMBIGUATION — LOOK BEFORE YOU ASK:\n"
         f"  When the user names a person/target for an action (schedule a meeting, draft, email\n"
         f"  someone) and you don't already have the exact one, you must LOOK FIRST — call the\n"
@@ -407,10 +492,14 @@ def reply(
             f"when the tool failed. Show what went wrong and what you did/didn't do. "
             f"If you did NOT successfully call the action tool the user asked for "
             f"(create_reply_draft / create_calendar_event / update_crm_contact / etc.), do NOT "
-            f"claim you performed the action — say it is not done yet."
+            f"claim you performed the action — say it is not done yet. "
+            f"But when you decline an action because an index or target genuinely can't be matched, "
+            f"that honest decline IS the complete answer — do NOT retry it as an unfinished action "
+            f"and do NOT tell the user you are waiting for data to refresh."
         )
         + f"{user_ctx}"
         + f"{session_ctx}"
+        + f"{current_views}"
         + f"{pending_note}"
     )
 
@@ -578,7 +667,20 @@ def reply(
                                "get_contact_history", "list_group_members") for t in tools_called)
     _claims_action = any(w in _ft for w in _CLAIM)
     _blind_pick    = any(p in _ft for p in _PICK) and not _lookup_called
-    _gate_relevant = bool(_ft.strip()) and (_action_attempted or _claims_action or _blind_pick)
+    # Honest "I can't match #N — here's what I have" decline (the [#N] block tells the bot to
+    # say this instead of punting to a refresh). It IS the complete answer — never re-drive it
+    # into "do it NOW". Guarded by "no action succeeded" so stray wording can't hide a real
+    # success or a falsely-claimed one.
+    _any_action_ok = any(action_results.values())
+    _honest_decline = (not _any_action_ok) and (
+        "here's what i have" in _ft or "here is what i have" in _ft
+        or ("match" in _ft and any(w in _ft for w in
+            ("can't", "cannot", "can not", "couldn't", "couldn", "unable")))
+    )
+    if _honest_decline:
+        finish_mode = "needs_user"
+    _gate_relevant = (bool(_ft.strip()) and not _honest_decline
+                      and (_action_attempted or _claims_action or _blind_pick))
 
     while _gate_relevant:
         v = _verify_completion(final_text)

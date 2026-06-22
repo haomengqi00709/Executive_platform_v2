@@ -2036,6 +2036,46 @@ _EMPTY_SECTION_MESSAGES: dict[str, str] = {
 }
 
 
+def _section_display_order(section_id: str, result: dict, tz: "ZoneInfo | None" = None) -> list[dict]:
+    """Return a section's items in the SAME order (and caps) the Teams briefing displays them,
+    as a flat list. Single source of truth shared by _format_section_for_teams and the bot's
+    read_module_result, so the "#N" the user sees in a pushed briefing == the "#N" the bot
+    resolves when acting on it. Sections not listed fall back to file order."""
+    items = result.get("items", []) or []
+    if section_id == "commitments_extract":
+        dated = [it for it in items if it.get("due_date")]
+        undated = [it for it in items if not it.get("due_date")]
+        dated.sort(key=lambda it: it.get("due_date") or "")
+        undated.sort(key=lambda it: it.get("received") or "", reverse=True)
+        return dated[:10] + undated[:5]
+    if section_id == "upcoming_commitments":
+        from zoneinfo import ZoneInfo as _ZI
+        tz = tz or _ZI("UTC")
+        today_d = datetime.now(tz).date()
+        tomorrow_d = today_d + timedelta(days=1)
+        overdue, today_b, tomorrow_b, later = [], [], [], []
+        for it in items:
+            due_raw = (it.get("due_date") or "")[:10]
+            try:
+                due_d = datetime.strptime(due_raw, "%Y-%m-%d").date() if due_raw else None
+            except Exception:
+                due_d = None
+            if it.get("overdue") or (due_d and due_d < today_d):
+                overdue.append((due_d, it))
+            elif due_d == today_d:
+                today_b.append((due_d, it))
+            elif due_d == tomorrow_d:
+                tomorrow_b.append((due_d, it))
+            else:
+                later.append((due_d or datetime.max.date(), it))
+        for bucket in (overdue, today_b, tomorrow_b, later):
+            bucket.sort(key=lambda p: p[0] or datetime.max.date())
+        return [it for _, it in (overdue + today_b + tomorrow_b + later)][:15]
+    caps = {"reply_needed": 10, "followup_needed": 10, "due_today": 15}
+    cap = caps.get(section_id)
+    return items[:cap] if cap else items
+
+
 def _format_section_for_teams(result: dict, tz: "ZoneInfo | None" = None) -> str:
     section_id = result.get("id", "")
     # Section formatters that need to compute "today"/"tomorrow" labels use
@@ -2153,10 +2193,12 @@ def _format_section_for_teams(result: dict, tz: "ZoneInfo | None" = None) -> str
         today_str = _now_local.strftime("%Y-%m-%d")
         tomorrow_str = (_now_local + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        dated = [it for it in items if it.get("due_date")]
-        undated = [it for it in items if not it.get("due_date")]
-        dated.sort(key=lambda it: it.get("due_date") or "")
-        undated.sort(key=lambda it: it.get("received") or "", reverse=True)
+        # Shared ordering so the bot's read_module_result numbers these identically.
+        ordered = _section_display_order("commitments_extract", result, tz)
+        dated = [it for it in ordered if it.get("due_date")]
+        undated = [it for it in ordered if not it.get("due_date")]
+        total_dated = sum(1 for it in items if it.get("due_date"))
+        total_undated = len(items) - total_dated
 
         def _fmt_item(item: dict, kind: str) -> str:
             tag = priority_tag.get(item.get("priority", "medium"), "🟡")
@@ -2178,22 +2220,25 @@ def _format_section_for_teams(result: dict, tz: "ZoneInfo | None" = None) -> str
             return f"{tag}{them} {desc}{contact_str} ({meta})"
 
         lines = [f"**Commitments** — {len(items)} item(s)"]
+        n = 0   # continuous numbering across both groups → "mark N" is unambiguous
 
         if dated:
             lines.append("")
-            lines.append(f"**With deadline ({len(dated)})** — earliest first")
-            for i, item in enumerate(dated[:10], start=1):
-                lines.append(f"{i}. {_fmt_item(item, 'dated')}")
-            if len(dated) > 10:
-                lines.append(f"... and {len(dated) - 10} more dated item(s)")
+            lines.append(f"**With deadline ({total_dated})** — earliest first")
+            for item in dated:
+                n += 1
+                lines.append(f"{n}. {_fmt_item(item, 'dated')}")
+            if total_dated > len(dated):
+                lines.append(f"... and {total_dated - len(dated)} more dated item(s)")
 
         if undated:
             lines.append("")
-            lines.append(f"**No deadline ({len(undated)})** — latest email first")
-            for i, item in enumerate(undated[:5], start=1):
-                lines.append(f"{i}. {_fmt_item(item, 'undated')}")
-            if len(undated) > 5:
-                lines.append(f"... and {len(undated) - 5} more undated item(s)")
+            lines.append(f"**No deadline ({total_undated})** — latest email first")
+            for item in undated:
+                n += 1
+                lines.append(f"{n}. {_fmt_item(item, 'undated')}")
+            if total_undated > len(undated):
+                lines.append(f"... and {total_undated - len(undated)} more undated item(s)")
 
         return "\n".join(lines)
 
