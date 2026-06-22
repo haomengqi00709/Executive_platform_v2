@@ -5,7 +5,7 @@ IS_ACTION = False
 
 def build(ctx):
     def check_email_handling(query: str) -> str:
-        from src.bot import _with_indices
+        from src.bot import _with_indices, _register_list
         from src.modules.subject_match import normalize_subject
         data_dir = ctx.data_dir
         if not data_dir:
@@ -72,5 +72,9 @@ def build(ctx):
                 "note": f"No recent email matches '{query}' in reply_needed or followup_needed. "
                         f"The system only tracks emails from the last 14 days.",
             }, ensure_ascii=False)
-        return json.dumps({"matches": _with_indices(unique[:8])}, ensure_ascii=False)
+        shown = unique[:8]
+        _register_list(ctx, "emails", shown, "email_id",
+                       label_fn=lambda it: f'{it.get("who","")} — "{(it.get("subject") or "")[:50]}"',
+                       source=f"email handling: {query}")
+        return json.dumps({"matches": _with_indices(shown)}, ensure_ascii=False)
     return check_email_handling

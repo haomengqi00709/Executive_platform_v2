@@ -7,7 +7,7 @@ IS_ACTION = False
 
 def build(ctx):
     def get_email_frequency_report(days_back: int = 30, top_n: int = 10) -> str:
-        from src.bot import _with_indices
+        from src.bot import _with_indices, _register_list
         owner_graph = ctx.owner_graph
         if owner_graph is None:
             return "Owner account not available."
@@ -26,10 +26,12 @@ def build(ctx):
                 sender = m.get("from", {}).get("emailAddress", {}).get("address", "")
                 if sender:
                     counts[sender] += 1
-            result = _with_indices([
-                {"email": email, "email_count": count}
-                for email, count in counts.most_common(top_n)
-            ])
+            rows = [{"email": email, "email_count": count}
+                    for email, count in counts.most_common(top_n)]
+            _register_list(ctx, "contacts", rows, "email",
+                           label_fn=lambda it: f'{it.get("email","")} ({it.get("email_count","")} emails)',
+                           source="most-emailed contacts")
+            result = _with_indices(rows)
             print(f"[Bot] get_email_frequency_report({days_back}d) → {len(result)} contacts")
             return json.dumps(result, ensure_ascii=False)
         except Exception as e:
