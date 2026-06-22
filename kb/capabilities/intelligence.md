@@ -8,7 +8,8 @@ describes_files:
   - src/skills/company_intelligence/skill.md
   - src/skills/business_insights/skill.md
   - src/modules/profile.py
-derived_from_commit: 8a20893
+  - src/modules/intel_enrich.py
+derived_from_commit: c71aa4c
 last_synced: 2026-06-22
 volatile_pointers:
   - src/skills/market_intelligence/skill.md
@@ -38,6 +39,11 @@ events surface — not market-size reports or explainers.
 - **Data source:** Gemini search grounding, scoped by the user's instruction + business
   profile / market segments (`src/modules/profile.py`). Optional per-user feeds add extra
   sources, off by default.
+- **Enrichment (top items):** the highest-ranked items are deep-read — `intel_enrich`
+  fetches the real article behind the top results and summarises from its full text (not a
+  search snippet), attaching only real, resolvable corroborating links; paywalled or
+  unreachable pages fall back to the snippet. Unresolvable links are dropped (no
+  google-search placeholder, in `references` or `source_url`). Shared with Company Intelligence.
 
 ## Company Intelligence (`company_intelligence`)
 News and signals about specific companies the user has chosen to watch.
