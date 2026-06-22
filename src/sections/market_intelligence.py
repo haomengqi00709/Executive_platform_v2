@@ -4,7 +4,7 @@ Macro market signals via Gemini Google Search grounding.
 Structured items: headline (point-form) + summary + source_url + 7-day dedup.
 """
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from pathlib import Path
 
 from src.ai import AIClient
@@ -28,8 +28,9 @@ _RESULT_ID = "market_intelligence"
 _FEED_LOOKBACK_DAYS = 30  # recency window for feed items — wider than grounding's
                           # 14d because niche B2B verticals publish less often;
                           # relevance scoring gates them regardless of age
-_QUOTA_PER_SIGNAL = 4     # max items kept per signal_type (anti-flood)
-_MAX_ITEMS = 15           # global cap on the brief size
+_SEARCH_TIMEOUT_SECS = 180  # one rich instruction-driven grounding search legitimately
+                            # runs longer than the 60s default; widen here instead of
+                            # chopping the search into generic topic batches to fit 60s
 
 _DEFAULT_INSTRUCTION = """\
 # Market Intelligence — Search Instruction
@@ -62,10 +63,10 @@ Daily Market Intelligence — [Your Focus Area]
 - Macroeconomic signals: supply chain, commodity prices, workforce trends
 
 ## Research Steps
-1. Search for recent news (last 14 days) across the target geographies and industries above
+1. Search for recent news (last 30 days) across the target geographies and industries above
 2. Focus on signals relevant to [your product/service — e.g. AI consulting, ERP implementation, capital project advisory]
 3. Prioritise signals from named companies in your client list or target account list
-4. Exclude generic think-pieces with no actionable signal and press releases older than 14 days
+4. Exclude generic think-pieces with no actionable signal and press releases older than 30 days
 5. Do not repeat items already covered in recent briefings
 
 ## Exclusions
@@ -87,6 +88,104 @@ def _load_user_instruction(data_dir: Path) -> str:
         path.write_text(_DEFAULT_INSTRUCTION)
         return _DEFAULT_INSTRUCTION.strip()
     return path.read_text().strip()
+
+
+def _build_search_prompt(skill_filled: str, context_block: str, angle: str | None = None) -> str:
+    """Minimal instruction-driven search prompt = business context + the lean skill.md
+    (role + how-to-search + the user's verbatim instruction + output spec; skill.md is the
+    source of truth). Kept deliberately lean: an N=5 A/B vs the heavier scaffolded prompt
+    showed this ties on client coverage + junk and wins on count-stability + schema
+    cleanliness. Ranking / dedup / validation happen AFTER the search, not in this prompt.
+
+    When `angle` is given (one fan-out leg — a named client or a focus area), the search is
+    narrowed to it while still honouring the instruction's window, exclusions, and schema."""
+    base = f"{context_block}{skill_filled}"
+    if angle:
+        base += (f"\n\n## This search's focus\n"
+                 f"For THIS particular search only, focus specifically on: {angle}\n"
+                 f"Still honour the instruction's time window, exclusions, and output schema above.")
+    return base
+
+
+_MAX_ANGLES = 6   # cap fan-out so a long client list can't explode the search cost
+_MAX_ITEMS = 12   # final brief size — fan-out floods, so rank by relevance and keep the top N
+_RECENCY_DEFAULT_DAYS = 30  # default hard recency cap (days); per-user override lives in
+                           # settings["market_intel_recency_days"]. The model/validator don't
+                           # reliably honour the window, so we hard-drop dated-older items.
+
+
+def _plan_search_angles(ai: AIClient, business_context: str, user_instruction: str,
+                        display_name: str) -> list[str]:
+    """Derive up to _MAX_ANGLES targeted search angles from the user's OWN data so the
+    fan-out reliably covers their named companies and focus areas, instead of leaning on a
+    single stochastic grounding search. General: angles are read from the business context +
+    instruction, never hardcoded. Returns [] on failure → caller falls back to one search."""
+    if not (business_context.strip() or user_instruction.strip()):
+        return []
+    prompt = f"""You are planning a market-intelligence search for {display_name}.
+
+Business context:
+{business_context}
+
+Their market-intelligence instruction:
+{user_instruction}
+
+Produce a JSON array of AT MOST {_MAX_ANGLES} short search angles that together cover this
+person's daily market intelligence comprehensively:
+- one angle per specific company they care about (named clients / partners / competitors in
+  the business context), and
+- one angle per key focus area / priority in their instruction.
+Each angle is a short phrase naming the target plus the relevant focus (e.g.
+"<Company> brownfield upgrades and digital-twin activity", or
+"as-built laser scanning and asset integrity in oil & gas").
+Output ONLY a JSON array of strings, at most {_MAX_ANGLES} items."""
+    try:
+        angles = json.loads(ai.extract_json(prompt))
+        if isinstance(angles, list):
+            return [str(a).strip() for a in angles if str(a).strip()][:_MAX_ANGLES]
+    except Exception:
+        pass
+    return []
+
+
+def _dedup_raw(items: list[dict]) -> list[dict]:
+    """Within-run dedup across fan-out legs (the same event surfaced by several angles),
+    by source_url then headline prefix. Cheap; runs before the score/enrich/validate passes."""
+    seen: set[str] = set()
+    out: list[dict] = []
+    for it in items:
+        url = (it.get("source_url") or "").strip().lower()
+        key = url or str(it.get("headline", ""))[:50].lower().strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
+
+
+def _filter_recent(items: list[dict], cutoff_days: int) -> tuple[list[dict], int]:
+    """Hard recency cap: drop items whose published_date is present AND older than
+    cutoff_days. Items with an empty/unparseable date are kept (don't over-filter on a
+    missing field). Returns (kept, n_dropped)."""
+    cutoff = (date.today() - timedelta(days=cutoff_days)).isoformat()
+    kept: list[dict] = []
+    dropped = 0
+    for it in items:
+        d = (it.get("published_date") or "").strip()
+        if d and d < cutoff:
+            dropped += 1
+            continue
+        kept.append(it)
+    return kept, dropped
+
+
+def _recency_days(settings: dict) -> int:
+    """Per-user recency cap in days (settings.market_intel_recency_days), clamped to a sane
+    range; falls back to _RECENCY_DEFAULT_DAYS when unset or invalid."""
+    try:
+        return max(1, min(int(settings.get("market_intel_recency_days")), 365))
+    except (TypeError, ValueError):
+        return _RECENCY_DEFAULT_DAYS
 
 
 def _parse_raw(raw: str, ai: AIClient) -> list[dict]:
@@ -163,24 +262,6 @@ def _normalise(items: list[dict]) -> list[dict]:
     return out
 
 
-def _apply_signal_quota(items: list[dict]) -> list[dict]:
-    """Keep at most _QUOTA_PER_SIGNAL items per signal_type and _MAX_ITEMS total,
-    so one category can't dominate the brief. Assumes items are pre-sorted by
-    ai_score descending (score_items guarantees this), so the highest-scored item
-    in each category survives. Preserves order."""
-    kept: list[dict] = []
-    per_signal: dict[str, int] = {}
-    for item in items:
-        sig = item.get("signal_type") or "other"
-        if per_signal.get(sig, 0) >= _QUOTA_PER_SIGNAL:
-            continue
-        kept.append(item)
-        per_signal[sig] = per_signal.get(sig, 0) + 1
-        if len(kept) >= _MAX_ITEMS:
-            break
-    return kept
-
-
 def run(
     graph: GraphClient,
     ai: AIClient,
@@ -216,53 +297,36 @@ def run(
     )
     context_block = f"Business context: {business_context}\n\n" if business_context else ""
 
-    # Split the broad market search into focused topic batches. One big
-    # open-ended grounding search blows the 60s Gemini timeout (the 2026-06
-    # regression after the shared timeout was tightened to prevent hangs
-    # elsewhere); company_intelligence never hit this because it searches in
-    # small per-company batches. Mirror that here: each topic is a narrower
-    # search that returns within 60s, and a per-topic try/except means one slow
-    # topic can't wipe out the whole section.
-    topics = [
-        ("regulatory & macro",
-         "regulatory or policy changes affecting the industry, plus macroeconomic "
-         "signals (supply chain, commodity prices, workforce trends, trade policy)"),
-        ("funding & M&A",
-         "funding rounds, M&A activity, and capital movement in relevant sectors"),
-        ("technology & competitive",
-         "technology / AI shifts with competitive implications, competitor moves, "
-         "new market entrants, pricing changes, and strategic pivots"),
-    ]
+    # Structured fan-out: one grounding search per angle (a named client or a focus area),
+    # then merge + dedup. A single grounding call is one stochastic slice — even on a strict
+    # window it reliably covers neither every client nor the full focus list (proven: two
+    # runs of the same prompt barely overlap). Angles are derived from the user's OWN data
+    # (business context + instruction) by a cheap planner call, so this stays general — no
+    # hardcoded companies/topics. The wider, noisier net is cleaned by validate downstream.
+    angles = _plan_search_angles(ai, business_context, user_instruction, display_name)
+    if angles:
+        _p(f"planned {len(angles)} search angles: {angles}")
+    else:
+        _p("no angles planned — falling back to one instruction-driven search")
+        angles = [None]  # sentinel: a single general instruction-driven search
 
     all_raw_items: list[dict] = []
     ok_batches = 0
-    for idx, (topic_label, topic_focus) in enumerate(topics, 1):
-        _p(f"Searching topic {idx}/{len(topics)}: {topic_label}")
-        search_prompt = f"""You are a market intelligence analyst. Today is {date_str}.
-{context_block}{skill_filled}
-
-Search Google (last 14 days) for current market signals, focused ONLY on: {topic_focus}.
-Return the 3-5 most relevant items as a JSON array — no markdown, no preamble. Example:
-[
-  {{
-    "headline": "Alberta announces $2B infrastructure tender for highway expansion",
-    "summary": "The Alberta government released a public tender for a major highway expansion project...",
-    "signal_type": "regulatory",
-    "source": "CBC News",
-    "source_url": "https://www.cbc.ca/news/...",
-    "published_date": "2026-05-20",
-    "relevance": "Direct opportunity for capital project advisory services in Western Canada.",
-    "priority": "high"
-  }}
-]"""
+    for idx, angle in enumerate(angles, 1):
+        prompt = _build_search_prompt(skill_filled, context_block, angle=angle)
         try:
-            raw = ai.generate_with_search(search_prompt)
-            batch_items = _parse_raw(raw, ai)
-            all_raw_items.extend(batch_items)
-            ok_batches += 1
-            _p(f"  → {len(batch_items)} items from '{topic_label}'")
+            raw = ai.generate_with_search(prompt, timeout_secs=_SEARCH_TIMEOUT_SECS)
+            items = _parse_raw(raw, ai)
+            all_raw_items.extend(items)
+            ok_batches += 1 if items else 0
+            _p(f"  angle {idx}/{len(angles)} [{angle or 'general'}]: {len(items)} items")
         except Exception as e:
-            _p(f"  → topic '{topic_label}' failed: {e}")
+            _p(f"  angle {idx} [{angle or 'general'}] failed: {e}")
+
+    before = len(all_raw_items)
+    all_raw_items = _dedup_raw(all_raw_items)
+    if len(all_raw_items) < before:
+        _p(f"fan-out dedup: {before} → {len(all_raw_items)} unique")
 
     # Merge configured feed sources (RSS / Google News / HN / Reddit), if the
     # user has opted in. Feed items enter the SAME schema and pipeline; the
@@ -293,20 +357,30 @@ Return the 3-5 most relevant items as a JSON array — no markdown, no preamble.
     _p("Parsing results...")
     items = _normalise(all_raw_items)
 
-    # Score 0-10 by relevance to THIS reader's business, then gate. Grounding
-    # items arrive already targeted; this mainly drops off-target feed noise and
-    # weak signals before the expensive URL-resolve + enrichment passes run.
-    items = score_items(items, ai, reader_context=business_context,
-                         instruction=user_instruction, display_name=display_name)
-    above = [it for it in items if it.get("ai_score", 0.0) >= DEFAULT_THRESHOLD]
-    _p(f"scored {len(items)} → {len(above)} above threshold {DEFAULT_THRESHOLD}")
-    items = above
+    # Code-level recency cap (user-configurable: settings.market_intel_recency_days; default
+    # _RECENCY_DEFAULT_DAYS). The model + validator don't reliably honour the window — they
+    # backfill older items to fill the brief — so hard-drop anything dated older than the cap.
+    cutoff_days = _recency_days(settings)
+    items, n_old = _filter_recent(items, cutoff_days)
+    if n_old:
+        _p(f"recency filter: dropped {n_old} item(s) older than {cutoff_days}d")
 
-    # Reshape surviving feed (raw-news) items into the brief's strategic-insight
-    # format so the validator treats them like grounding items instead of
-    # dropping them for "not a strategic insight / signal_type=other".
-    items = rewrite_feed_items(items, ai, display_name=display_name,
-                               reader_context=business_context, log=_p)
+    # Fan-out (and any configured feeds) cast a WIDE net — far more candidates than a brief
+    # should hold. When that happens, score every candidate for relevance to THIS reader
+    # (their profile + instruction), drop the off-target ones (< threshold; never pad), and
+    # keep the top _MAX_ITEMS. A small single-search fallback stays on-instruction and skips
+    # this. score_items sorts by ai_score desc, so the slice keeps the best.
+    if feed_items or len(items) > _MAX_ITEMS:
+        items = score_items(items, ai, reader_context=business_context,
+                            instruction=user_instruction, display_name=display_name)
+        above = [it for it in items if it.get("ai_score", 0.0) >= DEFAULT_THRESHOLD]
+        items = above[:_MAX_ITEMS]
+        _p(f"scored → {len(above)} above {DEFAULT_THRESHOLD}, kept top {len(items)}")
+        if feed_items:
+            # Reshape raw feed items into the brief's strategic-insight format so the
+            # validator treats them like grounding items (grounding items pass through).
+            items = rewrite_feed_items(items, ai, display_name=display_name,
+                                       reader_context=business_context, log=_p)
 
     items = _resolve_urls(items, _p)
 
@@ -334,16 +408,8 @@ Return the 3-5 most relevant items as a JSON array — no markdown, no preamble.
 
     items = assign_ids(items)
 
-    # Category quota: cap per signal_type + global size before the expensive
-    # enrichment pass, so one category (e.g. a feed-heavy 'technology' bucket)
-    # can't crowd out the brief.
-    before_quota = len(items)
-    items = _apply_signal_quota(items)
-    if len(items) < before_quota:
-        _p(f"quota: {before_quota} → {len(items)} items (≤{_QUOTA_PER_SIGNAL}/signal, ≤{_MAX_ITEMS} total)")
-
-    # Enrichment second-pass: for the top-N (highest-scored) items, add
-    # web-grounded background + community_view + REAL reference URLs via ddgs.
+    # Enrichment second-pass: for the top-N items, add web-grounded background +
+    # REAL reference URLs via ddgs.
     # Runs after dedup (don't enrich items we're about to drop) and before the
     # validator. Degrades to empty fields if ddgs is unavailable — never fatal.
     items = enrich_items(items, ai, display_name=display_name, log=_p)

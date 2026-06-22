@@ -366,11 +366,14 @@ class AIClient:
         that don't go through the metered generate* methods."""
         _record_usage(response, is_search=is_search, model=self.model)
 
-    def generate_with_search(self, prompt: str) -> str:
+    def generate_with_search(self, prompt: str, timeout_secs: int | None = None) -> str:
         """Generate content with Google Search grounding (real-time web search).
-        Search-grounded calls can be slower than plain generate; use the same
-        60s budget as generate() with one retry on timeout."""
+        Search-grounded calls can be slower than plain generate; defaults to the
+        same 60s budget as generate() with one retry on timeout. Callers running a
+        single rich instruction-driven search (market_intelligence) pass a larger
+        timeout_secs so the search isn't chopped into generic batches to fit 60s."""
         _budget_guard()
+        eff_timeout = timeout_secs or _GEMINI_SEARCH_TIMEOUT_SECS
         _late = _late_usage_recorder(dict(_usage_ctx.get()), self.model, is_search=True)
         for attempt in range(2):
             try:
@@ -382,7 +385,7 @@ class AIClient:
                             tools=[types.Tool(google_search=types.GoogleSearch())],
                         ),
                     ),
-                    _GEMINI_SEARCH_TIMEOUT_SECS, on_late=_late,
+                    eff_timeout, on_late=_late,
                 )
                 _record_usage(response, is_search=True, model=self.model)
                 # Empty result = "no news found" — a LEGITIMATE outcome for a search,
@@ -397,7 +400,7 @@ class AIClient:
                     raise
                 if isinstance(e, TimeoutError):
                     if attempt < 1:
-                        print(f"  Gemini search timeout after {_GEMINI_SEARCH_TIMEOUT_SECS}s, retrying once...")
+                        print(f"  Gemini search timeout after {eff_timeout}s, retrying once...")
                         time.sleep(3)
                         continue
                     print(f"  Gemini search timeout twice — giving up.")

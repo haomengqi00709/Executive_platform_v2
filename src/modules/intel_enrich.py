@@ -5,7 +5,6 @@ Adapted from Horizon's ai/enricher.py (concept → web search → synthesize), b
 trimmed for our use: English-only, and applied ONLY to the top-N items (cost
 control). For each selected item it produces:
   - background        2-3 sentences of context a busy CEO needs
-  - community_view    how analysts / the market are reacting (if the results show it)
   - references[]      {title, url} corroborating links
 
 Why ddgs (DuckDuckGo) and not Gemini grounding: ddgs hands back a concrete set of
@@ -73,7 +72,7 @@ def _web_search(query: str) -> list[dict]:
 
 
 def _synthesize(item: dict, web: list[dict], ai: AIClient, display_name: str) -> dict | None:
-    """Ask the AI to write background + community_view and cite ONLY from `web`.
+    """Ask the AI to write a background note and cite ONLY from `web`.
     Returns None on failure."""
     available = {r["url"]: r["title"] for r in web if r.get("url")}
     lines = [f"- [{r['title']}]({r['url']}): {r['body']}" for r in web]
@@ -91,7 +90,6 @@ Web search results:
 Return ONLY JSON:
 {{
   "background": "<2-3 sentences of context a busy CEO needs to understand this; empty string if the results add nothing>",
-  "community_view": "<1-2 sentences on how analysts / the market / commentators are reacting, ONLY if the results show it; else empty string>",
   "sources": ["<url>", "..."]  // 1-3 URLs you actually used, copied VERBATIM from the results above
 }}"""
     try:
@@ -111,7 +109,6 @@ Return ONLY JSON:
                 seen.add(u)
     return {
         "background": str(result.get("background") or "")[:600],
-        "community_view": str(result.get("community_view") or "")[:400],
         "references": references,
     }
 
@@ -143,23 +140,19 @@ def enrich_items(
                 # No external corroboration available → leave fields empty rather
                 # than risk a fabricated background. The item keeps its summary.
                 item.setdefault("background", "")
-                item.setdefault("community_view", "")
                 item.setdefault("references", [])
                 continue
             result = _synthesize(item, web, ai, display_name)
             if result:
                 item["background"] = result["background"]
-                item["community_view"] = result["community_view"]
                 item["references"] = result["references"]
                 enriched += 1
             else:
                 item.setdefault("background", "")
-                item.setdefault("community_view", "")
                 item.setdefault("references", [])
         except Exception as e:
             log(f"  enrich failed for '{item.get('headline','')[:50]}': {e}")
             item.setdefault("background", "")
-            item.setdefault("community_view", "")
             item.setdefault("references", [])
 
     log(f"enriched {enriched}/{len(targets)} items with web-grounded background")

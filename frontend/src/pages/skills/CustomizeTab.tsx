@@ -160,10 +160,13 @@ function CustomizeRow({
       </div>
 
       {expanded && (
-        <InstructionEditor
-          instruction={instruction}
-          onSave={onSave}
-        />
+        <>
+          {def.id === 'market_intelligence' && <RecencyControl />}
+          <InstructionEditor
+            instruction={instruction}
+            onSave={onSave}
+          />
+        </>
       )}
     </div>
   );
@@ -215,6 +218,58 @@ function InstructionEditor({
           {saving ? 'Saving…' : dirty ? 'Save changes' : 'Saved'}
         </button>
       </div>
+    </div>
+  );
+}
+
+// Per-user recency cap for the market-intelligence brief. The model/validator don't reliably
+// honour the instruction's window, so a hard code-level filter (src/sections/market_intelligence.py
+// _filter_recent) drops items dated older than this. Stored in settings.market_intel_recency_days.
+function RecencyControl() {
+  const [days, setDays] = useState<number | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    fetch('/api/settings', { credentials: 'include' })
+      .then(r => (r.ok ? r.json() : {}))
+      .then((s: Record<string, unknown>) => setDays(Number(s?.market_intel_recency_days) || 30))
+      .catch(() => setDays(30));
+  }, []);
+
+  const save = async (v: number) => {
+    setDays(v);
+    setSaving(true);
+    try {
+      await fetch('/api/settings', {
+        method: 'PATCH',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ market_intel_recency_days: String(v) }),
+      });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 1500);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (days === null) return null;
+  return (
+    <div className="bg-executive-bg/40 px-6 py-3 border-t border-executive-border/40 flex items-center flex-wrap gap-2 text-xs text-executive-text">
+      <span className="text-executive-muted">Show news from the last</span>
+      <select
+        value={days}
+        onChange={e => save(Number(e.target.value))}
+        disabled={saving}
+        className="bg-executive-bg border border-executive-border rounded-md px-2 py-1 text-executive-text focus:outline-none focus:border-executive-accent/60 disabled:opacity-50"
+      >
+        {[7, 14, 30, 60, 90].map(d => (
+          <option key={d} value={d}>{d} days</option>
+        ))}
+      </select>
+      {saved && <span className="text-emerald-300">Saved.</span>}
+      <span className="text-executive-muted">— older items are dropped before they reach your brief.</span>
     </div>
   );
 }
