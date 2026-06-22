@@ -236,7 +236,13 @@ def _resolve_urls(items: list[dict], log) -> list[dict]:
             headline=item.get("headline", ""),
             source=item.get("source", ""),
         )
-        item["source_url"] = final
+        # A "fallback" means we could not resolve the grounding redirect to a real
+        # article — `final` is only a google.com/search link. Don't surface it: a button
+        # labelled "Open source" that opens a search page reads as a real source but
+        # isn't, and confuses the reader. Drop it (frontend hides the button on empty
+        # source_url). Real corroborating links still come from enrichment references[];
+        # the source NAME is kept either way.
+        item["source_url"] = "" if status == "fallback" else final
         counts[status] = counts.get(status, 0) + 1
     log(f"URLs: {counts['resolved']} resolved · {counts['kept']} kept · "
         f"{counts['fallback']} fallback · {counts['empty']} empty")
