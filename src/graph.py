@@ -9,11 +9,13 @@ BASE = "https://graph.microsoft.com/v1.0"
 
 def _ensure_html(body: str) -> str:
     """Outlook expects draft bodies as HTML. Callers that hand-author HTML
-    (m03_meeting renders templates, server.py:draft_save calls _plain_to_html
-    upstream) keep their formatting; callers that pass AI-generated plain
-    text with `\\n` newlines (bot.py create_reply_draft, outreach worker,
-    teams_bot bulk-loader) used to get a single squashed paragraph in
-    Outlook because HTML drops raw newlines. This helper bridges both cases.
+    (e.g. m03_meeting renders HTML templates, or draft_save whose body already
+    became HTML when an HTML signature was appended) keep their formatting;
+    callers that pass AI-generated plain text with `\\n` newlines (bot.py
+    create_reply_draft, outreach worker, teams_bot bulk-loader, draft_save with
+    a plain/empty signature) used to get a single squashed paragraph in Outlook
+    because HTML drops raw newlines. This helper bridges both cases — and is the
+    SINGLE place draft bodies get HTML-ified, so it must stay idempotent.
 
     Detection: any tag-like sequence (`<tag>` or `</tag>`) signals pre-formed
     HTML and bypasses conversion. Otherwise treat as plain text — escape,
