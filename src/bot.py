@@ -18,6 +18,7 @@ from src.ai import DEFAULT_GEMINI_MODEL
 from src.modules.db_helpers import open_sqlite
 from src.modules.profile import load_profile_context, get_user_signature, append_signature_to_body
 from src.modules.subject_match import normalize_subject
+from src.modules.tz import now_local
 from src.modules.wiki import load_index, load_meeting
 from src.bot_tools.context import BotContext
 from src.bot_tools import registry
@@ -307,7 +308,7 @@ def reply(
     business_context  = load_profile_context(data_dir)
     writing_style     = settings.get("writing_style_note", "").strip()
     timezone_str      = settings.get("timezone", "UTC")
-    now_str           = datetime.now(timezone.utc).strftime("%A, %B %d, %Y %H:%M UTC")
+    now_str           = now_local(data_dir).strftime("%A, %B %d, %Y %H:%M %Z")
     bc_line           = f"\n\nBusiness context: {business_context}" if business_context else ""
     style_line        = (
         f"\n\nWriting style for all email drafts:\n{writing_style}"
@@ -378,7 +379,11 @@ def reply(
 
     system = (
         f"You are an AI executive assistant for {display_name}.{bc_line}{style_line}\n\n"
-        f"Today: {now_str}. Timezone: {timezone_str}.\n"
+        f"CURRENT DATE & TIME (authoritative): {now_str} [{timezone_str}].\n"
+        f"  This is the ONLY source of truth for 'today', 'tomorrow', 'this week', deadlines, etc.\n"
+        f"  IGNORE any date written in EARLIER messages of this conversation — they reflect when\n"
+        f"  those messages were sent and are likely stale. Always compute a relative day\n"
+        f"  (today/tomorrow/this Friday) from the CURRENT DATE above, never from older messages.\n"
         f"Be concise, professional, action-oriented. Use bullet points for lists.\n"
         f"Never invent data. Respond in the same language the user writes in.\n\n"
         f"LIST FORMATTING (important):\n"
@@ -474,6 +479,8 @@ def reply(
         f"  approve_draft / skip_draft → only when a pending draft is shown above\n"
         f"  update_crm_contact         → 'mark X as high priority', 'add note to Sarah', 'set company for John'\n"
         f"  create_calendar_event      → 'schedule meeting with X', 'block my calendar Friday', 'create Teams call'\n"
+        f"                               Pass `day` as the word the user used (today/tomorrow/friday/YYYY-MM-DD); the\n"
+        f"                               system computes the real date — never do the date arithmetic yourself.\n"
         f"  run_outreach               → 'draft outreach for the people I met at X', 'batch email contacts from OneDrive folder', 'draft outreach for everyone tagged Y'\n"
         f"  list_my_groups / list_group_members → 'what groups do I have?', 'who's in the Investors group?'\n"
         f"  draft_group_email          → 'draft/write an email about X to the GROUP/everyone tagged Y' — personalized per contact, draft-only; stages first, then confirm_group_email after the user agrees\n"
@@ -725,6 +732,11 @@ def reply(
     if web_link:
         from src.modules.links import wrap_draft_link
         final_text += f"\n\n<a href='{wrap_draft_link(web_link)}'>📬 Open draft in Outlook</a>"
+
+    event_link = state.pop("_last_event_web_link", None)
+    if event_link:
+        from src.modules.links import wrap_draft_link
+        final_text += f"\n\n<a href='{wrap_draft_link(event_link)}'>📅 Open event in Outlook</a>"
 
     actions_ok   = [n for n, ok in action_results.items() if ok]
     actions_fail = [n for n, ok in action_results.items() if not ok]
