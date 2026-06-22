@@ -3483,15 +3483,6 @@ def _html_to_plain(html: str) -> str:
     return text.strip()
 
 
-def _plain_to_html(text: str) -> str:
-    """Convert plain-text draft body to the HTML payload Outlook expects.
-    Preserves blank-line paragraph breaks and single-line line breaks."""
-    import html as _html
-    escaped = _html.escape(text or "")
-    paras = escaped.split("\n\n")
-    return "".join(f"<p>{p.replace(chr(10), '<br>')}</p>" for p in paras if p.strip() or True)
-
-
 def _fetch_original_email(uid: str, email_id: str) -> dict:
     """Return {subject, from_email, from_name, to_email, to_name, body_text,
     sent_date} for any mailbox message (inbox or sent items).
@@ -3671,7 +3662,13 @@ def draft_refine(body: dict, session: dict = Depends(require_session)):
 
 @app.post("/api/drafts/save")
 def draft_save(body: dict, session: dict = Depends(require_session)):
-    """Create a real Outlook draft via Graph. Plain-text body in → HTML out."""
+    """Create a real Outlook draft via Graph.
+
+    The body (plain text, OR already-HTML once an HTML signature was appended
+    upstream in draft_generate) is converted to HTML in exactly ONE place:
+    create_draft's _ensure_html, which is idempotent. Do NOT pre-convert here —
+    the old _plain_to_html() step double-escaped already-HTML bodies into literal
+    <p>/&#x27;/&amp; garbage for any user with an HTML signature (regression c5c4d43)."""
     uid     = session["user_id"]
     payload = body or {}
     to       = (payload.get("to") or "").strip()
@@ -3687,7 +3684,7 @@ def draft_save(body: dict, session: dict = Depends(require_session)):
     token = auth.get_valid_access_token(uid)
     graph = GraphClient(token)
     try:
-        result = graph.create_draft(subject=subject, body=_plain_to_html(body_txt), to=to)
+        result = graph.create_draft(subject=subject, body=body_txt, to=to)
     except Exception as e:
         raise HTTPException(500, f"Draft save failed: {e}")
     return {
