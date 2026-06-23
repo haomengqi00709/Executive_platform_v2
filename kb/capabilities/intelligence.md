@@ -10,7 +10,7 @@ describes_files:
   - src/modules/profile.py
   - src/modules/intel_enrich.py
   - src/modules/intel_dedup.py
-derived_from_commit: 502c2e9
+derived_from_commit: 3c08c7c
 last_synced: 2026-06-22
 volatile_pointers:
   - src/skills/market_intelligence/skill.md
@@ -46,11 +46,13 @@ the contract a future SQLite store will back without changing the search logic.
 - **Data source:** Gemini search grounding, scoped by the user's instruction + business
   profile / market segments (`src/modules/profile.py`). Optional per-user feeds add extra
   sources, off by default.
-- **Enrichment (top items):** the highest-ranked items are deep-read — `intel_enrich`
-  fetches the real article behind the top results and summarises from its full text (not a
-  search snippet), attaching only real, resolvable corroborating links; paywalled or
-  unreachable pages fall back to the snippet. Unresolvable links are dropped (no
-  google-search placeholder, in `references` or `source_url`). Shared with Company Intelligence.
+- **Enrichment (top items):** `intel_enrich` grounds a background per top item via Gemini
+  Google-Search grounding (NOT ddgs — ddgs is intermittently blocked on datacenter IPs, which
+  left backgrounds empty on Railway), attaching the real cited sources (`grounding_chunks`,
+  resolved; vertex-redirect / google-search fallbacks dropped, also from `source_url`).
+  Best-effort deep read: a resolved reference's full article is fetched (httpx) and the
+  background rewritten from it; paywalled / unfetchable pages keep the grounded background, so
+  a background is essentially never empty. Shared with Company Intelligence.
 
 ## Company Intelligence (`company_intelligence`)
 News and signals about specific companies the user has chosen to watch.
