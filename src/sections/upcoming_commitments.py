@@ -1,13 +1,9 @@
 """
-upcoming_commitments section — derived view of commitments_extract.
+upcoming_commitments section — derived view of the commitments store.
 
-No AI. Reads commitments_extract.json, filters to:
-  - type == "my_commitment"
-  - due_date within the next N days (default 7), OR already overdue
-  - due_date must be set (null entries excluded)
-
-Future: when M3 is ready, meeting_action_items.json action items
-with due_dates will be merged in as source="meeting".
+Base = visible my_commitments with a due_date within the next N days (overdue included),
+queried live from the store. Meeting action items (external, not store-owned) are merged in,
+overdue flags computed, then sorted. No AI, no state file.
 """
 import json
 from datetime import datetime, timedelta, timezone
@@ -15,7 +11,6 @@ from pathlib import Path
 
 from src.graph import GraphClient
 from src.ai import AIClient
-from src.modules.commitments_state import load_state, should_show, expire_asked, save_state
 from src.modules.tz import now_local
 from src.modules.text_utils import is_attendance_action_item
 
@@ -43,14 +38,12 @@ def run(
     settings: dict = None,
     progress=None,
 ) -> dict:
-    """
-    Derive upcoming commitments from commitments_extract.json.
-    Returns standard section result dict.
-    """
+    """Derive upcoming commitments from the store. Returns standard section result dict."""
     def log(msg: str):
         if progress:
             progress(msg)
 
+    from src.modules import commitments_store as store
     data_dir = Path(data_dir)
     settings = settings or {}
     window_days = int(settings.get("upcoming_commitments_days") or 7)
@@ -60,34 +53,11 @@ def run(
     today_str = today.strftime("%Y-%m-%d")
     cutoff_str = cutoff.strftime("%Y-%m-%d")
 
-    # ── 1. Read commitments_extract result ────────────────
-    extract_path = data_dir / "results" / "commitments_extract.json"
-    extract_data = _load_json(extract_path)
-
-    if extract_data.get("status") not in ("fresh", "stale"):
-        log("commitments_extract not yet run — returning not_run")
-        result = {
-            "id": "upcoming_commitments", "status": "not_run",
-            "last_run": None, "window_days": window_days,
-            "items": [], "count": 0, "empty": True,
-        }
-        _save_result(data_dir, result)
-        return result
-
-    all_commitments = extract_data.get("items", [])
-    log(f"Reading {len(all_commitments)} commitments from commitments_extract")
-
-    # ── 1b. Apply state filter (done / asked / snoozed) ───
-    state = load_state(data_dir)
-    expired = expire_asked(state)
-    if expired:
-        save_state(data_dir, state)
-    all_commitments = [c for c in all_commitments if should_show(c["id"], state, today_str)]
+    # ── 1. Base: visible my_commitments due within the window (overdue included) ──
+    all_commitments = store.query_upcoming(data_dir, today_str, cutoff_str)
+    log(f"Reading {len(all_commitments)} upcoming commitments from store")
 
     # ── 2. Merge meeting_action_items where the owner is the user ─────
-    # Match owner (e.g. "Jason") against display_name's first token. We accept
-    # an empty display_name as "owner unknown → include all" so the section
-    # isn't silently empty for users who haven't set their name yet.
     meeting_items_path = data_dir / "results" / "meeting_action_items.json"
     meeting_data = _load_json(meeting_items_path)
     exec_name = (settings.get("display_name") or "").strip().lower()
@@ -96,13 +66,10 @@ def run(
         if not item.get("due_date"):
             continue
         owner = (item.get("owner") or "").strip().lower()
-        # If we have an exec name, only include items owned by them.
-        # Otherwise (no name set) include all owned items.
         if exec_first and owner and exec_first not in owner and owner not in exec_first:
             continue
-        # Synthesise the commitment-shaped record the rest of the pipeline expects.
         all_commitments.append({
-            "id":          item.get("id") or item.get("meeting_id", "") + "_" + str(hash(item.get("action","")))[-8:],
+            "id":          item.get("id") or item.get("meeting_id", "") + "_" + str(hash(item.get("action", "")))[-8:],
             "type":        "my_commitment",
             "description": item.get("action", ""),
             "due_date":    item.get("due_date"),
@@ -123,25 +90,18 @@ def run(
         due = c.get("due_date")
         if not due:
             continue
-        # Include if overdue OR within window
         if due > cutoff_str:
             continue
-
-        # A past-due attendance item ("Attend the Thursday call") is a calendar
-        # event that already happened — nothing left to do, so it must not read
-        # as overdue. Future attend-items fall through and stay as reminders.
+        # A past-due attendance item already happened — not actionable, drop it.
         if due < today_str and is_attendance_action_item(c.get("description", "")):
             continue
 
         item = {**c, "source": c.get("source", "email")}
-
-        # Force high priority for overdue items
         if due < today_str:
             item["priority"] = "high"
             item["overdue"] = True
         else:
             item["overdue"] = False
-
         items.append(item)
 
     log(f"{len(items)} upcoming commitments (window: {window_days} days)")

@@ -17,11 +17,27 @@ def build(ctx):
         from src.bot import SECTION_IDS, _with_indices, _register_list
         if section_id not in SECTION_IDS:
             return f"Unknown section '{section_id}'. Available: {', '.join(SECTION_IDS)}"
-        result_path = ctx.data_dir / "results" / f"{section_id}.json"
-        if not result_path.exists():
-            return f"No results for '{section_id}' yet. Run the section first with run_skill()."
         try:
-            data = json.loads(result_path.read_text())
+            # Commitment lists come from the LIVE store (no snapshot-vs-state drift). The other
+            # commitment view, upcoming_commitments, keeps reading its JSON projection because it
+            # merges in meeting action items (the store's write_projection keeps it fresh/pruned).
+            if section_id in ("commitments_extract", "due_today"):
+                from src.modules import commitments_store as store
+                from src.modules.tz import today_local_str
+                today = today_local_str(ctx.data_dir)
+                if section_id == "commitments_extract":
+                    items = store.query_visible(ctx.data_dir, today)
+                    data = {"id": section_id, "status": "fresh", "items": items}
+                else:
+                    items = store.query_due_today(ctx.data_dir, today)
+                    data = {"id": section_id, "status": "fresh", "date": today, "items": items}
+                data["count"] = len(items)
+                data["empty"] = not items
+            else:
+                result_path = ctx.data_dir / "results" / f"{section_id}.json"
+                if not result_path.exists():
+                    return f"No results for '{section_id}' yet. Run the section first with run_skill()."
+                data = json.loads(result_path.read_text())
             if isinstance(data.get("items"), list):
                 # Order items to match exactly what the Teams briefing displays, so a "#N" the
                 # user saw in a pushed briefing resolves to the same item here.
