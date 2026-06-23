@@ -276,29 +276,24 @@ def load_crm(data_dir: Path) -> dict:
 
 
 def save_crm(data_dir: Path, crm: dict) -> None:
-    """Atomically write crm.json."""
-    f = Path(data_dir) / "crm.json"
-    tmp = f.with_suffix(".tmp")
-    tmp.write_text(json.dumps(crm, indent=2, ensure_ascii=False))
-    tmp.replace(f)
+    """Persist the CRM. Routed through the SQLite store (per-contact rows in one transaction — no
+    whole-file corruption race that the old direct crm.json write had); crm.json is regenerated as a
+    synced projection so every reader stays unchanged. Edit-preservation for the AI rebuild is kept
+    by crm._merge_ai_enrichment upstream (parity with the prior behaviour). Deferred import avoids
+    the crm_store→crm cycle."""
+    from src.modules import crm_store
+    crm_store.replace_from_dict(data_dir, crm)
 
 
 def update_contact(data_dir: Path, email: str, field: str, value) -> dict:
     """Update a single field on a CRM contact. Creates the contact entry if it doesn't exist.
-    'notes' field appends with timestamp instead of overwriting."""
-    from datetime import datetime as _dt
-    crm = load_crm(data_dir)
-    contacts = crm.setdefault("contacts", {})
-    contact = dict(contacts.get(email.lower(), {}))
-    if field == "notes":
-        existing = contact.get("notes", "")
-        stamp = _dt.now().strftime("%Y-%m-%d")
-        contact["notes"] = f"{existing}\n[{stamp}] {value}".strip()
-    else:
-        contact[field] = value
-    contacts[email.lower()] = contact
-    save_crm(data_dir, crm)
-    return contact
+    'notes' field appends with timestamp instead of overwriting.
+
+    Routed through the SQLite store (atomic per-contact write — no whole-file race with the daily
+    rebuild); crm.json is kept synced as a projection so all readers stay unchanged. Deferred
+    import avoids the crm_store→crm import cycle."""
+    from src.modules import crm_store
+    return crm_store.update_contact_field(data_dir, email, field, value)
 
 
 def add_contacts_bulk(data_dir: Path, raw_contacts: list, source: str,
