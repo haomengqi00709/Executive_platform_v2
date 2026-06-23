@@ -11,3 +11,4 @@ Append-only. One line per event. Grep recent: `grep '^## \[' kb/log.md | tail -5
 ## [2026-06-22] sync | intelligence — market_intelligence fan-out search (planner-derived angles) + top-N cap + per-user recency filter @ad23782
 ## [2026-06-22] sync | intelligence — market_intelligence drops unresolvable source_url (no google-search fallback link) @8a20893
 ## [2026-06-22] sync | intelligence — intel_enrich deep-reads full article text (vs snippet) for top items + drops fallback refs @c71aa4c
+## [2026-06-23] sync | intelligence — market_intelligence intersection search (lens × domain via get_market_config) + permanent md5-exact dedup @502c2e9
