@@ -620,13 +620,10 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
     seen_msg_ids = set(monitor_state.get("seen_msg_ids") or [])
     realtime_pushed_ids = set(monitor_state.get("realtime_pushed_ids") or [])
 
-    # Prune priority followups that have already been replied to
-    followups = monitor_state.get("pending_priority_followup") or []
-    if followups:
-        try:
-            monitor_state["pending_priority_followup"] = _check_replied(followups, owner_graph)
-        except Exception as e:
-            print(f"[EmailMonitor] Reply check error: {e}")
+    # (Removed: the dead `pending_priority_followup` prune. That priority-followup-reminder feature
+    # was retired when reply_needed became the single digest source (commit 14c3a9c, 2026-05-27) —
+    # nothing has populated the list since, so this was a no-op on an always-empty list. Follow-up
+    # dismissal now lives in followup_needed + the email_handled 'followup_dismissed' annotation.)
 
     last_ts = monitor_state.get("last_checked_ts") or ""
 

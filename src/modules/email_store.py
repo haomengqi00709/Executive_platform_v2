@@ -155,13 +155,17 @@ def mark_handled(data_dir, *, counterparty: str, subject: str, kind: str = "draf
     return True
 
 
-def get_handled_map(data_dir) -> dict:
-    """{(counterparty, norm_subject): {kind, target_subject, email_id, conversation_id, handled_at}}
-    — loaded once by reply_needed before its handled loop."""
+def get_handled_map(data_dir, kinds=None) -> dict:
+    """{(counterparty, norm_subject): {kind, target_subject, email_id, conversation_id, handled_at}}.
+    `kinds` filters by annotation kind so reply_needed (REPLY_KINDS, keyed on the SENDER) and
+    followup_needed (FOLLOWUP_KINDS, keyed on the RECIPIENT) never cross-contaminate even when a
+    (counterparty, subject) pair collides between the two directions."""
     con = _conn(data_dir)
     try:
         out = {}
         for r in con.execute("SELECT * FROM email_handled"):
+            if kinds and r["kind"] not in kinds:
+                continue
             out[(r["counterparty"], r["norm_subject"])] = {
                 "kind": r["kind"], "target_subject": r["target_subject"],
                 "email_id": r["email_id"], "conversation_id": r["conversation_id"],
@@ -187,21 +191,28 @@ def is_handled(data_dir, counterparty: str, subject: str) -> dict | None:
         con.close()
 
 
-def overlay_handled(data_dir, items: list) -> tuple[list, list]:
-    """Read-time overlay for reply_needed: split items into (still-open, now-handled) using the
-    durable handled table. The expensive AI-computed list comes from the cached snapshot; THIS
-    cheap live lookup removes any email the user already drafted/replied to — so it drops off
-    immediately, without re-running the slow/costly Graph+AI section. Matched by
-    (sender, normalized subject), the same key approve_draft writes."""
-    handled = get_handled_map(data_dir)
+# Annotation kinds, split by direction so the two read-time overlays don't cross-contaminate:
+REPLY_KINDS = frozenset({"drafted", "replied"})        # reply_needed: emails I acted on (keyed on sender)
+FOLLOWUP_KINDS = frozenset({"followup_dismissed"})     # followup_needed: follow-ups I dismissed (keyed on recipient)
+
+
+def overlay_handled(data_dir, items: list, kinds=None, key_field: str = "from_email") -> tuple[list, list]:
+    """Read-time overlay: split items into (still-open, now-handled/dismissed) using the durable
+    annotation table. The expensive AI-computed list stays the cached snapshot; THIS cheap live
+    lookup removes any item the user already acted on — so it drops off immediately, without
+    re-running the slow/costly Graph+AI section.
+      - reply_needed:    kinds=REPLY_KINDS,    key_field='from_email' (the inbound sender)
+      - followup_needed: kinds=FOLLOWUP_KINDS, key_field='to_email'   (the recipient I followed up with)
+    """
+    handled = get_handled_map(data_dir, kinds)
     if not handled:
         return list(items or []), []
     open_items, now_handled = [], []
     for it in items or []:
-        cp = (it.get("from_email") or "").strip().lower()
+        cp = (it.get(key_field) or "").strip().lower()
         key = (cp, normalize_subject(it.get("subject") or ""))
         if cp and key in handled:
-            now_handled.append({**it, "_handled_kind": handled[key].get("kind") or "drafted"})
+            now_handled.append({**it, "_handled_kind": handled[key].get("kind") or ""})
         else:
             open_items.append(it)
     return open_items, now_handled

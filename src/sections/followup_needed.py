@@ -492,6 +492,27 @@ def run(
     urgency_order = {"high": 0, "medium": 1, "low": 2}
     items.sort(key=lambda x: (urgency_order.get(x.get("urgency", "medium"), 1), -x.get("days_waiting", 0)))
 
+    # ── 11. Exclude follow-ups the user dismissed (durable store annotation) ──
+    # So a "skip the follow up to X" sticks — the item drops out of the snapshot the briefing
+    # reads too, not just the bot's read-time overlay. Keyed by (recipient, normalized subject).
+    try:
+        from src.modules import email_store
+        from src.modules.subject_match import normalize_subject
+        dismissed = email_store.get_handled_map(data_dir, kinds=email_store.FOLLOWUP_KINDS)
+        if dismissed:
+            kept = []
+            for it in items:
+                key = ((it.get("to_email") or "").strip().lower(), normalize_subject(it.get("subject") or ""))
+                if key in dismissed:
+                    handled_sidecar.append({
+                        "email_id": it.get("email_id", ""), "email_subject": it.get("subject", ""),
+                        "email_to": it.get("to_email", ""), "handled_by": {"kind": "followup_dismissed"}})
+                else:
+                    kept.append(it)
+            items = kept
+    except Exception:
+        pass
+
     result = {
         "id":       "followup_needed",
         "status":   "fresh",

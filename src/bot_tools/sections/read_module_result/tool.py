@@ -44,25 +44,32 @@ def build(ctx):
                 if not result_path.exists():
                     return f"No results for '{section_id}' yet. Run the section first with run_skill()."
                 data = json.loads(result_path.read_text())
-                # Read-time handled overlay: an email the user already drafted/replied to (recorded
-                # live in the store) drops off IMMEDIATELY here — no need to re-run the slow/costly
-                # Graph+AI section. The list stays the cached snapshot; only the cheap handled-status
-                # is live. reply_needed only (its from_email is the counterparty approve_draft keys on).
-                if section_id == "reply_needed" and isinstance(data.get("items"), list):
+                # Read-time handled overlay: an email the user already acted on (recorded live in
+                # the store) drops off IMMEDIATELY here — no re-run of the slow/costly Graph+AI
+                # section. The list stays the cached snapshot; only the cheap status is live.
+                #   reply_needed    → drafted/replied, keyed on the inbound SENDER (from_email)
+                #   followup_needed → dismissed,       keyed on the RECIPIENT  (to_email)
+                if section_id in ("reply_needed", "followup_needed") and isinstance(data.get("items"), list):
                     try:
                         from src.modules import email_store
-                        kept, moved = email_store.overlay_handled(ctx.data_dir, data["items"])
+                        if section_id == "reply_needed":
+                            kept, moved = email_store.overlay_handled(
+                                ctx.data_dir, data["items"],
+                                kinds=email_store.REPLY_KINDS, key_field="from_email")
+                        else:
+                            kept, moved = email_store.overlay_handled(
+                                ctx.data_dir, data["items"],
+                                kinds=email_store.FOLLOWUP_KINDS, key_field="to_email")
                         if moved:
-                            # Append to the handled sidecar in the SAME shape the section emits
-                            # (email_subject / email_from / handled_by) so check_email_handling
-                            # recognizes an overlay-excluded email as handled, not just dropped.
+                            # Append to the handled sidecar in the section's shape so
+                            # check_email_handling recognizes an overlay-excluded item.
                             sidecar = data.get("handled") or []
                             for it in moved:
                                 sidecar.append({
                                     "email_id":      it.get("email_id", ""),
                                     "email_subject": it.get("subject", ""),
-                                    "email_from":    (it.get("from_email") or "").lower(),
-                                    "handled_by":    {"kind": it.get("_handled_kind", "drafted")},
+                                    "email_from":    (it.get("from_email") or it.get("to_email") or "").lower(),
+                                    "handled_by":    {"kind": it.get("_handled_kind", "")},
                                 })
                             data["items"] = kept
                             data["handled"] = sidecar

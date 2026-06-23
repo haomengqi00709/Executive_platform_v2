@@ -35,25 +35,48 @@ def test_approve_draft_records_handled_with_reply_needed_key(tmp_path):
     assert es.is_handled(tmp_path, "daniel@imodel3d.com", "MEP Ai Tools")["kind"] == "drafted"
 
 
-def test_dismiss_followup_through_store(tmp_path):
-    """dismiss_email_followup edits pending_priority_followup via the store (atomic), not a raw file."""
-    from src.bot_tools.email.dismiss_email_followup.tool import build
-    es.save_poller_state(tmp_path, {"pending_priority_followup": [
-        {"from_name": "Bob", "from": "bob@x.com", "subject": "Q3 deal"},
-        {"from_name": "Alice", "from": "alice@x.com", "subject": "Lunch"}]})
-    out = build(_ctx(tmp_path))("bob")
-    assert "Removed 1" in out
-    rem = es.get_poller_state(tmp_path)["pending_priority_followup"]
-    assert len(rem) == 1 and rem[0]["from_name"] == "Alice"
+def _seed_followup(tmp_path, items):
+    import json
+    (tmp_path / "results").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "results" / "followup_needed.json").write_text(json.dumps(
+        {"id": "followup_needed", "status": "fresh", "items": items, "handled": [], "count": len(items)}))
 
 
-def test_dismiss_followup_no_match(tmp_path):
+def test_dismiss_followup_acts_on_followup_needed_and_sticks(tmp_path):
+    """The original痛点, fixed: 'skip the follow up to daniel' resolves against the LIVE
+    followup_needed list, records a durable followup_dismissed annotation, and the item drops
+    off the followup_needed read immediately (and stays off)."""
+    import json
     from src.bot_tools.email.dismiss_email_followup.tool import build
-    es.save_poller_state(tmp_path, {"pending_priority_followup": [
-        {"from_name": "Bob", "from": "bob@x.com", "subject": "Q3"}]})
+    from src.bot_tools.sections.read_module_result.tool import build as build_read
+    _seed_followup(tmp_path, [
+        {"email_id": "S1", "to_email": "daniel@trustai.com", "to_name": "Daniel",
+         "subject": "Testing", "sent": "2026-06-20T00:00:00Z", "days_waiting": 3, "urgency": "medium"},
+        {"email_id": "S2", "to_email": "other@x.com", "to_name": "Other",
+         "subject": "Proposal", "sent": "2026-06-21T00:00:00Z", "days_waiting": 2, "urgency": "high"}])
+    out = build(_ctx(tmp_path))("daniel")
+    assert "Dismissed 1" in out, out
+    data = json.loads(build_read(_ctx(tmp_path, settings={"timezone": "UTC"}))("followup_needed"))
+    subs = {it["subject"] for it in data["items"]}
+    assert "Testing" not in subs and "Proposal" in subs, subs
+
+
+def test_dismiss_followup_no_match_honest(tmp_path):
+    from src.bot_tools.email.dismiss_email_followup.tool import build
+    _seed_followup(tmp_path, [{"email_id": "S1", "to_email": "a@x.com", "to_name": "A", "subject": "X"}])
     out = build(_ctx(tmp_path))("nobody")
-    assert "No follow-up reminder matched" in out
-    assert len(es.get_poller_state(tmp_path)["pending_priority_followup"]) == 1
+    assert "can't find a follow-up" in out
+
+
+def test_followup_dismiss_does_not_leak_into_reply_needed(tmp_path):
+    """Kind isolation: dismissing a follow-up to X must NOT hide an INBOUND reply_needed from X
+    (same person + subject, opposite direction)."""
+    es.mark_handled(tmp_path, counterparty="daniel@trustai.com", subject="Testing",
+                    kind="followup_dismissed", source="dismiss_followup")
+    kept, moved = es.overlay_handled(
+        tmp_path, [{"email_id": "E1", "from_email": "daniel@trustai.com", "subject": "Testing"}],
+        kinds=es.REPLY_KINDS, key_field="from_email")
+    assert len(kept) == 1 and len(moved) == 0
 
 
 def test_read_module_result_overlays_handled(tmp_path):
