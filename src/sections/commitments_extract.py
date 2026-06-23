@@ -22,13 +22,8 @@ from src.modules.crm import load_crm
 from src.modules.projects import load_projects
 from src.modules.profile import load_profile_context
 from src.modules.validator import validate_output
-from src.modules.commitments_state import (
-    load_state, save_state, should_show, expire_asked, mark_asked,
-)
-from src.modules.commitments_cache import (
-    load_cache, save_cache, prune_cache, get_last_processed,
-    add_email_result, flatten_commitments,
-)
+from src.modules import commitments_store as store
+from src.modules.commitments_cache import _extract_msg_meta
 
 _SKILL_FILE = Path(__file__).parent.parent / "skills" / "commitments_extract" / "skill.md"
 _BATCH_SIZE = 8
@@ -195,9 +190,8 @@ def run(
     all_projects = list(projects_db.get("projects", {}).values())
 
     # ── 3. Load cache + determine fetch range ─────────────
-    cache = load_cache(data_dir)
-    prune_cache(cache)
-    last_processed = get_last_processed(cache)
+    store.prune_processed(data_dir)
+    last_processed = store.get_last_processed(data_dir)
     force_refresh = settings.get("commitment_force_refresh", False)
 
     if last_processed and not force_refresh:
@@ -209,8 +203,7 @@ def run(
             raw_inbox = []
     else:
         if force_refresh:
-            log("Force refresh: clearing cache, fetching 21 days...")
-            cache = {}
+            log("Force refresh: re-fetching 21 days, re-processing all...")
         else:
             log("First run: fetching inbox (last 21 days)...")
         try:
@@ -220,8 +213,8 @@ def run(
             raw_inbox = []
 
     # ── 4. Screen + extract only NEW emails ───────────────
-    # Skip emails already in cache
-    cached_ids = set(cache.get("emails", {}).keys())
+    # Skip emails already processed (force_refresh re-processes everything)
+    cached_ids = set() if force_refresh else store.get_processed_ids(data_dir)
     new_inbox = [m for m in raw_inbox if m.get("id") not in cached_ids]
     log(f"{len(new_inbox)} new emails to process ({len(raw_inbox) - len(new_inbox)} already cached)")
 
@@ -251,6 +244,7 @@ def run(
         # AI batch extraction on new emails
         index_map: dict[int, dict] = {i: msg for i, msg, _ in indexed}
         batches = [indexed[j:j + _BATCH_SIZE] for j in range(0, len(indexed), _BATCH_SIZE)]
+        pending: dict = {}
         for b_num, batch in enumerate(batches, 1):
             log(f"Extracting commitments from batch {b_num}/{len(batches)} ({len(batch)} emails)...")
             extracted = _extract_batch(batch, skill_text, ai, display_name, date_str, user_instruction)
@@ -263,34 +257,28 @@ def run(
                 msg = index_map[email_index]
                 email_id = msg.get("id", "")
                 received = msg.get("receivedDateTime", "")
-                # Accumulate per-email, then write to cache after loop
-                pending = cache.setdefault("_pending", {})
                 if email_id not in pending:
                     pending[email_id] = {"received": received, "_msg": msg, "commitments": []}
                 pending[email_id]["commitments"].append(c)
 
-        # Write pending extractions into cache (with msg_meta for dedup on future runs)
-        for email_id, entry in cache.pop("_pending", {}).items():
-            src_msg = entry.get("_msg") or {}
-            add_email_result(cache, email_id, entry["received"], entry["commitments"], msg=src_msg)
+        # Persist extractions to the store (msg_meta lets future runs dedup without re-fetching)
+        for email_id, entry in pending.items():
+            store.mark_email_processed(data_dir, email_id, entry["received"],
+                                       entry["commitments"], _extract_msg_meta(entry.get("_msg") or {}))
 
-        # Also mark emails with 0 commitments as processed (so we skip them next run)
+        # Mark 0-commitment emails processed too, so we skip them next run
         for i, msg, _ in indexed:
             eid = msg.get("id", "")
-            if eid not in cache.get("emails", {}):
-                add_email_result(cache, eid, msg.get("receivedDateTime", ""), [], msg=msg)
-
-        save_cache(data_dir, cache)
+            if eid and eid not in pending:
+                store.mark_email_processed(data_dir, eid, msg.get("receivedDateTime", ""),
+                                           [], _extract_msg_meta(msg))
 
     # Clear force_refresh flag if set
     if force_refresh and settings.get("commitment_force_refresh"):
         settings["commitment_force_refresh"] = False
 
-    # ── 5. Flatten all cached commitments ─────────────────
-    # Build msg_index from all fetched emails (new + cached context is minimal;
-    # we only have full msg objects for emails fetched this run)
-    msg_index: dict[str, dict] = {m.get("id", ""): m for m in raw_inbox}
-    all_raw = flatten_commitments(cache, msg_index)
+    # ── 5. Flatten all stored raw commitments (for cross-run dedup) ──
+    all_raw = store.get_raw_extractions(data_dir)
     log(f"{len(all_raw)} raw commitments extracted before dedup")
 
     # ── 6. Dedup ──────────────────────────────────────────
@@ -391,43 +379,36 @@ def run(
 
     items.sort(key=sort_key)
 
-    # ── 10. State filtering (done / asked / snoozed) ──────
+    # ── 10. Persist to the store + run the check-in (asked) lifecycle ──
     ask_days     = int(settings.get("commitment_ask_days", 7))
     expire_hours = int(settings.get("commitment_expire_hours", 24))
-    state        = load_state(data_dir)
-    expired      = expire_asked(state)       # move stale asked → done
-    if expired:
-        log(f"{len(expired)} commitments auto-expired")
 
+    store.upsert_commitments(data_dir, items)   # content upsert — preserves done/snoozed/asked
+    store.expire_asked(data_dir)                 # stale 'asked' → auto-done
+
+    # Snapshot visibility BEFORE marking newly-stale items as asked, so a freshly-stale
+    # commitment is surfaced ONCE this run (with a check-in flag), then hidden afterwards.
+    visible_items = store.query_visible(data_dir, today_str)
+    vis_by_id = {it["id"]: it for it in visible_items}
     newly_asked: list[dict] = []
-    visible_items: list[dict] = []
-
+    from datetime import date as _date
     for item in items:
         cid = item["id"]
-        if not should_show(cid, state, today_str):
+        if cid not in vis_by_id:
             continue
-        # Check if this item should trigger a check-in
         received_date = (item.get("received") or "")[:10]
-        due_date      = item.get("due_date")
+        due_date = item.get("due_date")
         days_old = 0
         if received_date:
             try:
-                from datetime import date
-                days_old = (date.today() - date.fromisoformat(received_date)).days
+                days_old = (_date.today() - _date.fromisoformat(received_date)).days
             except Exception:
                 pass
-        is_stale = (
-            (not due_date and days_old >= ask_days) or
-            (due_date and due_date < today_str)
-        )
+        is_stale = ((not due_date and days_old >= ask_days) or (due_date and due_date < today_str))
         if is_stale:
-            mark_asked(data_dir, cid, expire_hours)
+            store.mark_asked(data_dir, cid, expire_hours)
+            vis_by_id[cid]["_asked"] = True
             newly_asked.append(item)
-            # Still include in result so bot can reference by number
-            item = {**item, "_asked": True}
-        visible_items.append(item)
-
-    save_state(data_dir, state)
 
     if newly_asked:
         log(f"Check-in triggered for {len(newly_asked)} stale commitments")
@@ -441,7 +422,7 @@ def run(
         "empty":       len(visible_items) == 0,
         "newly_asked": [c["id"] for c in newly_asked],
     }
-    _save_result(data_dir, result)
+    store.write_projection(data_dir)   # sync commitments_extract.json + state.json + prune derived
 
     my_count = sum(1 for x in visible_items if x["type"] == "my_commitment")
     their_count = len(visible_items) - my_count

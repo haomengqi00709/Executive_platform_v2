@@ -2712,17 +2712,11 @@ def run_section(section_id: str, background_tasks: BackgroundTasks,
 
 @app.get("/api/sections/due_today")
 def get_due_today(session: dict = Depends(require_session)):
-    """Derived section — real-time filter of commitments_extract for due_date == today."""
+    """Derived section — live query of the commitments store for due_date == today."""
+    from src.modules import commitments_store as store
     uid = session["user_id"]
     today_str = today_local_str(_udir(uid))
-    path = _udir(uid) / "results" / "commitments_extract.json"
-    if not path.exists():
-        return {"id": "due_today", "status": "not_run", "items": [], "count": 0, "empty": True}
-    data = _read_json(path)
-    items = [
-        item for item in data.get("items", [])
-        if item.get("due_date") == today_str and item.get("type") == "my_commitment"
-    ]
+    items = store.query_due_today(_udir(uid), today_str)
     return {
         "id": "due_today", "status": "fresh",
         "date": today_str, "items": items,
@@ -3499,17 +3493,17 @@ def trigger_companies_scan(background_tasks: BackgroundTasks,
 
 @app.post("/api/commitments/{commitment_id}/done")
 def commitment_mark_done(commitment_id: str, session: dict = Depends(require_session)):
-    from src.modules.commitments_state import mark_done
-    mark_done(_udir(session["user_id"]), commitment_id, method="user")
+    from src.modules import commitments_store as store
+    store.mark_done(_udir(session["user_id"]), commitment_id, method="user")
     return {"ok": True, "id": commitment_id, "state": "done"}
 
 
 @app.post("/api/commitments/{commitment_id}/snooze")
 def commitment_snooze(commitment_id: str, body: dict | None = None,
                       session: dict = Depends(require_session)):
-    from src.modules.commitments_state import mark_snoozed
+    from src.modules import commitments_store as store
     days = int((body or {}).get("days") or 3)
-    mark_snoozed(_udir(session["user_id"]), commitment_id, days=days)
+    store.mark_snoozed(_udir(session["user_id"]), commitment_id, days=days)
     return {"ok": True, "id": commitment_id, "state": "snoozed", "days": days}
 
 

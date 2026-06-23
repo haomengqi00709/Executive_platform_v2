@@ -1,10 +1,9 @@
 """
-due_today section — Derived from commitments_extract.
+due_today section — derived view of the commitments store.
 
-Real-time filter of `results/commitments_extract.json` for items where
-`due_date == today` AND `type == "my_commitment"` AND not done/snoozed.
-
-No AI. No own data cache (reads upstream + writes own result snapshot).
+Queries the live store for `due_date == today` AND `type == "my_commitment"` AND visible
+(not done/snoozed/asked), then applies the user-preference validator. No AI extraction, no
+own cache — the store is the single source of truth.
 """
 import json
 from datetime import datetime, timezone
@@ -50,50 +49,18 @@ def run(
             progress(msg)
         print(f"[due_today] {msg}")
 
+    from src.modules import commitments_store as store
     data_dir = Path(data_dir)
     results_path = data_dir / "results" / f"{_RESULT_ID}.json"
     results_path.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
     today_str = today_local_str(data_dir)
 
-    src_path = data_dir / "results" / "commitments_extract.json"
-    if not src_path.exists():
-        _p("commitments_extract.json missing — run that section first")
-        result = {
-            "id":       _RESULT_ID,
-            "status":   "not_run",
-            "last_run": now.isoformat(),
-            "date":     today_str,
-            "items":    [],
-            "count":    0,
-            "empty":    True,
-            "empty_reason": "upstream_not_run",
-        }
-        results_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
-        return result
-
-    try:
-        upstream = json.loads(src_path.read_text())
-    except Exception as e:
-        _p(f"Failed to read commitments_extract.json: {e}")
-        upstream = {"items": []}
-
-    src_items = upstream.get("items", [])
-    items = []
-    for it in src_items:
-        if it.get("due_date") != today_str:
-            continue
-        if it.get("type") != "my_commitment":
-            continue
-        if it.get("state") in ("done", "snoozed") or it.get("completed"):
-            continue
-        items.append(it)
-
+    items = store.query_due_today(data_dir, today_str)
     items.sort(key=lambda x: (
         {"high": 0, "medium": 1, "low": 2}.get(x.get("priority", "medium"), 1),
         x.get("received", ""),
     ))
-
     _p(f"{len(items)} item(s) before user-preference review")
 
     user_instruction = _load_user_instruction(data_dir)

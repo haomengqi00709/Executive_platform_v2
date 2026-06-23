@@ -6,6 +6,7 @@ Returns: (reply_text, updated_state)
 """
 import json
 import os
+import re
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -146,6 +147,59 @@ def _build_current_views(state: dict) -> str:
         )
     except Exception:
         return ""
+
+
+# A line that is part of a rendered list (bullet, "[#N]", "N.", or a priority emoji) — used to
+# split a reply's prose preamble from its list body.
+_LIST_LINE_RE = re.compile(r"^\s*(\[#?\d+\]|#\d+|\d+[.)]|[•*]|-\s|🔴|🟡|🟢|⚠️|📌|📅|📆)")
+
+# Lightweight signal that the user asked to SEE a list (so an under-listed reply should be
+# completed even if the model wrote no bullets). Multilingual; permissive on purpose — a false
+# positive only appends the full canonical list, which is never wrong, just verbose.
+_DISPLAY_HINTS = (
+    "show", "list", "display", "what's my", "whats my", "what are my", "what is my",
+    "give me", "all my", "everything", "my commitment", "my task", "my action",
+    "my email", "my to-do", "my todo", "my follow", "outstanding", "pending",
+    "显示", "列出", "列一下", "看一下", "看下", "有哪些", "我的", "全部", "所有", "待办", "承诺", "任务",
+)
+
+
+def _enforce_list_completeness(text: str, state: dict, user_text: str) -> str:
+    """Approaches 1+3 for list display. read_module_result stashes the deterministic full render
+    of any list section it read (identical to the Teams briefing) into state['_pending_render'].
+    Here, if the model's own reply omits items it should have listed — it enumerated only a subset,
+    OR the user asked to see the list and the model under-showed — we substitute the canonical
+    block so a commitment/email/etc. is never silently dropped. A reply that already lists every
+    item, or a non-list (analytical) answer, is left untouched."""
+    try:
+        pend = state.pop("_pending_render", None) if isinstance(state, dict) else None
+        if not pend:
+            return text
+        block  = (pend.get("block") or "").strip()
+        labels = pend.get("labels") or []
+        count  = int(pend.get("count") or 0)
+        if not block or count <= 0 or not labels:
+            return text
+        low = (text or "").lower()
+        present = sum(1 for lbl in labels if lbl and lbl in low)
+        has_list_lines = any(_LIST_LINE_RE.match(ln) for ln in (text or "").splitlines())
+        is_display = any(h in (user_text or "").lower() for h in _DISPLAY_HINTS)
+        truncated = (has_list_lines and 1 <= present < count) or (is_display and present < count)
+        if not truncated:
+            return text
+        # Keep any non-list preamble the model wrote, then append the full canonical list.
+        preamble_lines = []
+        for ln in (text or "").splitlines():
+            if _LIST_LINE_RE.match(ln):
+                break
+            preamble_lines.append(ln)
+        preamble = "\n".join(preamble_lines).strip()
+        print(f"[Bot] list-completeness guard: model showed {present}/{count} "
+              f"{pend.get('section_id')} item(s) — substituting canonical render")
+        return (preamble + "\n\n" + block).strip() if preamble else block
+    except Exception:
+        return text
+
 
 SECTION_IDS = {
     "ai_summary":           "Morning Briefing — daily summary of calendar, emails, priorities, and key relationships",
@@ -726,6 +780,10 @@ def reply(
     if not final_text:
         finish_mode = "fallback"
         final_text = HONEST_FALLBACK
+
+    # List-completeness guard (approaches 1+3): if the model truncated a list section it read
+    # this turn, substitute the deterministic full render so nothing is silently dropped.
+    final_text = _enforce_list_completeness(final_text, state, text)
 
     # Append Outlook draft link if create_reply_draft saved one this turn
     web_link = state.pop("_last_draft_web_link", None)
