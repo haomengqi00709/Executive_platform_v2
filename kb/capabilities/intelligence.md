@@ -10,7 +10,7 @@ describes_files:
   - src/modules/profile.py
   - src/modules/intel_enrich.py
   - src/modules/intel_dedup.py
-derived_from_commit: 331a41b
+derived_from_commit: a16ce76
 last_synced: 2026-06-22
 volatile_pointers:
   - src/skills/market_intelligence/skill.md
@@ -52,7 +52,9 @@ the contract a future SQLite store will back without changing the search logic.
   resolved; vertex-redirect / google-search fallbacks dropped, also from `source_url`).
   Best-effort deep read: a resolved reference's full article is fetched (httpx) and the
   background rewritten from it; paywalled / unfetchable pages keep the grounded background, so
-  a background is essentially never empty. Shared with Company Intelligence.
+  a background is essentially never empty. If the main search left an item's `source_url` empty
+  (its model-self-reported URL failed to resolve) a real resolved citation is promoted to be the
+  `source_url`, so the item still gets a working link. Shared with Company Intelligence.
 
 ## Company Intelligence (`company_intelligence`)
 News and signals about specific companies the user has chosen to watch.

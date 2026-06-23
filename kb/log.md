@@ -14,3 +14,4 @@ Append-only. One line per event. Grep recent: `grep '^## \[' kb/log.md | tail -5
 ## [2026-06-23] sync | intelligence — market_intelligence intersection search (lens × domain via get_market_config) + permanent md5-exact dedup @502c2e9
 ## [2026-06-23] sync | intelligence — intel_enrich grounds backgrounds via Gemini search (drops ddgs, unreliable on datacenter IPs) @3c08c7c
 ## [2026-06-23] sync | intelligence — intel_enrich background prompts no longer centre on reader's name (fixes "no info about <name>" backgrounds) @331a41b
+## [2026-06-23] sync | intelligence — intel_enrich backfills empty source_url from a real grounding-cited link (main search's model-reported URL often fails) @a16ce76
