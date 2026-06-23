@@ -143,6 +143,24 @@ def _extract_search_queries(response) -> list:
     return out
 
 
+def _extract_grounding_sources(response) -> list:
+    """Real cited source links from candidates[].grounding_metadata.grounding_chunks[].web.{uri,title}
+    — the actual pages Google returned for this grounded call (the anti-hallucination set: cite only
+    from here). Returns [{title, url}]."""
+    out: list = []
+    try:
+        for c in (getattr(response, "candidates", None) or []):
+            gm = getattr(c, "grounding_metadata", None)
+            for ch in (getattr(gm, "grounding_chunks", None) or []) if gm else []:
+                web = getattr(ch, "web", None)
+                uri = getattr(web, "uri", None) if web else None
+                if uri:
+                    out.append({"title": (getattr(web, "title", "") or ""), "url": str(uri)})
+    except Exception:
+        pass
+    return out
+
+
 def _record_usage(response, is_search: bool, feature_override: str | None = None,
                   model: str | None = None) -> None:
     """Best-effort: record one call's token usage — and, for grounded calls, the
@@ -419,6 +437,42 @@ class AIClient:
                     time.sleep(5)
                 else:
                     raise
+
+    def generate_with_search_cited(self, prompt: str,
+                                   timeout_secs: int | None = None) -> tuple[str, list]:
+        """Like generate_with_search, but ALSO returns the real cited source links from the
+        grounding metadata. Used by enrich to ground a background + attach guaranteed-real
+        references WITHOUT a separate ddgs search (ddgs is intermittently blocked on datacenter
+        IPs; Gemini grounding is the same reliable path the main search uses). Returns
+        (text, [{title, url}]); ("", []) on failure is a legitimate 'nothing found' outcome —
+        enrich is best-effort and must never crash the run."""
+        _budget_guard()
+        eff_timeout = timeout_secs or _GEMINI_SEARCH_TIMEOUT_SECS
+        _late = _late_usage_recorder(dict(_usage_ctx.get()), self.model, is_search=True)
+        for attempt in range(2):
+            try:
+                response = _call_with_timeout(
+                    lambda: self.client.models.generate_content(
+                        model=self.model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            tools=[types.Tool(google_search=types.GoogleSearch())],
+                        ),
+                    ),
+                    eff_timeout, on_late=_late,
+                )
+                _record_usage(response, is_search=True, model=self.model)
+                return (response.text or ""), _extract_grounding_sources(response)
+            except Exception as e:
+                if _is_quota_error(e):
+                    raise
+                if isinstance(e, TimeoutError) and attempt < 1:
+                    time.sleep(3)
+                    continue
+                if attempt < 1:
+                    time.sleep(5)
+                    continue
+                return "", []
 
     def extract_json(self, prompt: str) -> str:
         full_prompt = f"{prompt}\n\nRespond with valid JSON only, no markdown, no code fences."
