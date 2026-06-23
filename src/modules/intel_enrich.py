@@ -83,13 +83,13 @@ def _fetch_article(url: str) -> str:
     return text[:_MAX_ARTICLE_CHARS]
 
 
-def _bg_prompt(item: dict, display_name: str) -> str:
+def _bg_prompt(item: dict) -> str:
     return (
-        f"You are briefing {display_name}, a busy executive. Using Google Search, write a 2-3 "
-        f"sentence BACKGROUND with the context needed to understand and act on this market-"
-        f"intelligence item — concrete (who / what / figures / why it matters), no preamble, no "
-        f"markdown.\n\nHeadline: {item.get('headline','')}\nSummary: {item.get('summary','')}\n\n"
-        f"Return ONLY the background prose."
+        f"Using Google Search, write a 2-3 sentence BACKGROUND on this market-intelligence item — "
+        f"the context a busy executive needs to understand and act on it (who / what / figures / "
+        f"why it matters). Stay on the item's OWN subject; do not mention or look for the reader. "
+        f"No preamble, no markdown.\n\nHeadline: {item.get('headline','')}\nSummary: "
+        f"{item.get('summary','')}\n\nReturn ONLY the background prose."
     )
 
 
@@ -118,13 +118,15 @@ def _refs_from_sources(sources: list[dict], limit: int = 3) -> list[dict]:
     return refs
 
 
-def _rewrite_bg_from_article(item: dict, article_text: str, ai: AIClient, display_name: str) -> str:
+def _rewrite_bg_from_article(item: dict, article_text: str, ai: AIClient) -> str:
     """Rewrite the background from a fetched full article — no search, no outside facts."""
     prompt = (
-        f"Using ONLY the article text below (do not add outside facts), write a 2-3 sentence "
-        f"background for {display_name} on this item — concrete, no preamble, no markdown.\n\n"
-        f"Item: {item.get('headline','')}\n\nArticle:\n{article_text[:_MAX_ARTICLE_CHARS]}\n\n"
-        f"Return ONLY the background prose."
+        f"Using ONLY the article below (do not add outside facts), write a 2-3 sentence background "
+        f"on this item — the context a busy executive needs (who / what / figures / why it matters). "
+        f"Describe the item's OWN subject; do NOT mention or look for any reader or person by name "
+        f"(if the article does not name one, that is expected — never write that information about a "
+        f"person is missing). No preamble, no markdown.\n\nItem: {item.get('headline','')}\n\n"
+        f"Article:\n{article_text[:_MAX_ARTICLE_CHARS]}\n\nReturn ONLY the background prose."
     )
     try:
         return _clean_bg(ai.generate(prompt))
@@ -152,7 +154,7 @@ def enrich_items(
     deep = 0
     for item in targets:
         try:
-            text, sources = ai.generate_with_search_cited(_bg_prompt(item, display_name))
+            text, sources = ai.generate_with_search_cited(_bg_prompt(item))
             refs = _refs_from_sources(sources)
             bg = _clean_bg(text)
             # Best-effort deep read: fetch a resolved reference's full article and rewrite the
@@ -161,7 +163,7 @@ def enrich_items(
             for r in refs[:_MAX_FETCH_PER_ITEM]:
                 full = _fetch_article(r["url"])
                 if full:
-                    deeper = _rewrite_bg_from_article(item, full, ai, display_name)
+                    deeper = _rewrite_bg_from_article(item, full, ai)
                     if deeper:
                         bg = deeper
                         deep += 1
