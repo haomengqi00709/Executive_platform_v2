@@ -10,7 +10,7 @@ describes_files:
   - src/modules/profile.py
   - src/modules/intel_enrich.py
   - src/modules/intel_dedup.py
-derived_from_commit: 3c08c7c
+derived_from_commit: 331a41b
 last_synced: 2026-06-22
 volatile_pointers:
   - src/skills/market_intelligence/skill.md
