@@ -12,6 +12,12 @@ def build(ctx):
         "upcoming_commitments": ("commitments", "id"),
         "due_today":            ("commitments", "id"),
     }
+    # Sections whose list the bot must show in FULL (deterministic render, identical to the
+    # Teams briefing) rather than a model-typed subset — see _enforce_list_completeness in bot.py.
+    _RENDER_SECTIONS = {
+        "reply_needed", "followup_needed", "commitments_extract",
+        "upcoming_commitments", "due_today",
+    }
 
     def read_module_result(section_id: str) -> str:
         from src.bot import SECTION_IDS, _with_indices, _register_list
@@ -39,6 +45,7 @@ def build(ctx):
                     return f"No results for '{section_id}' yet. Run the section first with run_skill()."
                 data = json.loads(result_path.read_text())
             if isinstance(data.get("items"), list):
+                _full_items = list(data["items"])   # uncapped, for a faithful canonical render
                 # Order items to match exactly what the Teams briefing displays, so a "#N" the
                 # user saw in a pushed briefing resolves to the same item here.
                 try:
@@ -58,6 +65,35 @@ def build(ctx):
                     _register_list(ctx, _typ, ordered, _idf,
                                    label_fn=lambda it: (it.get("description") or it.get("subject") or "")[:60],
                                    source=section_id)
+                if section_id in _RENDER_SECTIONS:
+                    # Approach 1: stash the deterministic full render (same renderer the Teams
+                    # briefing uses) so the bot shows the COMPLETE list, never a model-truncated
+                    # subset. bot.py's _enforce_list_completeness substitutes this if the model
+                    # drops items. labels/count come from the SHOWN (capped) `ordered` list.
+                    try:
+                        from src.server import _format_section_for_teams
+                        from zoneinfo import ZoneInfo
+                        _tzname = (ctx.settings or {}).get("timezone") or "UTC"
+                        try:
+                            _tz = ZoneInfo(_tzname)
+                        except Exception:
+                            _tz = ZoneInfo("UTC")
+
+                        def _lbl(it):
+                            s = (it.get("description") or it.get("action")
+                                 or it.get("subject") or it.get("title") or "")
+                            return " ".join(s.split())[:40].lower()
+
+                        _labels = [s for s in (_lbl(it) for it in ordered) if len(s) >= 8]
+                        if isinstance(getattr(ctx, "state", None), dict):
+                            ctx.state["_pending_render"] = {
+                                "section_id": section_id,
+                                "block": _format_section_for_teams({**data, "items": _full_items}, _tz),
+                                "labels": _labels,
+                                "count": len(_labels),
+                            }
+                    except Exception:
+                        pass
             if isinstance(data.get("handled"), list):
                 data["handled"] = _with_indices(data["handled"])
             print(f"[Bot] read_module_result({section_id})")
