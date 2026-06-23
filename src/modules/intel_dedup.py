@@ -21,7 +21,8 @@ Storage format — backward-compatible upgrade:
 
   load_history() accepts both. Old bare-string entries still provide
   md5-exact dedup but are invisible to the AI validator (no headline
-  text to compare). They expire on the normal 7-day cutoff.
+  text to compare). History is now kept permanently (no expiry) so the
+  exact layer never re-pushes a previously-surfaced item.
 
 Caller owns IO via load_history / save_history. Pure functions in
 between — no surprise filesystem writes.
@@ -32,14 +33,10 @@ from datetime import date, timedelta
 from pathlib import Path
 
 
-# How far back the md5-exact layer considers entries. Same as the old
-# inline _load_seen behavior — preserved to keep current dedup behavior
-# unchanged.
-_DEDUP_CUTOFF_DAYS = 7
-
-# How far back the AI validator sees historical headlines. Broader than
-# md5 cutoff because semantic similarity decays slower than exact-text
-# match: a story rephrased on day 10 should still be caught.
+# The md5-exact layer keeps history PERMANENTLY (see load_history) — an item that was ever
+# surfaced is never re-pushed. Only the AI validator's view is bounded: feeding all historical
+# headlines to the model would blow the token budget, so a story rephrased within
+# _VALIDATOR_LOOKBACK days is still caught semantically; older ones rely on exact-match.
 _VALIDATOR_LOOKBACK = 14
 
 
@@ -60,11 +57,13 @@ def _entry_first_seen(value) -> str:
 
 
 def load_history(data_dir: Path, section_id: str) -> dict:
-    """Load history for a section, filtered to _DEDUP_CUTOFF_DAYS.
+    """Load the FULL surfaced-item history for a section — PERMANENT, no expiry.
 
-    Returns { md5_key: entry_dict_or_str } — mixed format possible during
-    transition. Callers should not assume a uniform shape. Empty dict on
-    missing file or parse error.
+    The md5-exact layer (filter_exact_duplicates) uses this so an item that was EVER surfaced is
+    never re-pushed, even months later — it is a cheap hash-set lookup, so keeping it forever
+    costs ~nothing. Only the AI validator's view is bounded (format_history_for_validator caps to
+    _VALIDATOR_LOOKBACK) because feeding all historical headlines to the model would blow the token
+    budget. Returns { md5_key: entry_dict_or_str }; empty dict on missing file or parse error.
     """
     path = Path(data_dir) / f"{section_id}_seen.json"
     if not path.exists():
@@ -73,10 +72,7 @@ def load_history(data_dir: Path, section_id: str) -> dict:
         raw = json.loads(path.read_text())
     except Exception:
         return {}
-    if not isinstance(raw, dict):
-        return {}
-    cutoff = (date.today() - timedelta(days=_DEDUP_CUTOFF_DAYS)).isoformat()
-    return {k: v for k, v in raw.items() if _entry_first_seen(v) >= cutoff}
+    return raw if isinstance(raw, dict) else {}
 
 
 def save_history(data_dir: Path, section_id: str, history: dict) -> None:

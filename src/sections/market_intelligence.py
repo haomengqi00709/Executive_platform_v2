@@ -90,20 +90,60 @@ def _load_user_instruction(data_dir: Path) -> str:
     return path.read_text().strip()
 
 
-def _build_search_prompt(skill_filled: str, context_block: str, angle: str | None = None) -> str:
+def _read_market_config_file(data_dir: Path) -> dict:
+    """Per-user market-config overrides (lens / combine_mode / rules). Optional — defaults apply
+    when absent. This is the file the SQLite store will later replace (see get_market_config)."""
+    path = data_dir / "market_config.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def get_market_config(data_dir: Path) -> dict:
+    """Single accessor for the market-intelligence search config — the CONTRACT shared by the
+    search logic, the bot's change-focus tool, and (later) the SQLite store. File-backed today
+    (instruction md + profile + optional market_config.json); a store can back the SAME shape
+    without touching the search logic. Fields:
+      domain        — the target market / topic to watch (instructions/market_intelligence.md)
+      lens          — the capability / angle to view it THROUGH (from profile; overridable)
+      combine_mode  — 'intersect' (lens x domain) | 'domain_only' | 'lens_only'
+      rules         — free-text include/exclude rules (reserved; today they live in domain text)
+    """
+    overrides = _read_market_config_file(data_dir)
+    return {
+        "domain": _load_user_instruction(data_dir),
+        "lens": (overrides.get("lens") or "").strip() or load_profile_context(data_dir),
+        "combine_mode": overrides.get("combine_mode") or "intersect",
+        "rules": overrides.get("rules") or [],
+    }
+
+
+def _build_search_prompt(skill_filled: str, context_block: str, angle: str | None = None,
+                         intersection: bool = False) -> str:
     """Minimal instruction-driven search prompt = business context + the lean skill.md
     (role + how-to-search + the user's verbatim instruction + output spec; skill.md is the
     source of truth). Kept deliberately lean: an N=5 A/B vs the heavier scaffolded prompt
     showed this ties on client coverage + junk and wins on count-stability + schema
     cleanliness. Ranking / dedup / validation happen AFTER the search, not in this prompt.
 
-    When `angle` is given (one fan-out leg — a named client or a focus area), the search is
-    narrowed to it while still honouring the instruction's window, exclusions, and schema."""
+    When `angle` is given (one fan-out leg), the search is narrowed to it. When `intersection`
+    is set, the search looks at the lens x domain intersection and frames relevance accordingly,
+    with a clearly-secondary domain fallback when the intersection is thin."""
     base = f"{context_block}{skill_filled}"
     if angle:
         base += (f"\n\n## This search's focus\n"
                  f"For THIS particular search only, focus specifically on: {angle}\n"
                  f"Still honour the instruction's time window, exclusions, and output schema above.")
+    if intersection:
+        base += ("\n\n## Intersection framing\n"
+                 "View the target market THROUGH the reader's capability / lens (the business context "
+                 "above). Surface events at the INTERSECTION of that lens and the market, and frame each "
+                 "item's `relevance` as why it matters when applying that lens to this market. If "
+                 "genuinely few intersection events exist for this angle, you MAY include ONE notable "
+                 "general market signal as a clearly-secondary fallback — do not pad.")
     return base
 
 
@@ -114,30 +154,47 @@ _RECENCY_DEFAULT_DAYS = 30  # default hard recency cap (days); per-user override
                            # reliably honour the window, so we hard-drop dated-older items.
 
 
-def _plan_search_angles(ai: AIClient, business_context: str, user_instruction: str,
-                        display_name: str) -> list[str]:
-    """Derive up to _MAX_ANGLES targeted search angles from the user's OWN data so the
-    fan-out reliably covers their named companies and focus areas, instead of leaning on a
-    single stochastic grounding search. General: angles are read from the business context +
-    instruction, never hardcoded. Returns [] on failure → caller falls back to one search."""
-    if not (business_context.strip() or user_instruction.strip()):
+def _plan_search_angles(ai: AIClient, config: dict, display_name: str) -> list[str]:
+    """Derive up to _MAX_ANGLES search angles from the user's OWN data (never hardcoded).
+    In 'intersect' mode (default) angles cross the user's LENS (capability/identity) with their
+    DOMAIN (target market) — the intersection the reader actually wants (e.g. AI x water-pumps),
+    which also keeps off-lens noise (market-size reports, stock filings) out by construction. In
+    'domain_only' mode, or when there is no lens, angles cover the domain + its named companies.
+    Returns [] on failure → caller falls back to one search."""
+    lens = (config.get("lens") or "").strip()
+    domain = (config.get("domain") or "").strip()
+    if not (lens or domain):
         return []
-    prompt = f"""You are planning a market-intelligence search for {display_name}.
+    if config.get("combine_mode") == "intersect" and lens and domain:
+        prompt = f"""You are planning a market-intelligence search for {display_name}.
+
+Their CAPABILITY / LENS — the angle to view a market THROUGH:
+{lens}
+
+Their TARGET DOMAIN — the market / topic to watch:
+{domain}
+
+Produce a JSON array of AT MOST {_MAX_ANGLES} short search angles at the INTERSECTION of the lens
+and the domain. Each angle combines a concrete theme from the LENS with the DOMAIN (e.g. if the
+lens is AI / digital and the domain is water pumps: "AI and digital twins in water pump systems",
+"smart-water IoT product launches", "pump makers' AI / automation initiatives"). Include 1-2
+angles for notable named companies in the domain. Output ONLY a JSON array of strings, at most
+{_MAX_ANGLES} items."""
+    else:
+        prompt = f"""You are planning a market-intelligence search for {display_name}.
 
 Business context:
-{business_context}
+{lens}
 
 Their market-intelligence instruction:
-{user_instruction}
+{domain}
 
 Produce a JSON array of AT MOST {_MAX_ANGLES} short search angles that together cover this
 person's daily market intelligence comprehensively:
 - one angle per specific company they care about (named clients / partners / competitors in
   the business context), and
 - one angle per key focus area / priority in their instruction.
-Each angle is a short phrase naming the target plus the relevant focus (e.g.
-"<Company> brownfield upgrades and digital-twin activity", or
-"as-built laser scanning and asset integrity in oil & gas").
+Each angle is a short phrase naming the target plus the relevant focus.
 Output ONLY a JSON array of strings, at most {_MAX_ANGLES} items."""
     try:
         angles = json.loads(ai.extract_json(prompt))
@@ -284,7 +341,11 @@ def run(
     data_dir = Path(data_dir)
     results_path = data_dir / "results" / f"{_RESULT_ID}.json"
     display_name = settings.get("display_name") or "the executive"
-    business_context = load_profile_context(data_dir)
+    config = get_market_config(data_dir)
+    business_context = config["lens"]      # lens = capability / identity (from profile)
+    user_instruction = config["domain"]    # domain = the market to watch (instruction)
+    intersect = (config["combine_mode"] == "intersect"
+                 and bool(business_context.strip()) and bool(user_instruction.strip()))
     date_str = datetime.now().strftime("%A, %B %d, %Y")
 
     skill_doc = _load_skill_doc()
@@ -292,7 +353,6 @@ def run(
         _p("No skill.md found")
         return {"id": _RESULT_ID, "status": "not_run", "items": [], "count": 0, "empty": True}
 
-    user_instruction = _load_user_instruction(data_dir)
     history = load_history(data_dir, "market_intel")
 
     skill_filled = (
@@ -303,15 +363,15 @@ def run(
     )
     context_block = f"Business context: {business_context}\n\n" if business_context else ""
 
-    # Structured fan-out: one grounding search per angle (a named client or a focus area),
-    # then merge + dedup. A single grounding call is one stochastic slice — even on a strict
-    # window it reliably covers neither every client nor the full focus list (proven: two
-    # runs of the same prompt barely overlap). Angles are derived from the user's OWN data
-    # (business context + instruction) by a cheap planner call, so this stays general — no
-    # hardcoded companies/topics. The wider, noisier net is cleaned by validate downstream.
-    angles = _plan_search_angles(ai, business_context, user_instruction, display_name)
+    # Structured fan-out: one grounding search per angle, then merge + dedup. In 'intersect'
+    # mode the planner crosses the user's LENS (capability) with their DOMAIN (target market),
+    # so the angles — and the search prompt below — look at the intersection the reader wants
+    # (e.g. AI x water-pumps), which also keeps off-lens noise (market-size reports, stock
+    # filings) out by construction. A single grounding call is one stochastic slice; fan-out +
+    # cross-run dedup build coverage over time. Angles come from the user's OWN data, no hardcoding.
+    angles = _plan_search_angles(ai, config, display_name)
     if angles:
-        _p(f"planned {len(angles)} search angles: {angles}")
+        _p(f"planned {len(angles)} {'intersection ' if intersect else ''}search angles: {angles}")
     else:
         _p("no angles planned — falling back to one instruction-driven search")
         angles = [None]  # sentinel: a single general instruction-driven search
@@ -319,7 +379,7 @@ def run(
     all_raw_items: list[dict] = []
     ok_batches = 0
     for idx, angle in enumerate(angles, 1):
-        prompt = _build_search_prompt(skill_filled, context_block, angle=angle)
+        prompt = _build_search_prompt(skill_filled, context_block, angle=angle, intersection=intersect)
         try:
             raw = ai.generate_with_search(prompt, timeout_secs=_SEARCH_TIMEOUT_SECS)
             items = _parse_raw(raw, ai)
