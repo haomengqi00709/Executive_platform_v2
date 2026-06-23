@@ -100,6 +100,15 @@ def _clean_bg(text: str) -> str:
     return t[:600]
 
 
+def _domain(url: str) -> str:
+    """Clean host label for a URL ('https://www.kurrant.com/x' → 'kurrant.com')."""
+    try:
+        from urllib.parse import urlparse
+        return urlparse(url).netloc.replace("www.", "") or url
+    except Exception:
+        return url
+
+
 def _refs_from_sources(sources: list[dict], limit: int = 3) -> list[dict]:
     """Resolve grounding citation URLs to real article links, dropping vertex-redirect
     fallbacks (a google.com/search placeholder is not a real source). Returns [{title, url}]."""
@@ -168,6 +177,16 @@ def enrich_items(
                         bg = deeper
                         deep += 1
                     break
+            # The main search's source_url is the model's self-reported URL and often fails to
+            # resolve (dropped → empty) even though the real cited page is available. When that
+            # happened, promote a real grounding-cited link to be the source_url so the item gets a
+            # working "Open source". Keep the model's source NAME (usually the original outlet);
+            # only fill it from the domain if it's blank. The promoted link leaves `references`.
+            if not (item.get("source_url") or "").strip() and refs:
+                item["source_url"] = refs[0]["url"]
+                if not (item.get("source") or "").strip():
+                    item["source"] = _domain(refs[0]["url"])
+                refs = refs[1:]
             item["background"] = bg
             item["references"] = refs
             if bg:
