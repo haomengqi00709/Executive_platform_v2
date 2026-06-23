@@ -147,3 +147,38 @@ def test_migration_self_check_flags_mismatch(tmp_path, capsys):
     assert ok is False
     assert "MIGRATION MISMATCH" in out
     assert "lost=['a']" in out
+
+
+def test_migration_status_not_accessed(tmp_path):
+    """No store.db yet → status reports not_accessed WITHOUT creating/migrating anything."""
+    _seed(tmp_path)
+    assert store.get_migration_status(tmp_path) == {"state": "not_accessed"}
+    assert not (tmp_path / "store.db").exists(), "status check must not create the DB"
+
+
+def test_migration_status_durable_lossless(tmp_path):
+    """After a clean import, the verdict is persisted and queryable read-only."""
+    _seed(tmp_path)
+    (tmp_path / "results").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "results" / "commitments_extract.json").write_text(json.dumps({
+        "items": [_item("a"), _item("b")]}))
+    store.upsert_commitments(tmp_path, [])  # triggers first access → import + self-check
+    st = store.get_migration_status(tmp_path)
+    assert st["state"] == "checked" and st["verdict"] == "lossless" and st["new"] == 2
+
+
+def test_migration_status_durable_mismatch(tmp_path):
+    """A mismatch verdict is persisted so a dropped log line can't hide data loss."""
+    _seed(tmp_path)
+    (tmp_path / "results").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "results" / "commitments_extract.json").write_text(json.dumps({
+        "items": [_item("a"), _item("b")]}))
+    (tmp_path / "commitments_state.json").write_text(json.dumps(
+        {"done": {}, "asked": {}, "snoozed": {}}))
+    con = store._conn(tmp_path)
+    con.execute("UPDATE commitments SET status='done' WHERE id='a'")  # diverge without re-projecting
+    con.commit()
+    store._verify_import(con, tmp_path)
+    con.close()
+    st = store.get_migration_status(tmp_path)
+    assert st["state"] == "checked" and st["verdict"] == "mismatch" and st["lost"] == ["a"]

@@ -1436,6 +1436,31 @@ def admin_fleet_health(x_admin_token: str | None = Header(None, alias="X-Admin-T
     }
 
 
+@app.get("/api/admin/migration-status")
+def admin_migration_status(x_admin_token: str | None = Header(None, alias="X-Admin-Token")):
+    """Per-user SQLite migration verdict (Phase 1 commitments). The self-check writes its result
+    durably into each user's store, so a lossy migration is catchable here even if the log line
+    was dropped under load. Read-only — never triggers a migration. Auth: OPS_ADMIN_TOKEN."""
+    _require_admin_token(x_admin_token)
+    from src.modules import commitments_store as _cstore
+    sessions_dir = auth.DATA_DIR / "_sessions"
+    users = []
+    if sessions_dir.exists():
+        for sf in sorted(sessions_dir.glob("*.json")):
+            uid = sf.stem
+            try:
+                users.append({"uid": uid, **_cstore.get_migration_status(auth.DATA_DIR / uid)})
+            except Exception as e:
+                users.append({"uid": uid, "state": "error", "error": str(e)})
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "user_count":   len(users),
+        "mismatches":   sum(1 for u in users if u.get("verdict") == "mismatch"),
+        "checked":      sum(1 for u in users if u.get("state") == "checked"),
+        "users":        users,
+    }
+
+
 def _require_admin_token(x_admin_token: str | None) -> None:
     """Shared-secret auth for ops endpoints (OPS_ADMIN_TOKEN via X-Admin-Token header)."""
     expected = os.getenv("OPS_ADMIN_TOKEN")

@@ -98,6 +98,12 @@ def _conn(data_dir):
 def _maybe_import(con, data_dir) -> None:
     row = con.execute("SELECT v FROM store_meta WHERE k='migrated_from_json'").fetchone()
     if row:
+        # Already migrated. Backfill the durable verdict if it predates this feature, so a user
+        # who migrated BEFORE the verdict was persisted (e.g. a client) still gets a queryable
+        # result on their next access — verification can't depend on a log line that may be dropped.
+        chk = con.execute("SELECT v FROM store_meta WHERE k='migration_check'").fetchone()
+        if not chk:
+            _verify_import(con, Path(data_dir))
         return
     data_dir = Path(data_dir)
     try:
@@ -178,17 +184,37 @@ def _verify_import(con, data_dir: Path) -> bool:
         new_ids = {r["id"] for r in con.execute(
             f"SELECT id FROM commitments WHERE {where}", params).fetchall()}
         name = Path(data_dir).name
-        if old_ids == new_ids:
+        ok = old_ids == new_ids
+        payload = {
+            "verdict":     "lossless" if ok else "mismatch",
+            "old":         len(old_ids),
+            "new":         len(new_ids),
+            "lost":        sorted(old_ids - new_ids),
+            "resurrected": sorted(new_ids - old_ids),
+            "at":          _now_iso(),
+        }
+        # Durable verdict: a dropped log line must not hide a lossy migration. This row is
+        # queryable via get_migration_status / the admin endpoint, independent of logs.
+        con.execute("INSERT OR REPLACE INTO store_meta (k, v) VALUES ('migration_check', ?)",
+                    (json.dumps(payload),))
+        con.commit()
+        if ok:
             print(f"[commitments_store] migration verified dir={name} "
                   f"visible={len(new_ids)} (lossless)")
-            return True
-        print(f"[commitments_store] ⚠️ MIGRATION MISMATCH dir={name} "
-              f"old={len(old_ids)} new={len(new_ids)} "
-              f"lost={sorted(old_ids - new_ids)} resurrected={sorted(new_ids - old_ids)} "
-              f"— legacy JSON preserved; this user's store can be rolled back")
-        return False
+        else:
+            print(f"[commitments_store] ⚠️ MIGRATION MISMATCH dir={name} "
+                  f"old={len(old_ids)} new={len(new_ids)} "
+                  f"lost={payload['lost']} resurrected={payload['resurrected']} "
+                  f"— legacy JSON preserved; this user's store can be rolled back")
+        return ok
     except Exception as e:
         print(f"[commitments_store] migration self-check skipped: {e}")
+        try:
+            con.execute("INSERT OR REPLACE INTO store_meta (k, v) VALUES ('migration_check', ?)",
+                        (json.dumps({"verdict": "skipped", "error": str(e), "at": _now_iso()}),))
+            con.commit()
+        except Exception:
+            pass
         return True
 
 
@@ -478,6 +504,34 @@ def get_asked_ids(data_dir) -> list:
             "SELECT id FROM commitments WHERE status='open' AND asked_expires_at IS NOT NULL")]
     finally:
         con.close()
+
+
+def get_migration_status(data_dir) -> dict:
+    """Read-only migration verdict for a user. Deliberately does NOT use _conn (which would
+    trigger the migration) — opens a raw connection so the admin endpoint can REPORT status
+    without changing it. States: not_accessed (no store.db) / no_flag / migrated_unchecked /
+    checked (with verdict=lossless|mismatch|skipped + counts)."""
+    import sqlite3
+    path = _db_path(data_dir)
+    if not path.exists():
+        return {"state": "not_accessed"}
+    con = sqlite3.connect(str(path))
+    con.row_factory = sqlite3.Row
+    try:
+        mig = con.execute("SELECT v FROM store_meta WHERE k='migrated_from_json'").fetchone()
+        chk = con.execute("SELECT v FROM store_meta WHERE k='migration_check'").fetchone()
+    except Exception as e:
+        return {"state": "error", "error": str(e)}
+    finally:
+        con.close()
+    if not mig:
+        return {"state": "no_flag"}
+    if not chk:
+        return {"state": "migrated_unchecked"}
+    try:
+        return {"state": "checked", **json.loads(chk["v"])}
+    except Exception:
+        return {"state": "checked", "raw": chk["v"]}
 
 
 # ── projection (keep the legacy JSON files in sync for the dashboard/recap) ───
