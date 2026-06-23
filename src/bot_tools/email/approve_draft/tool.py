@@ -17,6 +17,19 @@ def build(ctx):
                 subject = draft.get("subject", ""),
                 body    = final_body,
             )
+            # Durably record that we acted on this thread so reply_needed excludes it even if the
+            # live Graph draft scan later misses this draft (the "drafted but still shows" bug).
+            # Keyed by (recipient, normalized subject); a 'Re: X' reply matches the original 'X'.
+            try:
+                from src.modules import email_store
+                if ctx.data_dir:
+                    email_store.mark_handled(
+                        ctx.data_dir,
+                        counterparty=draft.get("to", ""),
+                        subject=draft.get("subject", ""),
+                        kind="drafted", source="approve_draft")
+            except Exception as _e:
+                print(f"[Bot] approve_draft: handled-annotation skipped: {_e}")
             queue      = list(state.get("pending_queue") or [])
             next_draft = queue[0] if queue else None
             state["pending_draft"] = next_draft

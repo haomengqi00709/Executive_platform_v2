@@ -32,25 +32,15 @@ _DEFAULT_ACTIVE_HOURS = [8, 18]
 # ── State helpers ─────────────────────────────────────────────────────────
 
 def _load_monitor_state(data_dir: Path) -> dict:
-    path = data_dir / "email_monitor.json"
-    if path.exists():
-        try:
-            return json.loads(path.read_text())
-        except Exception:
-            pass
-    return {
-        "last_checked_ts": "",
-        "last_digest_ts": "",
-        "last_expiry_warning_date": "",
-        "processed_conv_ids": [],
-        "pending_priority_followup": [],   # legacy — kept for bot.py:dismiss_email_followup
-        "last_notified_emails": [],
-    }
+    # Source of truth is the per-user SQLite store (atomic, no torn whole-file writes); it lazily
+    # imports the legacy email_monitor.json on first access and keeps it synced as a projection.
+    from src.modules import email_store
+    return email_store.get_poller_state(data_dir)
 
 
 def _save_monitor_state(data_dir: Path, state: dict) -> None:
-    data_dir.mkdir(parents=True, exist_ok=True)
-    (data_dir / "email_monitor.json").write_text(json.dumps(state, indent=2, ensure_ascii=False))
+    from src.modules import email_store
+    email_store.save_poller_state(data_dir, state)
 
 
 # ── Address helpers ───────────────────────────────────────────────────────

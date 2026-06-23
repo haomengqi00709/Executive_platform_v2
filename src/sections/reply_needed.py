@@ -24,7 +24,9 @@ from src.modules.subject_match import (
     find_meeting_match,
     find_subject_match,
     make_handling_link,
+    normalize_subject,
 )
+from src.modules import email_store
 from src.modules.validator import validate_output
 from src.modules.tz import now_local, today_local_str
 from src.modules.profile import load_profile_context
@@ -285,6 +287,9 @@ def run(
 
     handled_sidecar: list[dict] = []
     not_replied: list[dict] = []
+    # Durable handled annotations: replies we drafted/sent, recorded at action time. Catches what
+    # the live Graph draft/sent scan above can miss (pagination / subfolder / timing).
+    store_handled = email_store.get_handled_map(data_dir)
 
     for m in visible:
         cid          = m.get("conversationId")
@@ -360,6 +365,20 @@ def run(
                     target_subject=evt.get("subject", ""),
                     target_when=start_dt or evt.get("createdDateTime", ""),
                     target_link=evt.get("webLink", ""),
+                )
+
+        # Channel 6: a reply we drafted/sent for this thread is recorded durably in the store
+        # (survives a missed Graph scan — fixes "I drafted a reply but the email still shows").
+        if handling is None and from_email:
+            h = store_handled.get((from_email, normalize_subject(subj)))
+            if h:
+                handling = make_handling_link(
+                    email_id=email_id, email_subject=subj, email_from=from_email,
+                    kind=h.get("kind") or "drafted",
+                    target_id=h.get("email_id", ""),
+                    target_subject=h.get("target_subject", "") or subj,
+                    target_when=h.get("handled_at", ""),
+                    target_link="",
                 )
 
         if handling is None:

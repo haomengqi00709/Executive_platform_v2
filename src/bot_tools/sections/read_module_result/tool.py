@@ -44,6 +44,32 @@ def build(ctx):
                 if not result_path.exists():
                     return f"No results for '{section_id}' yet. Run the section first with run_skill()."
                 data = json.loads(result_path.read_text())
+                # Read-time handled overlay: an email the user already drafted/replied to (recorded
+                # live in the store) drops off IMMEDIATELY here — no need to re-run the slow/costly
+                # Graph+AI section. The list stays the cached snapshot; only the cheap handled-status
+                # is live. reply_needed only (its from_email is the counterparty approve_draft keys on).
+                if section_id == "reply_needed" and isinstance(data.get("items"), list):
+                    try:
+                        from src.modules import email_store
+                        kept, moved = email_store.overlay_handled(ctx.data_dir, data["items"])
+                        if moved:
+                            # Append to the handled sidecar in the SAME shape the section emits
+                            # (email_subject / email_from / handled_by) so check_email_handling
+                            # recognizes an overlay-excluded email as handled, not just dropped.
+                            sidecar = data.get("handled") or []
+                            for it in moved:
+                                sidecar.append({
+                                    "email_id":      it.get("email_id", ""),
+                                    "email_subject": it.get("subject", ""),
+                                    "email_from":    (it.get("from_email") or "").lower(),
+                                    "handled_by":    {"kind": it.get("_handled_kind", "drafted")},
+                                })
+                            data["items"] = kept
+                            data["handled"] = sidecar
+                            data["count"] = len(kept)
+                            data["empty"] = not kept
+                    except Exception:
+                        pass
             if isinstance(data.get("items"), list):
                 _full_items = list(data["items"])   # uncapped, for a faithful canonical render
                 # Order items to match exactly what the Teams briefing displays, so a "#N" the

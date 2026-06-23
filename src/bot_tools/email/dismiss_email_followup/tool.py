@@ -6,12 +6,11 @@ def build(ctx):
         data_dir = ctx.data_dir
         if not data_dir:
             return "No data directory available."
-        monitor_path = data_dir / "email_monitor.json"
-        if not monitor_path.exists():
-            return "No email monitor state found."
         try:
-            import json as _j
-            monitor = _j.loads(monitor_path.read_text())
+            from src.modules import email_store
+            # Read-modify-write through the store: atomic + serialized, so a concurrent email-poll
+            # write can't corrupt the state (the old raw email_monitor.json write could).
+            monitor = email_store.get_poller_state(data_dir)
             followups = monitor.get("pending_priority_followup") or []
             query = from_name_or_subject.lower()
             before = len(followups)
@@ -25,7 +24,7 @@ def build(ctx):
             if removed == 0:
                 return f"No follow-up reminder matched '{from_name_or_subject}'."
             monitor["pending_priority_followup"] = remaining
-            monitor_path.write_text(_j.dumps(monitor, indent=2, ensure_ascii=False))
+            email_store.save_poller_state(data_dir, monitor)
             return f"✅ Removed {removed} follow-up reminder(s) matching '{from_name_or_subject}'."
         except Exception as e:
             return f"Error: {e}"

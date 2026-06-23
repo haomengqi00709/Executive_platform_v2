@@ -319,7 +319,8 @@ def _build_session_context(data_dir: Path) -> str:
     except Exception:
         pass
     try:
-        d = json.loads((data_dir / "email_monitor.json").read_text())
+        from src.modules import email_store
+        d = email_store.get_poller_state(data_dir)
         notified = (d.get("last_notified_emails") or [])[-5:]
         if notified:
             items = "; ".join(
