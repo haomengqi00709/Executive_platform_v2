@@ -107,6 +107,10 @@ def _maybe_import(con, data_dir) -> None:
     con.execute("INSERT OR REPLACE INTO store_meta (k, v) VALUES ('migrated_from_json', ?)",
                 (_now_iso(),))
     con.commit()
+    # Self-verify the one-time migration: the store's visible set MUST equal the legacy JSON read
+    # path on the same data. A mismatch (loss / resurrection) is logged LOUDLY so it surfaces the
+    # moment ANY user — including clients whose data we could not pre-verify — first migrates.
+    _verify_import(con, data_dir)
 
 
 def _read_json(path: Path) -> dict:
@@ -155,6 +159,37 @@ def _import_from_json(con, data_dir: Path) -> None:
              json.dumps(entry.get("commitments") or []),
              json.dumps(entry.get("msg_meta") or {})))
     con.commit()
+
+
+def _verify_import(con, data_dir: Path) -> bool:
+    """One-time migration self-check: compare the store's visible set to the legacy read path
+    (commitments_extract.json filtered by commitments_state.should_show) on the SAME data. They
+    must be identical — that's what 'lossless' means. Returns True on match; logs a loud, greppable
+    'MIGRATION MISMATCH' on divergence. Uses the live `con` (no re-entrant _conn). Best-effort:
+    never raises into the import path."""
+    try:
+        from src.modules.commitments_state import load_state, should_show
+        today = today_local_str(data_dir)
+        extract = _read_json(Path(data_dir) / "results" / "commitments_extract.json")
+        st = load_state(Path(data_dir))
+        old_ids = {it["id"] for it in (extract.get("items") or [])
+                   if it.get("id") and should_show(it["id"], st, today)}
+        where, params = _visible_clause(today)
+        new_ids = {r["id"] for r in con.execute(
+            f"SELECT id FROM commitments WHERE {where}", params).fetchall()}
+        name = Path(data_dir).name
+        if old_ids == new_ids:
+            print(f"[commitments_store] migration verified dir={name} "
+                  f"visible={len(new_ids)} (lossless)")
+            return True
+        print(f"[commitments_store] ⚠️ MIGRATION MISMATCH dir={name} "
+              f"old={len(old_ids)} new={len(new_ids)} "
+              f"lost={sorted(old_ids - new_ids)} resurrected={sorted(new_ids - old_ids)} "
+              f"— legacy JSON preserved; this user's store can be rolled back")
+        return False
+    except Exception as e:
+        print(f"[commitments_store] migration self-check skipped: {e}")
+        return True
 
 
 def _ensure_row(con, cid: str, now: str) -> None:

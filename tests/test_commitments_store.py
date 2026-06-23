@@ -111,3 +111,39 @@ def test_import_from_json_idempotent(tmp_path):
     # idempotent: importing again must not double or resurrect
     store.upsert_commitments(tmp_path, [])  # touches the store again
     assert _vis(tmp_path) == {"b", "c"}
+
+
+def test_migration_self_check_passes_on_lossless_import(tmp_path, capsys):
+    """The post-import self-check logs '(lossless)' when store visible == legacy read path."""
+    _seed(tmp_path)
+    (tmp_path / "results").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "results" / "commitments_extract.json").write_text(json.dumps({
+        "items": [_item("a"), _item("b")]}))
+    (tmp_path / "commitments_state.json").write_text(json.dumps({
+        "done": {"a": {"at": "2026-01-01", "method": "user"}}, "asked": {}, "snoozed": {}}))
+    con = store._conn(tmp_path)   # triggers import + self-check; a is done → both paths see {b}
+    con.close()
+    out = capsys.readouterr().out
+    assert "(lossless)" in out
+    assert "MIGRATION MISMATCH" not in out
+
+
+def test_migration_self_check_flags_mismatch(tmp_path, capsys):
+    """If the store diverges from the legacy JSON, the self-check logs a loud MISMATCH."""
+    _seed(tmp_path)
+    (tmp_path / "results").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "results" / "commitments_extract.json").write_text(json.dumps({
+        "items": [_item("a"), _item("b")]}))
+    (tmp_path / "commitments_state.json").write_text(json.dumps({
+        "done": {}, "asked": {}, "snoozed": {}}))
+    con = store._conn(tmp_path)          # clean import (both paths {a, b})
+    capsys.readouterr()                  # clear the "(lossless)" line
+    # Force the store to drop 'a' WITHOUT re-syncing the JSON projection → divergence.
+    con.execute("UPDATE commitments SET status='done' WHERE id='a'")
+    con.commit()
+    ok = store._verify_import(con, tmp_path)
+    con.close()
+    out = capsys.readouterr().out
+    assert ok is False
+    assert "MIGRATION MISMATCH" in out
+    assert "lost=['a']" in out
