@@ -807,11 +807,35 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
 
         # Refresh reply_needed.json now so the digest + frontend reflect this batch.
         if new_actionable:
+            # F4b: quantify how often the EXPENSIVE per-batch refresh fires (reply_needed.run is a
+            # Graph + multi-Gemini section). Grep `[EmailMonitor] expensive-refresh` to decide whether
+            # to make it incremental (add just the new emails) instead of a full re-run. Instrument
+            # first, optimize later — behavior unchanged for now.
+            print(f"[EmailMonitor] expensive-refresh uid={data_dir.name[:8]} "
+                  f"reason=new_actionable triaged={len(triaged)}")
             try:
                 from src.sections.reply_needed import run as run_reply_needed
                 run_reply_needed(owner_graph, ai, data_dir, settings)
             except Exception as e:
                 print(f"[EmailMonitor] reply_needed refresh failed: {e}")
+
+            # F4a: extract commitments from the new mail into the live store in REAL TIME (was only
+            # on the scheduled/manual run, so the commitments DB lagged new emails). commitments_extract
+            # is incremental — it dedups via the processed_emails store, so only genuinely-new emails
+            # hit the AI; gated on new_actionable so quiet cycles cost nothing. Labeled so the cost
+            # shows as feature=commitments_extract, not email_monitor.
+            # (Optimization for later if the re-screen cost matters: pass the already-screened `visible`
+            #  emails in instead of letting commitments_extract re-fetch+re-screen them.)
+            try:
+                from src.ai import set_usage_context
+                from src.sections.commitments_extract import run as run_commitments
+                set_usage_context("commitments_extract", data_dir.name)
+                try:
+                    run_commitments(owner_graph, ai, data_dir, settings)
+                finally:
+                    set_usage_context("email_monitor", data_dir.name)   # restore for the rest of the poll
+            except Exception as e:
+                print(f"[EmailMonitor] commitments extract failed: {e}")
 
     monitor_state["last_checked_ts"] = newest_ts
 
