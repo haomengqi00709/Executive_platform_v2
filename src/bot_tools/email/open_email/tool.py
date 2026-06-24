@@ -15,6 +15,16 @@ def build(ctx):
         if not eid:
             return ("Provide the email_id — the canonical id carried by a commitment, a reply_needed "
                     "item, a follow-up, or get_recent_emails.")
+        # The model often passes a COMMITMENT's id (a short hash) instead of its email_id (a long
+        # Graph id). If the value matches a commitment row, follow that pointer to the real email_id.
+        try:
+            from src.modules import commitments_store
+            for c in commitments_store.query_visible(ctx.data_dir):
+                if c.get("id") == eid and c.get("email_id"):
+                    eid = c["email_id"]
+                    break
+        except Exception:
+            pass
         try:
             m = owner_graph.get_message(eid)
         except Exception as e:

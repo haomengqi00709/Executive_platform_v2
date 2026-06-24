@@ -52,6 +52,26 @@ def test_open_email_body_capped(tmp_path):
     assert out["body_truncated"] is True and len(out["body"]) == 4000
 
 
+def test_open_email_resolves_commitment_id_to_email_id(tmp_path):
+    """The model often passes a commitment's id, not its email_id. open_email must follow the
+    pointer: commitment id → that commitment's source email_id → fetch the original."""
+    from src.modules import commitments_store as cstore
+    cstore.upsert_commitments(tmp_path, [{
+        "id": "cf70c4b89d3d291a", "type": "their_commitment", "description": "Daniel to send X",
+        "email_id": "AAMk-REAL-789", "subject": "Re: Follow-up", "received": "2026-06-23T07:51:00Z",
+        "priority": "medium"}])
+
+    seen = {}
+    class Capture:
+        def get_message(self, mid):
+            seen["id"] = mid
+            return {"id": mid, "subject": "Re: Follow-up", "from": {}, "toRecipients": [],
+                    "body": {"contentType": "text", "content": "the real body"}}
+    out = json.loads(build_open(_ctx(tmp_path, Capture()))("cf70c4b89d3d291a"))   # passed the COMMITMENT id
+    assert seen["id"] == "AAMk-REAL-789"          # resolved to the real email_id before fetching
+    assert "real body" in out["body"]
+
+
 def test_dismiss_followup_records_email_id(tmp_path):
     """The handled annotation must carry the email_id so it's navigable via open_email."""
     from src.bot_tools.email.dismiss_email_followup.tool import build as build_dismiss
