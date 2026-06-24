@@ -3,8 +3,11 @@ title: Workflow Tools (Outreach / Draft Composer)
 describes_files:
   - src/modules/outreach.py
   - src/bot.py
-derived_from_commit: b08e40c
-last_synced: 2026-06-20
+  - src/bot_tools/projects/modify_project/tool.py
+  - src/bot_tools/email/open_email/tool.py
+  - src/bot_tools/contacts/list_crm_contacts/tool.py
+derived_from_commit: 617a540
+last_synced: 2026-06-24
 ---
 
 # Workflow Tools (Outreach / Draft Composer)
@@ -53,8 +56,10 @@ disambiguation / completion-gate rules above:
 - **Multiple requests in one message** — "do X and also Y" is handled in full this
   turn, not just the first half.
 - **[#N] binds by type** — `snooze/mark N` → commitments list, `reply N` → email
-  list, `meeting N` → meetings list, `contact N` → contacts list, regardless of
-  which list was shown most recently.
+  list, `meeting N` → meetings list, `contact N` → contacts list, `project N` →
+  projects list, regardless of which list was shown most recently. Each list source
+  keeps its own bucket (e.g. a frequency report vs a name search vs a CRM-by-attribute
+  list are separate), so a "#N" from one list never resolves against another.
 - **When it can't** — for actions with no tool (cancel/reschedule a meeting,
   forward/delete email, out-of-office, SMS, filter a group by role) it says so
   plainly and offers the closest supported alternative; it never fakes success
@@ -91,6 +96,14 @@ to pick among candidates without looking them up. Pure reads ("show my emails",
 running the flaky checker on reads occasionally re-drove them and overwrote the
 correct answer with a false "I was unable to retrieve…". Reads now resolve in
 one pass with no verifier call.
+
+## Other bot actions (recently added)
+- **`modify_project`** — change one field on a project (status / momentum / category / ignore) by
+  name or `#N`; writes straight to the store, reflects immediately. See [projects](projects.md).
+- **`open_email`** — fetch the FULL verbatim body of an original email by id (the cached lists only
+  carry a preview). Accepts a commitment's id too (resolved to its source email). Used only when the
+  user wants the full text — "where is it from / what's it about" is answered from the item's own fields.
+- **`list_crm_contacts`** — list the curated CRM by status/priority/tag (see [data-management](data-management.md)).
 
 ## The hard rule
 **Drafts are never auto-sent.** Everything the AI writes is saved to Outlook Drafts;

@@ -4,8 +4,8 @@ describes_files:
   - CLAUDE.md
   - src/server.py
   - src/ai.py
-derived_from_commit: 46c63d6
-last_synced: 2026-06-15
+derived_from_commit: 617a540
+last_synced: 2026-06-24
 ---
 
 # System Overview
@@ -30,7 +30,9 @@ OneDrive / mail ─┘
 
 ## Core design principles (from CLAUDE.md)
 1. **One section → one data source → one result file.** No fallback paths. Missing
-   data ⇒ `status: "not_run"`, not "read from somewhere else".
+   data ⇒ `status: "not_run"`, not "read from somewhere else". The mutable state behind
+   this (commitments / email / CRM / projects) lives in one per-user `store.db` (SQLite);
+   the JSON files are synced read-only projections. See [data-and-auth](data-and-auth.md).
 2. **Multi-user isolation from line 1.** Every function takes `data_dir: Path`;
    all per-user state lives under `.data/{user_id}/`. No global paths.
 3. **Screener before email AI.** Any feature presenting inbound mail filters through

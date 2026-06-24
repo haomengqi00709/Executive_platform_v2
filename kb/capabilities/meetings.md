@@ -9,8 +9,8 @@ describes_files:
   - src/modules/wiki.py
   - src/skills/meetings_today/skill.md
   - src/skills/m03_meeting/skill.md
-derived_from_commit: 46c63d6
-last_synced: 2026-06-15
+derived_from_commit: 617a540
+last_synced: 2026-06-24
 volatile_pointers:
   - src/skills/meetings_today/skill.md
 ---

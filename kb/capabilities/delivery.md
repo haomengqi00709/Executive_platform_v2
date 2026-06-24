@@ -4,8 +4,8 @@ describes_files:
   - src/modules/email_monitor.py
   - src/modules/teams_bot.py
   - src/server.py
-derived_from_commit: 46c63d6
-last_synced: 2026-06-15
+derived_from_commit: 617a540
+last_synced: 2026-06-24
 ---
 
 # Delivery & Push Orchestration
@@ -24,7 +24,9 @@ How section output reaches the user, and how proactive pushes are configured.
   user can have several independent briefings. *(Per-user schedule config is on the
   roadmap; today the scheduler runs fixed jobs.)*
 - **Email Monitor** (`email_monitor.py`) — polls the inbox (~1 min); a new email is
-  triaged and pushed to Teams immediately or batched into a digest. Configurable
+  triaged and pushed to Teams immediately or batched into a digest. It also updates
+  the store in real time: **extracts any new commitments** and **auto-clears a
+  `their_commitment` when the counterparty replies** in-thread. Configurable
   working-hours window and digest interval.
 - **Meeting Autoresponder** — a new OneDrive recording auto-triggers the meeting
   summary → Teams push → Outlook follow-up draft. See [meetings](meetings.md).
@@ -33,7 +35,8 @@ How section output reaches the user, and how proactive pushes are configured.
 
 ## Background scheduler (`src/server.py` startup)
 Fixed jobs today: Teams bot poll (10s), email monitor poll (1m), expense scan (1m),
-CRM refresh (06:00 UTC), projects refresh (06:30 UTC).
+meeting-prep (5m), meeting-recording scan (20m), CRM refresh (06:00 UTC), projects
+refresh (06:30 UTC), companies refresh (06:45 UTC), DB cleanup (weekly Mon 07:00 UTC).
 
 ## Teams Adaptive Card rules (hard-won)
 Never use `{"type":"Separator"}` as an element (Teams silently drops the whole

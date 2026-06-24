@@ -3,8 +3,8 @@ title: Document Capture (Expenses)
 describes_files:
   - src/sections/expenses.py
   - src/modules/m05_expense.py
-derived_from_commit: 46c63d6
-last_synced: 2026-06-15
+derived_from_commit: 617a540
+last_synced: 2026-06-24
 ---
 
 # Document Capture (Expenses)
