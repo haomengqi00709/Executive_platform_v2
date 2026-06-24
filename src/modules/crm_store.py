@@ -216,6 +216,22 @@ def replace_from_dict(data_dir, crm: dict) -> None:
     write_projection(data_dir)
 
 
+def clear(data_dir) -> None:
+    """Drop all contacts + meta (used by the onboarding reset/cleanup endpoints, which delete
+    crm.json to rebuild from scratch). Without this, the upsert-only replace_from_dict would leave
+    pre-reset rows behind. The next store access re-imports from the (now empty/absent) JSON."""
+    path = _db_path(data_dir)
+    if not path.exists():
+        return
+    con = open_sqlite(path)
+    try:
+        con.execute("DROP TABLE IF EXISTS contacts")
+        con.execute("DROP TABLE IF EXISTS crm_meta")
+        con.commit()
+    finally:
+        con.close()
+
+
 def set_scan_meta(data_dir, last_scan, months_scanned) -> None:
     con = _conn(data_dir)
     try:

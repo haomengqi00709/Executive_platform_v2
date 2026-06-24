@@ -1438,25 +1438,36 @@ def admin_fleet_health(x_admin_token: str | None = Header(None, alias="X-Admin-T
 
 @app.get("/api/admin/migration-status")
 def admin_migration_status(x_admin_token: str | None = Header(None, alias="X-Admin-Token")):
-    """Per-user SQLite migration verdict (Phase 1 commitments). The self-check writes its result
-    durably into each user's store, so a lossy migration is catchable here even if the log line
-    was dropped under load. Read-only — never triggers a migration. Auth: OPS_ADMIN_TOKEN."""
+    """Per-user SQLite migration verdict for every migrated domain (commitments / crm / projects).
+    Each domain's self-check writes its result durably into the user's store, so a lossy migration is
+    catchable here even if the log line was dropped under load. Read-only — never triggers a
+    migration. Auth: OPS_ADMIN_TOKEN."""
     _require_admin_token(x_admin_token)
     from src.modules import commitments_store as _cstore
+    from src.modules import crm_store as _crmstore
+    from src.modules import projects_store as _projstore
+    domains = {"commitments": _cstore, "crm": _crmstore, "projects": _projstore}
     sessions_dir = auth.DATA_DIR / "_sessions"
     users = []
     if sessions_dir.exists():
         for sf in sorted(sessions_dir.glob("*.json")):
             uid = sf.stem
-            try:
-                users.append({"uid": uid, **_cstore.get_migration_status(auth.DATA_DIR / uid)})
-            except Exception as e:
-                users.append({"uid": uid, "state": "error", "error": str(e)})
+            udir = auth.DATA_DIR / uid
+            entry = {"uid": uid}
+            for name, mod in domains.items():
+                try:
+                    entry[name] = mod.get_migration_status(udir)
+                except Exception as e:
+                    entry[name] = {"state": "error", "error": str(e)}
+            users.append(entry)
+
+    def _mismatches(u):
+        return sum(1 for d in domains if (u.get(d) or {}).get("verdict") == "mismatch")
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "user_count":   len(users),
-        "mismatches":   sum(1 for u in users if u.get("verdict") == "mismatch"),
-        "checked":      sum(1 for u in users if u.get("state") == "checked"),
+        "domains":      list(domains),
+        "mismatches":   sum(_mismatches(u) for u in users),
         "users":        users,
     }
 
@@ -3766,23 +3777,19 @@ def patch_project(project_id: str, body: dict, session: dict = Depends(require_s
     proj_path = _udir(uid) / "projects.json"
     if not proj_path.exists():
         raise HTTPException(404, "Projects DB not built yet")
-    data = json.loads(proj_path.read_text())
-    projects = data.get("projects", {})
-    if project_id not in projects:
-        raise HTTPException(404, f"Project '{project_id}' not found")
     updates = {k: v for k, v in body.items() if k in _PROJECT_EDITABLE_FIELDS}
     if "status" in updates and updates["status"] not in _PROJECT_VALID_STATUSES:
         raise HTTPException(400, f"Invalid status. Must be one of {sorted(_PROJECT_VALID_STATUSES)}")
     if "momentum" in updates and updates["momentum"] not in _PROJECT_VALID_MOMENTUMS:
         raise HTTPException(400, f"Invalid momentum. Must be one of {sorted(_PROJECT_VALID_MOMENTUMS)}")
-    projects[project_id].update(updates)
-    projects[project_id]["updated_at"] = today_local_str(_udir(uid))
-    data["projects"] = projects
-    # Atomic write
-    tmp = proj_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-    tmp.replace(proj_path)
-    return projects[project_id]
+    # Field-level store update — never rewrites the whole object, so sibling user columns can't be
+    # clobbered; projects.json is regenerated as a synced projection.
+    from src.modules import projects_store
+    updated = projects_store.update_project_fields(
+        _udir(uid), project_id, updates, today_local_str(_udir(uid)))
+    if updated is None:
+        raise HTTPException(404, f"Project '{project_id}' not found")
+    return updated
 
 
 # ── Expenses: full history from Excel + manual edit ──────
@@ -4593,6 +4600,17 @@ def get_init_status(session: dict = Depends(require_session)):
     return load_init_status(_udir(session["user_id"]))
 
 
+def _clear_crm_projects_store(udir) -> None:
+    """The reset/cleanup endpoints delete crm.json/projects.json to rebuild from scratch — also drop
+    the SQLite store tables so the upsert-only rebuild doesn't inherit pre-reset rows. Best-effort."""
+    try:
+        from src.modules import crm_store, projects_store
+        crm_store.clear(udir)
+        projects_store.clear(udir)
+    except Exception as e:
+        print(f"[reset] store clear failed: {e}")
+
+
 @app.post("/api/onboarding/restart")
 def restart_onboarding(session: dict = Depends(require_session)):
     """Wipe init artifacts and send the user back through the wizard. Unlike
@@ -4608,6 +4626,7 @@ def restart_onboarding(session: dict = Depends(require_session)):
         if p.exists():
             try: p.unlink()
             except Exception: pass
+    _clear_crm_projects_store(udir)
     status_path = udir / "profile" / "init_status.json"
     if status_path.exists():
         try: status_path.unlink()
@@ -4633,6 +4652,7 @@ def reset_init(session: dict = Depends(require_session)):
                 p.unlink()
             except Exception:
                 pass
+    _clear_crm_projects_store(udir)
     status_path = udir / "profile" / "init_status.json"
     if status_path.exists():
         try:

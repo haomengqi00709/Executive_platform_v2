@@ -46,11 +46,13 @@ def load_projects(data_dir: Path) -> dict:
 
 
 def save_projects(data_dir: Path, projects: dict) -> None:
-    """Atomic write to projects.json."""
-    path = Path(data_dir) / "projects.json"
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(projects, indent=2, ensure_ascii=False))
-    tmp.replace(path)
+    """Persist the projects DB. Routed through the SQLite store (per-project rows in one transaction
+    — no whole-file corruption race that the old direct projects.json write had); projects.json is
+    regenerated as a synced projection so every reader stays unchanged. Edit-preservation for the AI
+    rebuild is kept UPSTREAM in refresh_projects / _merge_projects (parity with the prior behaviour).
+    Deferred import avoids any import cycle."""
+    from src.modules import projects_store
+    projects_store.replace_from_dict(data_dir, projects)
 
 
 # ── Private helpers ──────────────────────────────────────
