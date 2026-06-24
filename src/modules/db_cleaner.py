@@ -467,11 +467,13 @@ def find_stale_records(data_dir: Path) -> list[dict]:
 # ── Execution: MERGE operations ────────────────────────────
 
 def merge_projects(data_dir: Path, keep_id: str, merge_id: str) -> dict:
-    """Apply a project merge: combine fields, delete the duplicate, log it."""
+    """Apply a project merge: combine fields, delete the duplicate, log it.
+
+    Persisted through projects_store (the single source of truth) — NOT a direct projects.json write.
+    Otherwise the store keeps the merged-away duplicate and the next project refresh resurrects it."""
+    from src.modules import projects_store
     data_dir = Path(data_dir)
-    proj_path = data_dir / "projects.json"
-    db = _read_json(proj_path, {})
-    projects = db.get("projects", {})
+    projects = projects_store.load_projects(data_dir).get("projects", {})
 
     if keep_id not in projects or merge_id not in projects:
         return {"ok": False, "error": "Project not found"}
@@ -490,10 +492,10 @@ def merge_projects(data_dir: Path, keep_id: str, merge_id: str) -> dict:
         keep["last_activity"] = merge["last_activity"]
     keep["updated_at"] = datetime.now().strftime("%Y-%m-%d")
 
-    # Delete the merged project
-    del projects[merge_id]
-
-    _write_json(proj_path, db)
+    # Persist through the store: upsert the merged keep (full object → user cols preserved), then
+    # delete the duplicate row so it can't be regenerated into the projection.
+    projects_store.replace_from_dict(data_dir, {"projects": {keep_id: keep}})
+    projects_store.delete_project(data_dir, merge_id)
     _append_merge_log(data_dir, {
         "op": "merge_projects", "keep_id": keep_id, "merge_id": merge_id, "before": before,
     })
@@ -501,11 +503,13 @@ def merge_projects(data_dir: Path, keep_id: str, merge_id: str) -> dict:
 
 
 def merge_contacts(data_dir: Path, keep_email: str, merge_email: str) -> dict:
-    """Apply a contact merge: union messages, delete the duplicate, log it."""
+    """Apply a contact merge: union messages, delete the duplicate, log it.
+
+    Persisted through crm_store (the single source of truth) — NOT a direct crm.json write, so the
+    next CRM rebuild can't resurrect the merged-away duplicate."""
+    from src.modules import crm_store
     data_dir = Path(data_dir)
-    crm_path = data_dir / "crm.json"
-    db = _read_json(crm_path, {})
-    contacts = db.get("contacts", {})
+    contacts = crm_store.load_crm(data_dir).get("contacts", {})
 
     keep_key  = keep_email.lower()
     merge_key = merge_email.lower()
@@ -527,13 +531,13 @@ def merge_contacts(data_dir: Path, keep_email: str, merge_email: str) -> dict:
 
     # Track the alias so future emails to merge_email still resolve
     aliases = set(keep.get("aliases", []))
-    aliases.add(merge["email"])
+    aliases.add(merge.get("email") or merge_key)
     keep["aliases"] = sorted(aliases)
     keep["updated_at"] = datetime.now().strftime("%Y-%m-%d")
 
-    del contacts[merge_key]
-
-    _write_json(crm_path, db)
+    # Persist through the store: upsert the merged keep, then delete the duplicate row.
+    crm_store.replace_from_dict(data_dir, {"contacts": {keep_key: keep}})
+    crm_store.delete_contact(data_dir, merge_key)
     _append_merge_log(data_dir, {
         "op": "merge_contacts", "keep_email": keep_email, "merge_email": merge_email, "before": before,
     })
@@ -541,26 +545,25 @@ def merge_contacts(data_dir: Path, keep_email: str, merge_email: str) -> dict:
 
 
 def archive_record(data_dir: Path, kind: str, ident: str) -> dict:
-    """Set archived=true on a project (kind='project') or contact (kind='contact')."""
+    """Set archived=true on a project (kind='project') or contact (kind='contact').
+
+    Field-level write through the store (the single source of truth) — so the archived flag survives
+    the next refresh instead of being a direct JSON write that gets regenerated away."""
     data_dir = Path(data_dir)
+    today = datetime.now().strftime("%Y-%m-%d")
     if kind == "project":
-        path = data_dir / "projects.json"
-        db = _read_json(path, {})
-        record = db.get("projects", {}).get(ident)
-        if not record:
+        from src.modules import projects_store
+        updated = projects_store.update_project_fields(data_dir, ident, {"archived": True}, today)
+        if updated is None:
             return {"ok": False, "error": "Project not found"}
-        record["archived"] = True
-        record["updated_at"] = datetime.now().strftime("%Y-%m-%d")
-        _write_json(path, db)
     elif kind == "contact":
-        path = data_dir / "crm.json"
-        db = _read_json(path, {})
-        record = db.get("contacts", {}).get(ident.lower())
-        if not record:
+        from src.modules import crm_store
+        e = ident.lower()
+        # update_contact_field creates the row if absent — guard existence first to keep the 404.
+        if e not in crm_store.load_crm(data_dir).get("contacts", {}):
             return {"ok": False, "error": "Contact not found"}
-        record["archived"] = True
-        record["updated_at"] = datetime.now().strftime("%Y-%m-%d")
-        _write_json(path, db)
+        crm_store.update_contact_field(data_dir, e, "archived", True)
+        crm_store.update_contact_field(data_dir, e, "updated_at", today)
     else:
         return {"ok": False, "error": f"Unknown kind: {kind}"}
 

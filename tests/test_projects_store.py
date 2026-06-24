@@ -139,6 +139,17 @@ def test_migration_verdict_durable_and_readonly(tmp_path):
     assert st["state"] == "checked" and st["verdict"] == "lossless"
 
 
+def test_delete_project_removes_row_and_syncs_projection(tmp_path):
+    _seed(tmp_path, {"a": _proj("a", name="A"), "b": _proj("b", name="B")})
+    ps.load_projects(tmp_path)
+    assert ps.delete_project(tmp_path, "b") is True
+    out = ps.load_projects(tmp_path)["projects"]
+    assert "b" not in out and "a" in out
+    proj = json.loads((tmp_path / "projects.json").read_text())["projects"]
+    assert "b" not in proj and "a" in proj                     # projection synced
+    assert ps.delete_project(tmp_path, "nope") is False        # no-op on missing
+
+
 def test_clear_resets_store_no_stale_rows(tmp_path):
     """Reset deletes projects.json + clears the store. A from-scratch rebuild then must NOT inherit
     pre-reset rows (the upsert-only replace_from_dict can't delete them itself)."""

@@ -142,6 +142,17 @@ def test_crm_py_wiring_round_trips_through_store(tmp_path):
     assert proj["priority"] == "low" and proj["tags"] == ["vip"]
 
 
+def test_delete_contact_removes_row_and_syncs_projection(tmp_path):
+    _seed_crm(tmp_path, {"a@x.com": _contact(email="a@x.com"), "b@x.com": _contact(email="b@x.com")})
+    cs.load_crm(tmp_path)
+    assert cs.delete_contact(tmp_path, "B@X.com") is True       # case-insensitive
+    out = cs.load_crm(tmp_path)["contacts"]
+    assert "b@x.com" not in out and "a@x.com" in out
+    proj = json.loads((tmp_path / "crm.json").read_text())["contacts"]
+    assert "b@x.com" not in proj and "a@x.com" in proj          # projection synced
+    assert cs.delete_contact(tmp_path, "nobody@x.com") is False
+
+
 def test_migration_verdict_durable_and_readonly(tmp_path):
     assert cs.get_migration_status(tmp_path) == {"state": "not_accessed"}  # no DB yet, no trigger
     _seed_crm(tmp_path, {"a@x.com": _contact(tags=["t"])})

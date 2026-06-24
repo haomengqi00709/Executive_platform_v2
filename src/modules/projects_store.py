@@ -164,6 +164,21 @@ def update_project_fields(data_dir, project_id: str, updates: dict, updated_at: 
     return proj
 
 
+def delete_project(data_dir, project_id: str) -> bool:
+    """Remove a single project row (used by db_cleaner's merge — the duplicate is deleted; replace_from_dict
+    is upsert-only and can't propagate a deletion). Regenerates the projection so readers see it gone
+    immediately. Returns True if a row was removed."""
+    con = _conn(data_dir)
+    try:
+        cur = con.execute("DELETE FROM projects WHERE id=?", (project_id,))
+        con.commit()
+        removed = cur.rowcount > 0
+    finally:
+        con.close()
+    write_projection(data_dir)
+    return removed
+
+
 def clear(data_dir) -> None:
     """Drop all projects + meta (used by the onboarding reset/cleanup endpoints, which delete
     projects.json to rebuild from scratch). Without this, the upsert-only replace_from_dict would

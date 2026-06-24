@@ -216,6 +216,22 @@ def replace_from_dict(data_dir, crm: dict) -> None:
     write_projection(data_dir)
 
 
+def delete_contact(data_dir, email: str) -> bool:
+    """Remove a single contact row (used by db_cleaner's merge — the duplicate is deleted; replace_from_dict
+    is upsert-only and can't propagate a deletion). Regenerates the projection so readers see it gone
+    immediately. Returns True if a row was removed."""
+    e = (email or "").lower()
+    con = _conn(data_dir)
+    try:
+        cur = con.execute("DELETE FROM contacts WHERE email=?", (e,))
+        con.commit()
+        removed = cur.rowcount > 0
+    finally:
+        con.close()
+    write_projection(data_dir)
+    return removed
+
+
 def clear(data_dir) -> None:
     """Drop all contacts + meta (used by the onboarding reset/cleanup endpoints, which delete
     crm.json to rebuild from scratch). Without this, the upsert-only replace_from_dict would leave
