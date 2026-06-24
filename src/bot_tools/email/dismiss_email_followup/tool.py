@@ -26,9 +26,12 @@ def build(ctx):
                 return (f"⚠️ I can't find a follow-up to '{from_name_or_subject}' in your current "
                         f"'awaiting reply' list — show the list and ask which; don't claim it's dismissed.")
             for it in matched:
+                # Carry the pointer (email_id/conversation_id) so the annotation can be navigated
+                # back to the original sent email (open_email) — followup_needed items have them.
                 email_store.mark_handled(
                     data_dir, counterparty=it.get("to_email", ""), subject=it.get("subject", ""),
-                    kind="followup_dismissed", source="dismiss_followup")
+                    kind="followup_dismissed", source="dismiss_followup",
+                    email_id=it.get("email_id", ""), conversation_id=it.get("conversation_id", ""))
             who = ", ".join(sorted({(it.get("to_name") or it.get("to_email") or "") for it in matched}))
             print(f"[Bot] dismiss_email_followup('{from_name_or_subject}') → {len(matched)} followup(s)")
             return f"✅ Dismissed {len(matched)} follow-up(s) ({who}) — won't flag them as awaiting a reply again."
