@@ -217,6 +217,29 @@ def load_projects(data_dir) -> dict:
         con.close()
 
 
+# Display ordering for the live list — most-attention-worthy first (mirrors project_status.run).
+_STATUS_RANK = {"needs_attention": 0, "ongoing": 1, "paused": 2, "early_stage": 3, "completed": 4}
+
+
+def query_live_projects(data_dir, statuses=None, ignore_archived=True) -> list[dict]:
+    """Live project list for the bot's interactive read (the read-side mirror of
+    commitments_store.query_visible). Applies the SAME deterministic filter project_status.run uses
+    — drop ignore/archived, keep the given status set — but WITHOUT the AI validator, so the bot's
+    'what projects do I have' is fresh + free + never a stale render cache. Sorted attention-first
+    then most-recent (same idiom as the section). Returns the full project dicts; the caller shapes
+    for display. `statuses=None` means no status filter."""
+    out = []
+    for p in (load_projects(data_dir).get("projects") or {}).values():
+        if ignore_archived and (p.get("ignore") or p.get("archived")):
+            continue
+        if statuses is not None and p.get("status") not in statuses:
+            continue
+        out.append(p)
+    out.sort(key=lambda p: p.get("last_activity") or "", reverse=True)   # recency within a rank
+    out.sort(key=lambda p: _STATUS_RANK.get(p.get("status", ""), 9))     # stable → attention first
+    return out
+
+
 def write_projection(data_dir) -> None:
     """Regenerate projects.json from the store so every existing reader (project_status,
     projects_needing_attention, business_insights, meeting_prep, reply/followup_needed) keeps

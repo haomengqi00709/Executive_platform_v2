@@ -11,6 +11,14 @@ def build(ctx):
         "commitments_extract":  ("commitments", "id"),
         "upcoming_commitments": ("commitments", "id"),
         "due_today":            ("commitments", "id"),
+        "project_status":            ("projects", "id"),
+        "projects_needing_attention": ("projects", "id"),
+    }
+    # Status sets matching each project section's deterministic filter (project_status.py:19,
+    # projects_needing_attention.py:18) — so the bot's live read shows the same set as the dashboard.
+    _PROJECT_STATUSES = {
+        "project_status":             {"ongoing", "needs_attention", "paused", "early_stage"},
+        "projects_needing_attention": {"needs_attention", "early_stage"},
     }
     # Sections whose list the bot must show in FULL (deterministic render, identical to the
     # Teams briefing) rather than a model-typed subset — see _enforce_list_completeness in bot.py.
@@ -39,6 +47,24 @@ def build(ctx):
                     data = {"id": section_id, "status": "fresh", "date": today, "items": items}
                 data["count"] = len(items)
                 data["empty"] = not items
+            elif section_id in _PROJECT_STATUSES:
+                # Projects come from the LIVE store too — same single-source rule as commitments.
+                # The AI-validated render (project_status.run) still feeds the dashboard/briefing;
+                # this interactive read is fresh + free (no validator) so the bot never serves a
+                # stale results/project_status.json (the drift we hit: cache showed 1 old project,
+                # store had 2). Lean shape — the heavy fields (conversation_ids/participants) stay out.
+                from src.modules import projects_store
+                raw = projects_store.query_live_projects(
+                    ctx.data_dir, statuses=_PROJECT_STATUSES[section_id])
+                items = [{
+                    "id": p.get("id"), "name": p.get("name"), "status": p.get("status"),
+                    "momentum": p.get("momentum"), "category": p.get("category"),
+                    "summary": p.get("summary"), "next_action": p.get("next_action"),
+                    "deadline": p.get("deadline"), "last_activity": p.get("last_activity"),
+                    "thread_count": p.get("thread_count"),
+                } for p in raw]
+                data = {"id": section_id, "status": "fresh", "items": items,
+                        "count": len(items), "empty": not items}
             else:
                 result_path = ctx.data_dir / "results" / f"{section_id}.json"
                 if not result_path.exists():
@@ -96,7 +122,8 @@ def build(ctx):
                 if section_id in _SEC_MAP:
                     _typ, _idf = _SEC_MAP[section_id]
                     _register_list(ctx, _typ, ordered, _idf,
-                                   label_fn=lambda it: (it.get("description") or it.get("subject") or "")[:60],
+                                   label_fn=lambda it: (it.get("description") or it.get("subject")
+                                                        or it.get("name") or it.get("title") or "")[:60],
                                    source=section_id)
                 if section_id in _RENDER_SECTIONS:
                     # Approach 1: stash the deterministic full render (same renderer the Teams
