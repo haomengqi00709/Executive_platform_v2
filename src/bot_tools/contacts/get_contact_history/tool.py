@@ -30,9 +30,23 @@ def build(ctx):
                     from src.modules.crm import load_crm
                     crm = load_crm(data_dir)
                     contact = crm.get("contacts", {}).get(email.lower(), {})
-                    ws = contact.get("writing_style", "").strip()
-                    if ws:
-                        result["writing_style_note"] = ws
+                    if contact:
+                        # The CRM profile (was: only writing_style) — so the bot can answer
+                        # "who is X / what's their status / priority / my notes" from the curated CRM.
+                        result["crm"] = {
+                            "name":         contact.get("name", ""),
+                            "company":      contact.get("company", ""),
+                            "role":         contact.get("role", ""),
+                            "status":       contact.get("status", ""),
+                            "priority":     contact.get("priority", ""),
+                            "tags":         contact.get("tags") or [],
+                            "notes":        contact.get("notes", ""),
+                            "last_contact": contact.get("last_contact", ""),
+                            "thread_count": contact.get("thread_count", 0),
+                        }
+                        ws = (contact.get("writing_style") or "").strip()
+                        if ws:
+                            result["writing_style_note"] = ws
                 except Exception:
                     pass
             result["emails"]   = _with_indices(result["emails"])

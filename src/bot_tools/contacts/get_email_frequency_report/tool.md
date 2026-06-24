@@ -1,4 +1,6 @@
 ---
 action: false
 ---
-Analyze email frequency by sender over the past N days. Shows who you communicate with most.
+Rank senders by RAW email volume over the past N days — this is VOLUME, not importance
+(newsletters, no-reply, and automated senders rank high here). For "my key / high-priority /
+client / internal contacts", use list_crm_contacts (the curated CRM), not this.
