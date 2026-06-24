@@ -343,6 +343,7 @@ def run(
             "contact_email":       from_email,
             "contact_name":        from_name,
             "email_id":            email_id,
+            "conversation_id":     msg.get("conversationId", ""),   # F4c: lets a reply auto-clear it
             "subject":             (msg.get("subject") or "(no subject)")[:200],
             "received":            c.get("_received") or msg.get("receivedDateTime", ""),
             "priority":            c.get("priority", "medium"),

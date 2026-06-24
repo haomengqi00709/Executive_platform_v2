@@ -666,6 +666,21 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
     # Quiet cycles (no new email) log nothing — the DIAG below fires only when
     # there's actual work. Job liveness is tracked by the scheduler/ops dashboard.
     if fresh:
+        # F4c: a new INBOUND email (inbox-only fetch → it's the other party, not us) in a thread
+        # where we're waiting on them means they replied → auto-clear that their_commitment (the
+        # "waiting on them" state is resolved). Cheap: SQL by conversationId, no AI. Runs BEFORE the
+        # extraction below so a NEW commitment in the reply isn't cleared by its own arrival.
+        try:
+            from src.modules import commitments_store
+            _cleared = 0
+            for _conv in {(m.get("conversationId") or "") for m in fresh}:
+                if _conv:
+                    _cleared += commitments_store.mark_done_by_conversation_id(data_dir, _conv)
+            if _cleared:
+                print(f"[EmailMonitor] auto-cleared {_cleared} their_commitment(s) — counterparty replied")
+        except Exception as e:
+            print(f"[EmailMonitor] their_commitment auto-clear failed: {e}")
+
         # Build ignored_emails from CRM
         ignored_emails: set = set()
         try:

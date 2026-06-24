@@ -29,7 +29,7 @@ _DB_NAME = "store.db"
 # Item content columns (everything EXCEPT status/* — those are never touched by upsert).
 _CONTENT_COLS = [
     "type", "description", "due_date", "due_date_confidence", "contact_email",
-    "contact_name", "email_id", "subject", "received", "priority",
+    "contact_name", "email_id", "conversation_id", "subject", "received", "priority",
     "contact_json", "project_json",
 ]
 
@@ -58,6 +58,7 @@ def _conn(data_dir):
             contact_email TEXT,
             contact_name TEXT,
             email_id TEXT,
+            conversation_id TEXT,
             subject TEXT,
             received TEXT,
             priority TEXT DEFAULT 'medium',
@@ -73,9 +74,14 @@ def _conn(data_dir):
             last_seen TEXT
         )
     """)
+    # Additive migration (F4c): older stores lack conversation_id — used to auto-clear a
+    # their_commitment when the counterparty replies in the same thread. Safe; existing rows → NULL.
+    if "conversation_id" not in {r["name"] for r in con.execute("PRAGMA table_info(commitments)")}:
+        con.execute("ALTER TABLE commitments ADD COLUMN conversation_id TEXT")
     con.execute("CREATE INDEX IF NOT EXISTS ix_c_status ON commitments(status)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_c_due ON commitments(due_date)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_c_email ON commitments(email_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_c_conv ON commitments(conversation_id)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_c_type_due ON commitments(type, due_date)")
     con.execute("""
         CREATE TABLE IF NOT EXISTS processed_emails (
@@ -240,7 +246,8 @@ def _content_values(it: dict) -> tuple:
     return (
         it.get("type", "my_commitment"), it.get("description", ""), it.get("due_date"),
         it.get("due_date_confidence", "none"), it.get("contact_email", ""),
-        it.get("contact_name", ""), it.get("email_id", ""), it.get("subject", ""),
+        it.get("contact_name", ""), it.get("email_id", ""), it.get("conversation_id", ""),
+        it.get("subject", ""),
         it.get("received", ""), it.get("priority", "medium"),
         json.dumps(it.get("contact")) if it.get("contact") is not None else None,
         json.dumps(it.get("project")) if it.get("project") is not None else None,
@@ -406,6 +413,31 @@ def mark_done_by_email_id(data_dir, email_id: str, method: str = "email_monitor"
     return n
 
 
+def mark_done_by_conversation_id(data_dir, conversation_id: str,
+                                 method: str = "email_monitor_reply") -> int:
+    """Auto-clear their_commitments awaiting a reply in this email thread — the counterparty just
+    replied (a new INBOUND message in the same conversation), so the 'waiting on them' state is
+    resolved. Only their_commitment + open. If the reply itself carries a NEW commitment, the
+    real-time extraction (F4a) re-adds it, so this can't lose a fresh obligation. Returns rows cleared."""
+    cid = (conversation_id or "").strip()
+    if not cid:
+        return 0
+    con = _conn(data_dir)
+    try:
+        cur = con.execute(
+            "UPDATE commitments SET status='done', status_at=?, status_method=?, "
+            "asked_expires_at=NULL, snoozed_until=NULL "
+            "WHERE conversation_id=? AND type='their_commitment' AND status='open'",
+            (_now_iso(), method, cid))
+        con.commit()
+        n = cur.rowcount
+    finally:
+        con.close()
+    if n:
+        write_projection(data_dir)
+    return n
+
+
 # ── read path (queries) ─────────────────────────────────────────────────────
 
 def _visible_clause(today: str) -> tuple[str, tuple]:
@@ -423,7 +455,8 @@ def _row_to_item(r) -> dict:
         "id": r["id"], "type": r["type"], "description": r["description"],
         "due_date": r["due_date"], "due_date_confidence": r["due_date_confidence"],
         "contact_email": r["contact_email"], "contact_name": r["contact_name"],
-        "email_id": r["email_id"], "subject": r["subject"], "received": r["received"],
+        "email_id": r["email_id"], "conversation_id": r["conversation_id"],
+        "subject": r["subject"], "received": r["received"],
         "priority": r["priority"] or "medium",
         "contact": json.loads(r["contact_json"]) if r["contact_json"] else None,
         "project": json.loads(r["project_json"]) if r["project_json"] else None,
