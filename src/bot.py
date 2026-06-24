@@ -537,9 +537,9 @@ def reply(
         f"                               Pass `day` as the word the user used (today/tomorrow/friday/YYYY-MM-DD); the\n"
         f"                               system computes the real date — never do the date arithmetic yourself.\n"
         f"  run_outreach               → 'draft outreach for the people I met at X', 'batch email contacts from OneDrive folder', 'draft outreach for everyone tagged Y'\n"
-        f"  list_my_groups / list_group_members → 'what groups do I have?', 'who's in the Investors group?'\n"
-        f"  draft_group_email          → 'draft/write an email about X to the GROUP/everyone tagged Y' — personalized per contact, draft-only; stages first, then confirm_group_email after the user agrees\n"
         f"                               Three modes (pick one): folder= (OneDrive), tag= (CRM by tag), recent_hours= (CRM by recency)\n"
+        f"  list_my_groups / list_group_members → 'what groups do I have?', 'who's in the Investors group?'\n"
+        f"  draft_group_email          → 'email the X group about Y', 'draft an email to everyone in the X group', 'message everyone tagged X about Y', 'write the Investors group about Z' — personalized per contact, draft-only; stages first, then confirm_group_email after the user agrees\n"
         f"  tag_recent_contacts        → 'tag everyone I just added as X', 'group these contacts as Calgary Summit 2026'\n\n"
         + "".join(_reg_routing)
         + f"AVAILABLE SECTIONS (use these exact section_id values for run_skill, "
