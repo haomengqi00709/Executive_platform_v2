@@ -1446,7 +1446,9 @@ def admin_migration_status(x_admin_token: str | None = Header(None, alias="X-Adm
     from src.modules import commitments_store as _cstore
     from src.modules import crm_store as _crmstore
     from src.modules import projects_store as _projstore
-    domains = {"commitments": _cstore, "crm": _crmstore, "projects": _projstore}
+    from src.modules import companies_store as _compstore
+    domains = {"commitments": _cstore, "crm": _crmstore,
+               "projects": _projstore, "companies": _compstore}
     sessions_dir = auth.DATA_DIR / "_sessions"
     users = []
     if sessions_dir.exists():
@@ -4602,11 +4604,13 @@ def get_init_status(session: dict = Depends(require_session)):
 
 def _clear_crm_projects_store(udir) -> None:
     """The reset/cleanup endpoints delete crm.json/projects.json to rebuild from scratch — also drop
-    the SQLite store tables so the upsert-only rebuild doesn't inherit pre-reset rows. Best-effort."""
+    the SQLite store tables (incl. the companies layer derived from them) so the rebuild doesn't
+    inherit pre-reset rows. Best-effort."""
     try:
-        from src.modules import crm_store, projects_store
+        from src.modules import crm_store, projects_store, companies_store
         crm_store.clear(udir)
         projects_store.clear(udir)
+        companies_store.clear(udir)
     except Exception as e:
         print(f"[reset] store clear failed: {e}")
 

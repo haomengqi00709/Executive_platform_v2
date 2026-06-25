@@ -165,10 +165,12 @@ def load_companies(data_dir: Path) -> dict:
 
 
 def save_companies(data_dir: Path, db: dict) -> None:
-    f = Path(data_dir) / "companies.json"
-    tmp = f.with_suffix(".tmp")
-    tmp.write_text(json.dumps(db, indent=2, ensure_ascii=False))
-    tmp.replace(f)
+    """Persist the companies DB through the SQLite store (FULL SYNC — build/update/add/delete all
+    pass the authoritative full set here; companies_store deletes any company no longer present, which
+    is how derived companies whose source vanished are dropped). companies.json is regenerated as a
+    synced projection so every reader stays unchanged. Deferred import avoids any cycle."""
+    from src.modules import companies_store
+    companies_store.replace_from_dict(data_dir, db)
 
 
 def _read_json(p: Path, default):
