@@ -36,8 +36,27 @@ def resolve_project_ref(ctx, data_dir, index_or_hint: str):
     for p in all_projects:                                       # exact id
         if p.get("id") == s:
             return p["id"], p.get("name", "")
-    hint = s.lower()                                             # name keyword
-    for p in all_projects:
+
+    hint = s.lower().strip()
+    for p in all_projects:                                       # contiguous substring (most precise)
         if hint in (p.get("name") or "").lower():
             return p["id"], p.get("name", "")
+
+    # Token-subset match: the model often passes a COMPRESSED name ("IPS CTO Role Alignment") that
+    # isn't a contiguous substring of the full name ("IPS Consultancy — CTO Role Alignment"). Match
+    # when every word of the hint appears somewhere in the name (or the kebab id). Require ≥2 hint
+    # words so a single common word can't grab the wrong project.
+    import re
+    hint_words = [w for w in re.split(r"\W+", hint) if len(w) >= 2]
+    if len(hint_words) >= 2:
+        best = None
+        for p in all_projects:
+            hay = ((p.get("name") or "") + " " + (p.get("id") or "")).lower().replace("-", " ")
+            hay_words = set(re.split(r"\W+", hay))
+            if all(w in hay_words for w in hint_words):
+                if best is not None:
+                    return None, ""                              # ambiguous — don't guess
+                best = p
+        if best:
+            return best["id"], best.get("name", "")
     return None, ""

@@ -77,3 +77,26 @@ def test_no_match_is_honest(tmp_path):
     _seed(tmp_path, {"a": _proj("a")})
     out = build(_ctx(tmp_path))("nonexistent-project", "status", "paused")
     assert "can't match" in out.lower()
+
+
+def test_compressed_name_resolves_by_token_subset(tmp_path):
+    """The model passes a COMPRESSED name not contiguous in the full name. Token-subset must match."""
+    _seed(tmp_path, {"ips-consultancy-cto-role-alignment":
+                     _proj("ips-consultancy-cto-role-alignment", name="IPS Consultancy — CTO Role Alignment")})
+    out = build(_ctx(tmp_path))("IPS CTO Role Alignment", "status", "ongoing")   # not a substring
+    assert "✅" in out
+    assert _proj_status(tmp_path, "ips-consultancy-cto-role-alignment") == "ongoing"
+
+
+def _proj_status(tmp_path, pid):
+    from src.modules import projects_store
+    return projects_store.load_projects(tmp_path)["projects"][pid].get("status")
+
+
+def test_token_subset_ambiguous_does_not_guess(tmp_path):
+    """Two projects whose names BOTH contain the hint words non-contiguously → token-subset path
+    sees two matches → don't guess (names chosen so the hint isn't a contiguous substring of either)."""
+    _seed(tmp_path, {"a": _proj("a", name="Strategy work for Acme on AI"),
+                     "b": _proj("b", name="Strategy work for Beta on AI")})
+    out = build(_ctx(tmp_path))("AI Strategy", "status", "paused")   # not contiguous in either
+    assert "can't match" in out.lower()        # ambiguous → honest, no wrong write
