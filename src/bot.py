@@ -253,8 +253,23 @@ SECTION_IDS = {
 }
 
 
+_GENAI_CLIENT = None
+_GENAI_LOCK = __import__("threading").Lock()
+
+
 def _client() -> genai.Client:
-    return genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    """A single shared genai client for the whole process. Was: a fresh genai.Client() per call —
+    but the google-genai SDK shares an underlying httpx transport across Client instances, so when a
+    SECOND client coexists with the first (e.g. search_web creating its own while a reply turn already
+    holds one) and either is GC'd, the shared transport closes and the other fails with 'Cannot send a
+    request, as the client has been closed' (live: search_web errored mid-turn). One cached client
+    avoids the multi-instance close race."""
+    global _GENAI_CLIENT
+    if _GENAI_CLIENT is None:
+        with _GENAI_LOCK:
+            if _GENAI_CLIENT is None:
+                _GENAI_CLIENT = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    return _GENAI_CLIENT
 
 
 # ── Conversation history ───────────────────────────────────
