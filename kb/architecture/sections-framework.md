@@ -5,8 +5,8 @@ describes_files:
   - src/modules/validator.py
   - src/modules/screener.py
   - src/sections/relationship_health.py
-derived_from_commit: 617a540
-last_synced: 2026-06-24
+derived_from_commit: 97215fd
+last_synced: 2026-06-25
 ---
 
 # How a Section Works

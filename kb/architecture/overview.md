@@ -4,8 +4,8 @@ describes_files:
   - CLAUDE.md
   - src/server.py
   - src/ai.py
-derived_from_commit: 617a540
-last_synced: 2026-06-24
+derived_from_commit: 97215fd
+last_synced: 2026-06-25
 ---
 
 # System Overview

@@ -5,13 +5,17 @@ describes_files:
   - src/modules/crm_store.py
   - src/modules/projects.py
   - src/modules/projects_store.py
+  - src/modules/companies.py
+  - src/modules/companies_store.py
   - src/modules/db_cleaner.py
   - src/modules/profile_init.py
   - src/bot_tools/contacts/list_crm_contacts/tool.py
   - src/bot_tools/contacts/get_contact_history/tool.py
   - src/bot_tools/contacts/update_crm_contact/tool.py
-derived_from_commit: 617a540
-last_synced: 2026-06-24
+  - src/bot_tools/contacts/tag_contact/tool.py
+  - src/bot_tools/companies/list_companies/tool.py
+derived_from_commit: 97215fd
+last_synced: 2026-06-25
 ---
 
 # Data Management (CRM / Projects / Companies)
@@ -20,11 +24,12 @@ The structured business records the user maintains inside the platform. List vie
 + inline edit + bulk ops + import/export.
 
 ## Storage (single source of truth)
-CRM and Projects live in the per-user SQLite `store.db` (`crm_store.py` / `projects_store.py`); the
-old `crm.json` / `projects.json` are kept as synced read-only projections so existing readers are
-unchanged. Writes are **edit-preserving**: an AI rebuild only overwrites AI-derived fields and never
-the user's columns (notes, tags, priority, ignore, status edits). Migration from the legacy JSON is
-lossless and reversible.
+CRM, Projects, AND Companies all live in the per-user SQLite `store.db` (`crm_store.py` /
+`projects_store.py` / `companies_store.py`); the old `crm.json` / `projects.json` / `companies.json`
+are kept as synced read-only projections so existing readers are unchanged. Writes are
+**edit-preserving**: an AI rebuild only overwrites AI-derived fields and never the user's columns
+(notes, tags, priority, ignore, status edits). Migration from the legacy JSON is lossless and
+reversible. Every frontend data operation on a mutable business domain now lands in the store.
 
 ## CRM (contacts)
 People — email, company, role, status, priority, relationship summary, notes, tags.
@@ -35,15 +40,21 @@ People — email, company, role, status, priority, relationship summary, notes, 
 - **Ask the bot:** "who are my high-priority contacts / clients / internal contacts / everyone tagged X"
   → `list_crm_contacts` (filters the curated CRM by status/priority/tag — NOT inbox volume); "who is X /
   what's my history with X" → `get_contact_history` (full CRM profile + writing style + meetings);
-  "mark X high priority / add a note" → `update_crm_contact`.
+  "mark X high priority / add a note" → `update_crm_contact`; "tag X as Y / add X to the Y group" →
+  `tag_contact` (one named contact).
 
 ## Projects
 See [projects](projects.md) — same store powers the data view, the project sections, and the bot's
 `modify_project`.
 
 ## Companies
-Organizations, **identified by email domain** (not by name). Auto-derived from CRM + Projects; users
-can add a company to watch and toggle "Company Intelligence monitoring".
+Organizations, **identified by email domain** (not by name). A DERIVED view — identity/contacts/
+projects/status recomputed from CRM + Projects — plus a user-state layer (monitor toggle, ignore,
+notes, priority, name, manual adds) that persists across rebuilds. That user state lives in the store
+(`companies_store.py`); `companies.json` is a synced projection. The `monitor_intelligence` / `ignore`
+/ `priority` edits directly drive which companies **Company Intelligence** actually runs on.
+- **Ask the bot:** "what companies am I tracking / monitoring for intelligence", "list my companies"
+  → `list_companies` (default shows only the companies intelligence runs on; filterable by status/priority).
 
 ## Cleanup
 A weekly AI scan proposes tidy-ups across CRM/Projects (dedup, stale flags), grouped by confidence;

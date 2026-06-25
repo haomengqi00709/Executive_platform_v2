@@ -6,8 +6,10 @@ describes_files:
   - src/bot_tools/projects/modify_project/tool.py
   - src/bot_tools/email/open_email/tool.py
   - src/bot_tools/contacts/list_crm_contacts/tool.py
-derived_from_commit: 617a540
-last_synced: 2026-06-24
+  - src/bot_tools/contacts/tag_contact/tool.py
+  - src/bot_tools/companies/list_companies/tool.py
+derived_from_commit: 97215fd
+last_synced: 2026-06-25
 ---
 
 # Workflow Tools (Outreach / Draft Composer)
@@ -59,7 +61,10 @@ disambiguation / completion-gate rules above:
   list, `meeting N` → meetings list, `contact N` → contacts list, `project N` →
   projects list, regardless of which list was shown most recently. Each list source
   keeps its own bucket (e.g. a frequency report vs a name search vs a CRM-by-attribute
-  list are separate), so a "#N" from one list never resolves against another.
+  list are separate), so a "#N" from one list never resolves against another. After a
+  successful action MUTATES a domain (mark/snooze/dismiss a commitment, modify/tag/edit),
+  that domain's shown-list bucket is dropped, so the next "#N" re-resolves against the
+  LIVE store rather than the now-stale positions.
 - **When it can't** — for actions with no tool (cancel/reschedule a meeting,
   forward/delete email, out-of-office, SMS, filter a group by role) it says so
   plainly and offers the closest supported alternative; it never fakes success
@@ -103,7 +108,10 @@ one pass with no verifier call.
 - **`open_email`** — fetch the FULL verbatim body of an original email by id (the cached lists only
   carry a preview). Accepts a commitment's id too (resolved to its source email). Used only when the
   user wants the full text — "where is it from / what's it about" is answered from the item's own fields.
-- **`list_crm_contacts`** — list the curated CRM by status/priority/tag (see [data-management](data-management.md)).
+- **`list_crm_contacts`** / **`tag_contact`** — list the curated CRM by status/priority/tag; tag one
+  named contact (see [data-management](data-management.md)).
+- **`list_companies`** — list the company database, default = the companies Company Intelligence
+  actually monitors (see [data-management](data-management.md)).
 
 ## The hard rule
 **Drafts are never auto-sent.** Everything the AI writes is saved to Outlook Drafts;

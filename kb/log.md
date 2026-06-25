@@ -21,3 +21,6 @@ Append-only. One line per event. Grep recent: `grep '^## \[' kb/log.md | tail -5
 ## [2026-06-24] sync | email-triage + delivery — drafted/replied overlaid out live; follow-up dismissable; email monitor extracts commitments + auto-clears in real time @617a540
 ## [2026-06-24] sync | workflow-tools — new tools (modify_project, open_email, list_crm_contacts); per-source #N buckets fix cross-list collision @617a540
 ## [2026-06-24] sync | deployment + expenses + meetings — Railway-only (Azure decommissioned); non-behavioral bumps @617a540
+## [2026-06-25] sync | data-management — companies → store (Phase 3c, store-backed + edit-preserving); list_companies + tag_contact bot tools @97215fd
+## [2026-06-25] sync | workflow-tools — new tools (list_companies/tag_contact); shown-list invalidated after a mutating action so #N re-resolves live @97215fd
+## [2026-06-25] sync | overview + sections-framework + delivery — companies store migration (server.py); non-behavioral bumps @97215fd
