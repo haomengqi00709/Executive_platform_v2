@@ -24,3 +24,4 @@ frontend/.vite/
 
 # local pre-change backups (not committed)
 .backups/
+phase_f_test_30.py
