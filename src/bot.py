@@ -149,6 +149,35 @@ def _build_current_views(state: dict) -> str:
         return ""
 
 
+# When an action MUTATES a domain, the list the user saw for that domain is now stale — a later
+# "#N" against it would resolve to the wrong row (e.g. mark #1 done, then "snooze 2" hits the OLD #2).
+# So after a successful action we drop its domain's _shown_lists bucket(s); the next "#N" then has no
+# stale bucket to match and re-resolves against the LIVE store (or forces a fresh read).
+_ACTION_INVALIDATES = {
+    "mark_commitment_done":   ("commitments",),
+    "snooze_commitment":      ("commitments",),
+    "dismiss_commitment":     ("commitments",),
+    "modify_project":         ("projects",),
+    "update_crm_contact":     ("contacts", "crm_contacts", "frequency_contacts"),
+    "tag_contact":            ("contacts", "crm_contacts", "frequency_contacts"),
+    "tag_recent_contacts":    ("contacts", "crm_contacts", "frequency_contacts"),
+    "dismiss_email_followup": ("emails",),
+    "approve_draft":          ("emails",),
+}
+
+
+def _invalidate_shown_lists(state: dict, tool_name: str) -> None:
+    """Drop the stale _shown_lists buckets a successful action invalidated. Best-effort."""
+    try:
+        buckets = (state or {}).get("_shown_lists")
+        if not buckets:
+            return
+        for t in _ACTION_INVALIDATES.get(tool_name, ()):
+            buckets.pop(t, None)
+    except Exception:
+        pass
+
+
 # A line that is part of a rendered list (bullet, "[#N]", "N.", or a priority emoji) — used to
 # split a reply's prose preamble from its list body.
 _LIST_LINE_RE = re.compile(r"^\s*(\[#?\d+\]|#\d+|\d+[.)]|[•*]|-\s|🔴|🟡|🟢|⚠️|📌|📅|📆)")
@@ -627,6 +656,10 @@ def reply(
                         ("Error", "⚠️", "Owner account", "No pending",
                          "Unknown tool", "Tool error", "Couldn't"))
                     action_results[fc.name] = action_results.get(fc.name, False) or ok
+                    if ok:
+                        # The action mutated its domain → the shown list for that domain is now
+                        # stale; drop it so a later "#N" re-resolves against the live store.
+                        _invalidate_shown_lists(state, fc.name)
                 response_parts.append(
                     types.Part(function_response=types.FunctionResponse(
                         name=fc.name, response={"result": result})))
