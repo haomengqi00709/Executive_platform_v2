@@ -856,5 +856,12 @@ def reply(
           f"verdict={verdict} corrections={corrections} "
           f"tools={tools_called} actions_ok={actions_ok} actions_failed={actions_fail}")
 
-    _save_turn(db_path, text, final_text)
+    # Don't persist a FAILED turn (model returned nothing → honest fallback). Saving it would write a
+    # "this question → empty/fallback" pair into the replayed history, and an autoregressive model
+    # tends to MIMIC that pattern — so an identical repeat question keeps returning empty (the turn
+    # poisons itself). Dropping failed turns keeps history clean; the user's retry/rephrase starts fresh.
+    if finish_mode != "fallback":
+        _save_turn(db_path, text, final_text)
+    else:
+        print("[Bot] fallback turn — NOT saved to history (avoids empty-response feedback loop)")
     return final_text, state
