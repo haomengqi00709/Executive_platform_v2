@@ -65,7 +65,26 @@ def test_dismiss_followup_no_match_honest(tmp_path):
     from src.bot_tools.email.dismiss_email_followup.tool import build
     _seed_followup(tmp_path, [{"email_id": "S1", "to_email": "a@x.com", "to_name": "A", "subject": "X"}])
     out = build(_ctx(tmp_path))("nobody")
-    assert "can't find a follow-up" in out
+    assert "can't match" in out.lower() and "don't claim" in out.lower()
+
+
+def test_dismiss_followup_all_closes_every_open(tmp_path):
+    """Daniel's "close the follow-ups for those emails" — 'all'/'those' dismisses every open follow-up."""
+    from src.bot_tools.email.dismiss_email_followup.tool import build
+    _seed_followup(tmp_path, [
+        {"email_id": "S1", "to_email": "a@x.com", "to_name": "Alice", "subject": "Proposal"},
+        {"email_id": "S2", "to_email": "b@x.com", "to_name": "Bob", "subject": "Invoice"}])
+    out = build(_ctx(tmp_path))("all")
+    assert "Dismissed 2" in out, out
+
+
+def test_dismiss_followup_token_subset(tmp_path):
+    """Name/subject that isn't a contiguous substring still matches via token-subset."""
+    from src.bot_tools.email.dismiss_email_followup.tool import build
+    _seed_followup(tmp_path, [
+        {"email_id": "S1", "to_email": "daniel@x.com", "to_name": "Daniel Zhang", "subject": "MEP Ai Tools follow-up"}])
+    out = build(_ctx(tmp_path))("Daniel MEP")          # not contiguous in any field
+    assert "Dismissed 1" in out, out
 
 
 def test_followup_dismiss_does_not_leak_into_reply_needed(tmp_path):
