@@ -1,66 +1,79 @@
+import re
+
 IS_ACTION = True
+
+
+def _hay(it):
+    return " ".join((it.get(f) or "") for f in ("to_name", "to_email", "subject")).lower()
+
+
+def _match_by_text(items, q):
+    """Name/subject hint dismisses ALL matching follow-ups: contiguous substring first (precise), then
+    token-subset (every ≥2-char hint word appears in name/email/subject) — for compressed refs."""
+    matched = [it for it in items if q in _hay(it)]
+    if not matched:
+        words = [w for w in re.split(r"\W+", q) if len(w) >= 2]
+        if len(words) >= 2:
+            matched = [it for it in items if all(w in set(re.split(r"\W+", _hay(it))) for w in words)]
+    return matched
+
+
+def _render(items):
+    return "; ".join(
+        f'[#{i + 1}] "{(it.get("to_name") or it.get("to_email") or "")}" — {(it.get("subject") or "")[:40]}'
+        for i, it in enumerate(items[:6]))
 
 
 def build(ctx):
     def dismiss_email_followup(from_name_or_subject: str) -> str:
+        from src.modules import email_store
+        from src.bot_tools.email._shared import visible_followups, resolve_followup
         data_dir = ctx.data_dir
         if not data_dir:
             return "No data directory available."
         try:
-            import json as _j
-            from src.modules import email_store
-            # The follow-ups the user sees come from the followup_needed section (emails THEY sent
-            # that haven't been answered). Resolve the hint against that LIVE list, then record a
-            # durable 'followup_dismissed' annotation so the item drops off and stays off (read-time
-            # overlay in read_module_result/followup_needed honours it).
-            # (Was: grepped the long-dead `pending_priority_followup` list — always empty since the
-            #  reply_needed=single-source refactor — so it always returned "no match".)
-            path = data_dir / "results" / "followup_needed.json"
-            items = (_j.loads(path.read_text()).get("items") if path.exists() else []) or []
-            # Apply the read-time overlay so already-dismissed items aren't "matched" again.
-            try:
-                kept, _ = email_store.overlay_handled(
-                    data_dir, items, kinds=email_store.FOLLOWUP_KINDS, key_field="to_email")
-                items = kept
-            except Exception:
-                pass
+            items = visible_followups(ctx)
             if not items:
-                return ("You have no follow-ups currently awaiting a reply — nothing to close.")
+                return "You have no follow-ups currently awaiting a reply — nothing to close."
 
-            q = from_name_or_subject.lower().strip()
-
-            def _hay(it):
-                return " ".join((it.get(f) or "") for f in ("to_name", "to_email", "subject")).lower()
+            q = (from_name_or_subject or "").lower().strip()
+            tokens = [t.strip() for t in q.replace(",", " ").split() if t.strip()]
+            missing = []
 
             if q in ("all", "those", "them", "these", "all of them", "everything", ""):
-                matched = list(items)                      # "close those / all" → every open follow-up
-            else:
-                matched = [it for it in items if q in _hay(it)]    # contiguous substring (precise)
+                matched = list(items)                          # "close those / all" → every open follow-up
+            elif tokens and all(t.isdigit() for t in tokens):
+                # position(s) — "1", "1,3", "2 3" — resolved in CODE the way the user saw the list
+                # (snapshot or canonical display order), never by guessing a name from the number.
+                matched = []
+                for t in tokens:
+                    it = resolve_followup(ctx, t, ordered_items=items)
+                    if it is not None and it not in matched:
+                        matched.append(it)
+                    else:
+                        missing.append(t)
                 if not matched:
-                    # Token-subset: the model often passes a name/subject that isn't a contiguous
-                    # substring ("Daniel MEP" vs "Daniel — MEP Ai Tools"). Match when every hint word
-                    # (≥2 words) appears somewhere in name/email/subject. This is Daniel's reported
-                    # "names/subjects didn't precisely match" failure.
-                    import re
-                    words = [w for w in re.split(r"\W+", q) if len(w) >= 2]
-                    if len(words) >= 2:
-                        matched = [it for it in items
-                                   if all(w in set(re.split(r"\W+", _hay(it))) for w in words)]
-            if not matched:
-                shown = "; ".join(f'"{(it.get("to_name") or it.get("to_email") or "")}" — '
-                                  f'{(it.get("subject") or "")[:40]}' for it in items[:6])
-                return (f"⚠️ I can't match '{from_name_or_subject}' to a follow-up you're awaiting. "
-                        f"Your open follow-ups: {shown}. Which one (or say 'all')? Don't claim it's dismissed.")
+                    return (f"⚠️ #{', #'.join(tokens)} doesn't line up with your follow-up list "
+                            f"({len(items)} open): {_render(items)}. Which number? Don't claim it's dismissed.")
+            else:
+                matched = _match_by_text(items, q)
+                if not matched:
+                    return (f"⚠️ I can't match '{from_name_or_subject}' to a follow-up you're awaiting. "
+                            f"Your open follow-ups: {_render(items)}. Which one (or say 'all')? "
+                            f"Don't claim it's dismissed.")
+
             for it in matched:
-                # Carry the pointer (email_id/conversation_id) so the annotation can be navigated
-                # back to the original sent email (open_email) — followup_needed items have them.
+                # Carry the pointer (email_id / conversation_id) so the annotation stays navigable
+                # back to the original sent email (open_email).
                 email_store.mark_handled(
                     data_dir, counterparty=it.get("to_email", ""), subject=it.get("subject", ""),
                     kind="followup_dismissed", source="dismiss_followup",
                     email_id=it.get("email_id", ""), conversation_id=it.get("conversation_id", ""))
             who = ", ".join(sorted({(it.get("to_name") or it.get("to_email") or "") for it in matched}))
             print(f"[Bot] dismiss_email_followup('{from_name_or_subject}') → {len(matched)} followup(s)")
-            return f"✅ Dismissed {len(matched)} follow-up(s) ({who}) — won't flag them as awaiting a reply again."
+            note = f" (couldn't find #{', #'.join(missing)})" if missing else ""
+            return (f"✅ Dismissed {len(matched)} follow-up(s) ({who}){note} — "
+                    f"won't flag them as awaiting a reply again.")
         except Exception as e:
             return f"Error: {e}"
     return dismiss_email_followup

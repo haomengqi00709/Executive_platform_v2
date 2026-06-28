@@ -87,6 +87,69 @@ def test_dismiss_followup_token_subset(tmp_path):
     assert "Dismissed 1" in out, out
 
 
+def _seed3(tmp_path):
+    _seed_followup(tmp_path, [
+        {"email_id": "S1", "to_email": "a@x.com", "to_name": "Alice", "subject": "Alpha",
+         "sent": "2026-06-20T00:00:00Z", "days_waiting": 3, "urgency": "high"},
+        {"email_id": "S2", "to_email": "b@x.com", "to_name": "Bob", "subject": "Beta",
+         "sent": "2026-06-21T00:00:00Z", "days_waiting": 2, "urgency": "medium"},
+        {"email_id": "S3", "to_email": "c@x.com", "to_name": "Carol", "subject": "Gamma",
+         "sent": "2026-06-22T00:00:00Z", "days_waiting": 1, "urgency": "low"}])
+
+
+def test_dismiss_followup_by_position(tmp_path):
+    """'close follow up 1,3' resolves the NUMBERS in code against the list the user saw (display
+    order) — never by guessing a name. The regression behind Daniel's 'I couldn't find Commercial
+    Rates': the dismiss tool had no positional path at all."""
+    import json
+    from src.bot_tools.email.dismiss_email_followup.tool import build
+    from src.bot_tools.email._shared import visible_followups
+    from src.bot_tools.sections.read_module_result.tool import build as build_read
+    _seed3(tmp_path)
+    ctx = _ctx(tmp_path, settings={"timezone": "UTC"})
+    visible = visible_followups(ctx)                       # the exact order the user is shown
+    assert len(visible) == 3
+    first_sub, third_sub = visible[0]["subject"], visible[2]["subject"]
+
+    out = build(ctx)("1,3")
+    assert "Dismissed 2" in out, out
+
+    data = json.loads(build_read(_ctx(tmp_path, settings={"timezone": "UTC"}))("followup_needed"))
+    remaining = {it["subject"] for it in data["items"]}
+    assert first_sub not in remaining and third_sub not in remaining, remaining
+    assert len(remaining) == 1, remaining                  # only the #2 the user didn't name survives
+
+
+def test_dismiss_followup_position_out_of_range_is_honest(tmp_path):
+    """A number with no matching row is reported honestly, never a fake 'dismissed'."""
+    from src.bot_tools.email.dismiss_email_followup.tool import build
+    _seed_followup(tmp_path, [
+        {"email_id": "S1", "to_email": "a@x.com", "to_name": "Alice", "subject": "Alpha"}])
+    out = build(_ctx(tmp_path, settings={"timezone": "UTC"}))("9")
+    assert "doesn't line up" in out.lower() and "don't claim" in out.lower(), out
+
+
+def test_dismiss_followup_position_ignores_foreign_bucket_snapshot(tmp_path):
+    """The 'emails' #N bucket is shared (reply_needed/recent also write it). A snapshot whose source
+    is NOT followup_needed must be ignored — '#1' falls back to the follow-up canonical order, so a
+    stale reply_needed list can't make 'dismiss 1' hit the wrong record."""
+    from src.bot_tools.email.dismiss_email_followup.tool import build
+    from src.bot_tools.email._shared import visible_followups
+    _seed3(tmp_path)
+    foreign = {"_shown_lists": {"emails": {"source": "reply_needed",
+               "items": [{"pos": 1, "id": "S3"}, {"pos": 2, "id": "S2"}, {"pos": 3, "id": "S1"}]}}}
+    ctx = _ctx(tmp_path, settings={"timezone": "UTC"}, state=foreign)
+    pos1_sub = visible_followups(ctx)[0]["subject"]        # canonical #1
+    out = build(ctx)("1")
+    assert "Dismissed 1" in out, out
+    # dismissed the CANONICAL #1, not the foreign-snapshot's pos-1 (S3)
+    import json
+    from src.bot_tools.sections.read_module_result.tool import build as build_read
+    data = json.loads(build_read(_ctx(tmp_path, settings={"timezone": "UTC"}))("followup_needed"))
+    remaining = {it["subject"] for it in data["items"]}
+    assert pos1_sub not in remaining, (pos1_sub, remaining)
+
+
 def test_followup_dismiss_does_not_leak_into_reply_needed(tmp_path):
     """Kind isolation: dismissing a follow-up to X must NOT hide an INBOUND reply_needed from X
     (same person + subject, opposite direction)."""
