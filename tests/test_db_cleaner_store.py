@@ -99,6 +99,31 @@ def test_merge_contacts_persists_in_store_no_resurrection(tmp_path):
     assert "dup@x.com" not in proj and "keep@x.com" in proj
 
 
+def test_merge_contacts_is_lossless_union(tmp_path):
+    """Merge must STACK both sides' data, never overwrite: the merged-away contact's tags / notes /
+    priority / ignore survive, its email + name become alias/variant — nothing the user set is lost."""
+    cs.replace_from_dict(tmp_path, {"contacts": {
+        "keep@x.com": _contact("keep@x.com", name="Jason Hao", thread_count=2,
+                               tags=["vip"], priority="low", notes="from keep", company="Acme"),
+        "dup@x.com":  _contact("dup@x.com", name="Hao Jason", thread_count=3,
+                               tags=["client"], priority="high", notes="from dup",
+                               ignore=True, company="Globex")}})
+
+    r = db_cleaner.merge_contacts(tmp_path, "keep@x.com", "dup@x.com")
+    assert r["ok"]
+
+    keep = cs.load_crm(tmp_path)["contacts"]["keep@x.com"]
+    assert sorted(keep["tags"]) == ["client", "vip"]                      # tags UNIONED, dup's kept
+    assert keep["priority"] == "high"                                     # stronger priority wins
+    assert keep["ignore"] is True                                         # dup's ignore flag survives
+    assert "from keep" in keep["notes"] and "from dup" in keep["notes"]   # both notes kept
+    assert keep["thread_count"] == 5                                      # counts summed
+    assert "dup@x.com" in keep["aliases"]                                 # merged email kept as alias
+    assert "Hao Jason" in keep.get("name_variants", [])                  # merged name kept as variant
+    assert keep["company"] == "Acme" and "Globex" in keep["notes"]       # primary kept, other recorded
+    assert "dup@x.com" not in cs.load_crm(tmp_path)["contacts"]          # duplicate row gone
+
+
 def test_archive_contact_persists_in_store(tmp_path):
     cs.replace_from_dict(tmp_path, {"contacts": {"c@x.com": _contact("c@x.com", tags=["keep"])}})
     r = db_cleaner.archive_record(tmp_path, "contact", "c@x.com")

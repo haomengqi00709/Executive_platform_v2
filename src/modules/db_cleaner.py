@@ -502,11 +502,51 @@ def merge_projects(data_dir: Path, keep_id: str, merge_id: str) -> dict:
     return {"ok": True, "keep_id": keep_id, "removed_id": merge_id}
 
 
-def merge_contacts(data_dir: Path, keep_email: str, merge_email: str) -> dict:
-    """Apply a contact merge: union messages, delete the duplicate, log it.
+# Priority is a scalar STATE, not a list — when two duplicates disagree the stronger one wins
+# (you can't keep "two priorities"). Everything below "high/medium/low" ranks 0 so an unset side
+# never overrides a set one.
+_PRIORITY_RANK = {"high": 3, "medium": 2, "med": 2, "normal": 2, "low": 1}
 
-    Persisted through crm_store (the single source of truth) — NOT a direct crm.json write, so the
-    next CRM rebuild can't resurrect the merged-away duplicate."""
+
+def _prio_rank(p) -> int:
+    return _PRIORITY_RANK.get((p or "").strip().lower(), 0)
+
+
+def _union_list(*lists) -> list:
+    """Order-preserving union of several lists; strings deduped case-insensitively, blanks dropped.
+    The merge's list-type fields (tags, aliases, name variants, meeting_ids) use this so NO entry
+    from either side is ever lost."""
+    out, seen = [], set()
+    for lst in lists:
+        for v in (lst or []):
+            if v is None or v == "":
+                continue
+            key = v.lower() if isinstance(v, str) else v
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(v)
+    return out
+
+
+def merge_contacts(data_dir: Path, keep_email: str, merge_email: str) -> dict:
+    """Apply a contact merge as a LOSSLESS field-level UNION — neither side's data is dropped.
+
+    The previous version was "keep wins": it copied only 6 AI fields from the merged-away side (and
+    only when keep's was empty), then deleted the row — silently losing any tags / notes / priority /
+    ignore the user had set on that side. That violated "don't lose user customization". The merge now
+    folds EVERY field into keep BEFORE deleting the duplicate:
+      - list fields (tags, meeting_ids, name variants, email aliases) → UNION, deduped
+      - scalar-state flags (ignore / archived / manual) → OR; priority → stronger wins
+      - free text (notes / summary / writing_style) → concatenate when the two differ
+      - AI/derived single-value fields (role / phone / linkedin / status / …) → non-empty wins, prefer keep
+      - company → non-empty wins; if both set and differ, keep primary + record the other in notes
+    keep_email stays the canonical address; merge_email and any aliases it carried become aliases, and
+    its display name (if different) is preserved under name_variants — so searching either name resolves
+    once a reader honours those fields.
+
+    Persisted through crm_store (the single source of truth): upsert the fully-merged keep, then delete
+    the duplicate row — so the merge can never lose user data and can't be resurrected from crm.json."""
     from src.modules import crm_store
     data_dir = Path(data_dir)
     contacts = crm_store.load_crm(data_dir).get("contacts", {})
@@ -516,26 +556,64 @@ def merge_contacts(data_dir: Path, keep_email: str, merge_email: str) -> dict:
     if keep_key not in contacts or merge_key not in contacts:
         return {"ok": False, "error": "Contact not found"}
 
-    keep = contacts[keep_key]
-    merge = contacts[merge_key]
+    keep  = dict(contacts[keep_key])
+    merge = dict(contacts[merge_key])
     before = {"keep": dict(keep), "merge": dict(merge)}
 
+    # ── counts / derived ──
     keep["thread_count"] = (keep.get("thread_count") or 0) + (merge.get("thread_count") or 0)
-    if (merge.get("last_contact") or "") > (keep.get("last_contact") or ""):
-        keep["last_contact"] = merge["last_contact"]
+    keep["last_contact"] = max(keep.get("last_contact") or "", merge.get("last_contact") or "")
+    if merge.get("added_at"):
+        keep["added_at"] = min(keep.get("added_at") or merge["added_at"], merge["added_at"])
 
-    # Fall back to merge's fields when keep's is empty
-    for f in ("company", "role", "phone", "linkedin", "summary", "writing_style"):
+    # ── list-type fields: UNION, never drop ──
+    keep["tags"]        = _union_list(keep.get("tags"), merge.get("tags"))
+    keep["meeting_ids"] = _union_list(keep.get("meeting_ids"), merge.get("meeting_ids"))
+
+    # name: one canonical display name (keep's); preserve every other distinct name as a variant
+    variants = _union_list(keep.get("name_variants"), merge.get("name_variants"),
+                           [keep.get("name"), merge.get("name")])
+    variants = [n for n in variants if n and n != keep.get("name")]
+    if variants:
+        keep["name_variants"] = variants
+
+    # emails: keep_key stays primary; merge's address + any aliases it carried become aliases
+    aliases = _union_list(keep.get("aliases"), merge.get("aliases"),
+                          [merge.get("email") or merge_key])
+    keep["aliases"] = sorted(a for a in aliases if a and a.lower() != keep_key)
+
+    # ── scalar-state flags: combine by rule (never silently drop a flag the user set) ──
+    keep["ignore"]   = bool(keep.get("ignore")   or merge.get("ignore"))
+    keep["archived"] = bool(keep.get("archived") or merge.get("archived"))
+    keep["manual"]   = bool(keep.get("manual")   or merge.get("manual"))
+    if _prio_rank(merge.get("priority")) > _prio_rank(keep.get("priority")):
+        keep["priority"] = merge["priority"]
+
+    # ── free text: concatenate when the two differ (keep both) ──
+    for f in ("notes", "summary", "writing_style"):
+        kv = (keep.get(f) or "").strip()
+        mv = (merge.get(f) or "").strip()
+        if mv and mv != kv:
+            keep[f] = f"{kv}\n{mv}".strip()
+
+    # ── AI/derived single-value fields: non-empty wins (prefer keep) ──
+    for f in ("role", "phone", "linkedin", "status", "draft_link", "source"):
         if not keep.get(f) and merge.get(f):
             keep[f] = merge[f]
 
-    # Track the alias so future emails to merge_email still resolve
-    aliases = set(keep.get("aliases", []))
-    aliases.add(merge.get("email") or merge_key)
-    keep["aliases"] = sorted(aliases)
+    # company: non-empty wins; if both set and differ, keep primary + record the other in notes
+    kc = (keep.get("company") or "").strip()
+    mc = (merge.get("company") or "").strip()
+    if not kc and mc:
+        keep["company"] = mc
+    elif kc and mc and kc.lower() != mc.lower():
+        note = f"[merge] also listed under company: {mc}"
+        existing = (keep.get("notes") or "").strip()
+        keep["notes"] = f"{existing}\n{note}".strip()
+
     keep["updated_at"] = datetime.now().strftime("%Y-%m-%d")
 
-    # Persist through the store: upsert the merged keep, then delete the duplicate row.
+    # Persist through the store: upsert the fully-merged keep, THEN delete the duplicate row.
     crm_store.replace_from_dict(data_dir, {"contacts": {keep_key: keep}})
     crm_store.delete_contact(data_dir, merge_key)
     _append_merge_log(data_dir, {
