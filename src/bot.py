@@ -48,6 +48,25 @@ BUDGET_NUDGE_AT = 2        # rounds-remaining threshold to push the model to act
 MAX_CORRECTIONS = 2        # completion gate: how many times we re-drive an unfinished action
 HONEST_FALLBACK = "I looked into that but didn't finish — want me to try again?"
 
+# Borrowed from Hermes (anti history-poisoning): a "fetch fresh / never answer from memory" contract.
+# The flat replayed history makes the model parrot a stale answer it gave earlier (e.g. a contact list
+# produced WITHOUT calling the lookup tool) instead of calling the tool again. This block forbids that.
+# The "#N" carve-out preserves the CURRENT VIEWS cross-turn resolution flow (_build_current_views).
+_FRESH_FETCH_CONTRACT = (
+    "\n\nALWAYS FETCH FRESH — NEVER ANSWER FROM MEMORY: Contacts, emails, meetings, commitments, drafts, "
+    "groups and every other stored record can change between turns. NEVER list, name, or quote any such "
+    "record from your own memory or from anything said EARLIER in this conversation — earlier turns (and any "
+    "list, contact, email or result they contain) are REFERENCE ONLY and may be stale; they do NOT replace "
+    "calling the tool. To answer 'who is X', 'find X's email', 'draft to X', or 'show my emails / meetings / "
+    "commitments', you MUST call the matching lookup tool THIS turn (find_contacts_by_name, get_recent_emails, "
+    "get_upcoming_meetings, read_module_result, …) and answer ONLY from that fresh result — even if you "
+    "believe you already know it from earlier in the chat. If information is missing, use the lookup tool; ask "
+    "the user ONLY when no tool can retrieve it. Do NOT repeat or re-send an answer you gave in an earlier turn "
+    "(a contact list, an email, a result) — if the user asks again, RE-FETCH with the tool. The user's LATEST "
+    "message is the only thing to act on. The ONE exception: resolving a '#N' reference against the CURRENT "
+    "VIEWS block below is allowed — those ids are carried forward for exactly that purpose."
+)
+
 # Tools that DO something (mutate state / create a resource) vs. read tools. Mirrors the
 # Action-tool telemetry set. Every tool now lives in src/bot_tools/<domain>/<tool>/ and
 # declares `action: true` in its tool.md; the registry returns the action names, so this
@@ -191,6 +210,27 @@ _DISPLAY_HINTS = (
     "my email", "my to-do", "my todo", "my follow", "outstanding", "pending",
     "显示", "列出", "列一下", "看一下", "看下", "有哪些", "我的", "全部", "所有", "待办", "承诺", "任务",
 )
+
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+_CONTACT_LEADIN = ("i found these contacts", "here are the contacts", "found these contacts for",
+                   "contacts named", "i found a few")
+
+
+def _is_poisoned_turn(final_text: str, tools_called: list) -> bool:
+    """True when a reply PRESENTS a stored-record listing (a contact list / a multi-line [#N] list / an
+    email address) but NO tool ran at all this turn — i.e. it was produced from memory or replayed
+    history, not a fresh call. Such a turn must NOT be persisted: stored flat and replayed, it teaches
+    the model to parrot the stale answer instead of calling the lookup tool (the live "draft to jason →
+    backed a stale ips/proxy list, tools=[]" bug). Conjunction + tight signals so a plain answer
+    (greeting, decline, explanation) — or any turn where a real tool ran — is NEVER dropped."""
+    if tools_called:
+        return False                                    # a real call ran → the content is genuine, keep it
+    ft = final_text or ""
+    if _EMAIL_RE.search(ft):
+        return True                                     # an email address with no fetch behind it = the artifact
+    if any(s in ft.lower() for s in _CONTACT_LEADIN):
+        return True
+    return sum(1 for ln in ft.splitlines() if _LIST_LINE_RE.match(ln)) >= 2   # ≥2 list lines = a listed set
 
 
 def _enforce_list_completeness(text: str, state: dict, user_text: str) -> str:
@@ -608,6 +648,7 @@ def reply(
             f"that honest decline IS the complete answer — do NOT retry it as an unfinished action "
             f"and do NOT tell the user you are waiting for data to refresh."
         )
+        + _FRESH_FETCH_CONTRACT
         + f"{user_ctx}"
         + f"{session_ctx}"
         + f"{current_views}"
@@ -777,7 +818,7 @@ def reply(
     _PICK = ("which daniel", "which one", "which of these", "which of them",
              "please specify which", "specify which", "which contact", "which person",
              "which meeting", "which email")
-    _action_attempted = any(t in ACTION_TOOLS for t in tools_called)
+    _action_attempted = any(t in _action_set for t in tools_called)   # was ACTION_TOOLS (empty) → dead
     _lookup_called = any(t in ("find_contacts_by_name", "check_email_handling", "get_recent_emails",
                                "get_contact_history", "list_group_members") for t in tools_called)
     _claims_action = any(w in _ft for w in _CLAIM)
@@ -860,8 +901,16 @@ def reply(
     # "this question → empty/fallback" pair into the replayed history, and an autoregressive model
     # tends to MIMIC that pattern — so an identical repeat question keeps returning empty (the turn
     # poisons itself). Dropping failed turns keeps history clean; the user's retry/rephrase starts fresh.
-    if finish_mode != "fallback":
+    # Also drop a POISONED turn: a reply that listed a stored record (contacts / [#N] list / an email)
+    # with NO tool call this turn — it was answered from memory/replayed history, not a fresh lookup.
+    # Persisting it flat teaches the model to parrot the stale answer next time instead of calling the
+    # tool (the "draft to jason → backed a stale ips/proxy list, tools=[]" bug). See _is_poisoned_turn.
+    _poisoned = _is_poisoned_turn(final_text, tools_called)
+    if finish_mode != "fallback" and not _poisoned:
         _save_turn(db_path, text, final_text)
+    elif _poisoned:
+        print("[Bot] turn NOT saved — answered from memory (record listing with no tool call) "
+              f"finish={finish_mode}")
     else:
         print("[Bot] fallback turn — NOT saved to history (avoids empty-response feedback loop)")
     return final_text, state
