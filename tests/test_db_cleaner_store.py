@@ -165,17 +165,23 @@ def test_resolve_primary_email_returns_clean_smtp(tmp_path):
 
 
 def test_group_survives_rebuild(tmp_path):
-    """The daily rebuild (upsert_built_contacts with a fresh AI dict that has NO group fields) must
-    PRESERVE group_id / is_group_primary — they're user columns, not rebuild-authority."""
+    """The ACTUAL daily refresh path — build_crm/refresh_crm start from the existing rows, fold fresh
+    AI fields via _merge_ai_enrichment, then save_crm (replace_from_dict) — must PRESERVE group_id /
+    is_group_primary (they're not AI-owned). (The earlier version tested upsert_built_contacts, which
+    is NOT the path the daily job uses — server _refresh_crm_for_user → save_crm.)"""
+    from src.modules import crm
     cs.replace_from_dict(tmp_path, {"contacts": {"p@x.com": _contact("p@x.com"), "m@x.com": _contact("m@x.com")}})
     db_cleaner.merge_contacts(tmp_path, "p@x.com", "m@x.com")
     gid = cs.load_crm(tmp_path)["contacts"]["p@x.com"]["group_id"]
-    cs.upsert_built_contacts(tmp_path, {                            # simulate a refresh, no group fields
-        "p@x.com": {"email": "p@x.com", "name": "P", "company": "NewCo", "thread_count": 9},
-        "m@x.com": {"email": "m@x.com", "name": "M", "company": "NewCo2", "thread_count": 4}})
+    existing = cs.load_crm(tmp_path)["contacts"]
+    built = {e: crm._merge_ai_enrichment(existing.get(e, {}),
+                                         {"email": e, "company": "NewCo", "status": "client"})
+             for e in ("p@x.com", "m@x.com")}
+    crm.save_crm(tmp_path, {"contacts": built})                    # the real persist (replace_from_dict)
     out = cs.load_crm(tmp_path)["contacts"]
     assert out["p@x.com"].get("group_id") == gid and out["p@x.com"].get("is_group_primary") is True
     assert out["m@x.com"].get("group_id") == gid
+    assert out["p@x.com"]["company"] == "NewCo"                    # AI field still refreshed
 
 
 def test_ungroup_is_reversible(tmp_path):
