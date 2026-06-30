@@ -529,25 +529,55 @@ def _union_list(*lists) -> list:
     return out
 
 
-def merge_contacts(data_dir: Path, keep_email: str, merge_email: str) -> dict:
-    """Apply a contact merge as a LOSSLESS field-level UNION — neither side's data is dropped.
+_GROUP_LEVEL_TEXT = ("notes", "summary", "writing_style")
+_GROUP_LEVEL_FILL = ("role", "phone", "linkedin", "status", "draft_link", "source")
 
-    The previous version was "keep wins": it copied only 6 AI fields from the merged-away side (and
-    only when keep's was empty), then deleted the row — silently losing any tags / notes / priority /
-    ignore the user had set on that side. That violated "don't lose user customization". The merge now
-    folds EVERY field into keep BEFORE deleting the duplicate:
-      - list fields (tags, meeting_ids, name variants, email aliases) → UNION, deduped
-      - scalar-state flags (ignore / archived / manual) → OR; priority → stronger wins
-      - free text (notes / summary / writing_style) → concatenate when the two differ
-      - AI/derived single-value fields (role / phone / linkedin / status / …) → non-empty wins, prefer keep
-      - company → non-empty wins; if both set and differ, keep primary + record the other in notes
-    keep_email stays the canonical address; merge_email and any aliases it carried become aliases, and
-    its display name (if different) is preserved under name_variants — so searching either name resolves
-    once a reader honours those fields.
 
-    Persisted through crm_store (the single source of truth): upsert the fully-merged keep, then delete
-    the duplicate row — so the merge can never lose user data and can't be resurrected from crm.json."""
+def _aggregate_group_fields(primary: dict, other: dict, member_keys: list, primary_key: str) -> dict:
+    """Fold OTHER's group-level user fields into PRIMARY (lossless union). Returns a NEW primary dict.
+    Group-level = tags/notes/priority/ignore/archived/manual/meeting_ids/name_variants/aliases (they
+    belong to the person). Per-row fields (company/email/role/thread_count) are NOT folded — each row
+    keeps its own; collapse_groups aggregates them for display."""
+    p = dict(primary)
+    p["tags"]        = _union_list(p.get("tags"), other.get("tags"))
+    p["meeting_ids"] = _union_list(p.get("meeting_ids"), other.get("meeting_ids"))
+    variants = _union_list(p.get("name_variants"), other.get("name_variants"),
+                           [p.get("name"), other.get("name")])
+    variants = [n for n in variants if n and n != p.get("name")]
+    if variants:
+        p["name_variants"] = variants
+    aliases = _union_list(p.get("aliases"), other.get("aliases"), member_keys)
+    p["aliases"] = sorted(a for a in aliases if a and a.lower() != primary_key)
+    p["ignore"]   = bool(p.get("ignore")   or other.get("ignore"))
+    p["archived"] = bool(p.get("archived") or other.get("archived"))
+    p["manual"]   = bool(p.get("manual")   or other.get("manual"))
+    if _prio_rank(other.get("priority")) > _prio_rank(p.get("priority")):
+        p["priority"] = other["priority"]
+    for f in _GROUP_LEVEL_TEXT:
+        pv, ov = (p.get(f) or "").strip(), (other.get(f) or "").strip()
+        if ov and ov != pv:
+            p[f] = f"{pv}\n{ov}".strip()
+    for f in _GROUP_LEVEL_FILL:                       # fill primary's empties from other (don't overwrite)
+        if not p.get(f) and other.get(f):
+            p[f] = other[f]
+    if not (p.get("company") or "").strip() and (other.get("company") or "").strip():
+        p["company"] = other["company"]
+    return p
+
+
+def merge_contacts(data_dir: Path, keep_email: str, merge_email: str, primary_email: str = None) -> dict:
+    """Group two contacts that are the SAME PERSON, NON-DESTRUCTIVELY: BOTH rows stay (each keeps its
+    own email / company / role / thread_count), linked by a shared `group_id`, with one flagged
+    `is_group_primary` — the user-chosen `primary_email` (default keep_email; the clean SMTP used for
+    drafting). GROUP-LEVEL user fields (tags / notes / priority / ignore / archived / meeting_ids /
+    name_variants / aliases) are folded onto the primary via the lossless union, so a reader — which
+    resolves any member email → the primary (crm_store.load_crm_resolved) — sees them.
+
+    NOTHING is deleted → fully reversible (`ungroup_contact`). The non-primary row keeps its own fields
+    intact, so an ungroup restores it cleanly. Previously this destructively unioned into one row and
+    deleted the other — which flattened away "this person has N emails/companies"."""
     from src.modules import crm_store
+    import hashlib
     data_dir = Path(data_dir)
     contacts = crm_store.load_crm(data_dir).get("contacts", {})
 
@@ -556,70 +586,77 @@ def merge_contacts(data_dir: Path, keep_email: str, merge_email: str) -> dict:
     if keep_key not in contacts or merge_key not in contacts:
         return {"ok": False, "error": "Contact not found"}
 
-    keep  = dict(contacts[keep_key])
-    merge = dict(contacts[merge_key])
-    before = {"keep": dict(keep), "merge": dict(merge)}
+    primary_key = (primary_email or keep_email).lower()
+    if primary_key not in (keep_key, merge_key):
+        return {"ok": False, "error": "primary_email must be one of keep_email / merge_email"}
+    other_key = merge_key if primary_key == keep_key else keep_key
 
-    # ── counts / derived ──
-    keep["thread_count"] = (keep.get("thread_count") or 0) + (merge.get("thread_count") or 0)
-    keep["last_contact"] = max(keep.get("last_contact") or "", merge.get("last_contact") or "")
-    if merge.get("added_at"):
-        keep["added_at"] = min(keep.get("added_at") or merge["added_at"], merge["added_at"])
+    before = {"primary": dict(contacts[primary_key]), "other": dict(contacts[other_key])}
+    member_keys = sorted([keep_key, merge_key])
 
-    # ── list-type fields: UNION, never drop ──
-    keep["tags"]        = _union_list(keep.get("tags"), merge.get("tags"))
-    keep["meeting_ids"] = _union_list(keep.get("meeting_ids"), merge.get("meeting_ids"))
+    # group id: reuse an existing group either row already belongs to (n-way merge), else mint one
+    gid = (contacts[primary_key].get("group_id") or contacts[other_key].get("group_id")
+           or "grp_" + hashlib.sha1("|".join(member_keys).encode()).hexdigest()[:12])
 
-    # name: one canonical display name (keep's); preserve every other distinct name as a variant
-    variants = _union_list(keep.get("name_variants"), merge.get("name_variants"),
-                           [keep.get("name"), merge.get("name")])
-    variants = [n for n in variants if n and n != keep.get("name")]
-    if variants:
-        keep["name_variants"] = variants
+    primary = _aggregate_group_fields(contacts[primary_key], contacts[other_key], member_keys, primary_key)
+    other   = dict(contacts[other_key])
 
-    # emails: keep_key stays primary; merge's address + any aliases it carried become aliases
-    aliases = _union_list(keep.get("aliases"), merge.get("aliases"),
-                          [merge.get("email") or merge_key])
-    keep["aliases"] = sorted(a for a in aliases if a and a.lower() != keep_key)
+    today = datetime.now().strftime("%Y-%m-%d")
+    primary.update({"group_id": gid, "is_group_primary": True, "updated_at": today})
+    other.update({"group_id": gid, "is_group_primary": False, "updated_at": today})
 
-    # ── scalar-state flags: combine by rule (never silently drop a flag the user set) ──
-    keep["ignore"]   = bool(keep.get("ignore")   or merge.get("ignore"))
-    keep["archived"] = bool(keep.get("archived") or merge.get("archived"))
-    keep["manual"]   = bool(keep.get("manual")   or merge.get("manual"))
-    if _prio_rank(merge.get("priority")) > _prio_rank(keep.get("priority")):
-        keep["priority"] = merge["priority"]
-
-    # ── free text: concatenate when the two differ (keep both) ──
-    for f in ("notes", "summary", "writing_style"):
-        kv = (keep.get(f) or "").strip()
-        mv = (merge.get(f) or "").strip()
-        if mv and mv != kv:
-            keep[f] = f"{kv}\n{mv}".strip()
-
-    # ── AI/derived single-value fields: non-empty wins (prefer keep) ──
-    for f in ("role", "phone", "linkedin", "status", "draft_link", "source"):
-        if not keep.get(f) and merge.get(f):
-            keep[f] = merge[f]
-
-    # company: non-empty wins; if both set and differ, keep primary + record the other in notes
-    kc = (keep.get("company") or "").strip()
-    mc = (merge.get("company") or "").strip()
-    if not kc and mc:
-        keep["company"] = mc
-    elif kc and mc and kc.lower() != mc.lower():
-        note = f"[merge] also listed under company: {mc}"
-        existing = (keep.get("notes") or "").strip()
-        keep["notes"] = f"{existing}\n{note}".strip()
-
-    keep["updated_at"] = datetime.now().strftime("%Y-%m-%d")
-
-    # Persist through the store: upsert the fully-merged keep, THEN delete the duplicate row.
-    crm_store.replace_from_dict(data_dir, {"contacts": {keep_key: keep}})
-    crm_store.delete_contact(data_dir, merge_key)
+    # UPSERT BOTH rows — no delete_contact. Non-destructive + reversible.
+    crm_store.replace_from_dict(data_dir, {"contacts": {primary_key: primary, other_key: other}})
     _append_merge_log(data_dir, {
-        "op": "merge_contacts", "keep_email": keep_email, "merge_email": merge_email, "before": before,
+        "op": "group_contacts", "group_id": gid, "primary_email": primary_key,
+        "member_emails": member_keys, "before": before,
     })
-    return {"ok": True, "keep_email": keep_email, "removed_email": merge_email}
+    return {"ok": True, "group_id": gid, "primary_email": primary_key, "member_emails": member_keys}
+
+
+def set_group_primary(data_dir: Path, group_id: str, primary_email: str) -> dict:
+    """Switch which email in a group is the canonical/primary. Moves the group-level aggregated fields
+    to the new primary and flips the is_group_primary flags. Reversible."""
+    from src.modules import crm_store
+    data_dir = Path(data_dir)
+    contacts = crm_store.load_crm(data_dir).get("contacts", {})
+    members = {e: c for e, c in contacts.items() if c.get("group_id") == group_id}
+    new_key = primary_email.lower()
+    if new_key not in members:
+        return {"ok": False, "error": "primary_email is not a member of the group"}
+    old_key = next((e for e, c in members.items() if c.get("is_group_primary")), None)
+
+    updates = {}
+    new_primary = dict(members[new_key])
+    if old_key and old_key != new_key:
+        # carry the group-level fields from the old primary onto the new one
+        new_primary = _aggregate_group_fields(new_primary, members[old_key], sorted(members.keys()), new_key)
+        old = dict(members[old_key]); old["is_group_primary"] = False
+        updates[old_key] = old
+    new_primary["is_group_primary"] = True
+    new_primary["aliases"] = sorted(e for e in members if e != new_key)
+    updates[new_key] = new_primary
+    crm_store.replace_from_dict(data_dir, {"contacts": updates})
+    _append_merge_log(data_dir, {"op": "set_group_primary", "group_id": group_id, "primary_email": new_key})
+    return {"ok": True, "group_id": group_id, "primary_email": new_key}
+
+
+def ungroup_contact(data_dir: Path, email: str) -> dict:
+    """Split one member out of its identity group — clears group_id/is_group_primary on that row only.
+    NOTHING is deleted; the row keeps its own fields → it becomes a standalone contact again."""
+    from src.modules import crm_store
+    data_dir = Path(data_dir)
+    e = email.lower()
+    contacts = crm_store.load_crm(data_dir).get("contacts", {})
+    if e not in contacts:
+        return {"ok": False, "error": "Contact not found"}
+    row = dict(contacts[e])
+    gid = row.pop("group_id", None)
+    row.pop("is_group_primary", None)
+    row.pop("aliases", None)
+    crm_store.replace_from_dict(data_dir, {"contacts": {e: row}})
+    _append_merge_log(data_dir, {"op": "ungroup_contact", "email": e, "group_id": gid})
+    return {"ok": True, "email": e, "group_id": gid}
 
 
 def archive_record(data_dir: Path, kind: str, ident: str) -> dict:

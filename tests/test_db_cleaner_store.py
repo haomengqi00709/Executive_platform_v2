@@ -78,50 +78,130 @@ def test_archive_project_persists_in_store(tmp_path):
 
 # ── contact merge / archive (CRM had the same hole) ───────────────────────────
 
-def test_merge_contacts_persists_in_store_no_resurrection(tmp_path):
+def test_group_contacts_keeps_both_rows(tmp_path):
+    """Merge is now NON-destructive GROUPING: both rows stay, linked by group_id, one flagged primary,
+    each row keeps its OWN company. (Was: the merged-away row was deleted — intentional behavior change.)"""
     cs.replace_from_dict(tmp_path, {"contacts": {
-        "keep@x.com": _contact("keep@x.com", thread_count=2, tags=["vip"], company=""),
-        "dup@x.com":  _contact("dup@x.com", thread_count=3, company="Acme")}})
+        "keep@x.com": _contact("keep@x.com", name="Jason Hao", thread_count=2, tags=["vip"], company="Acme"),
+        "dup@x.com":  _contact("dup@x.com", name="Hao Jason", thread_count=3, tags=["client"], company="Globex")}})
 
     r = db_cleaner.merge_contacts(tmp_path, "keep@x.com", "dup@x.com")
-    assert r["ok"] and r["removed_email"] == "dup@x.com"
+    assert r["ok"] and r["primary_email"] == "keep@x.com"
 
     out = cs.load_crm(tmp_path)["contacts"]
-    assert "dup@x.com" not in out, "duplicate must be gone from the STORE"
-    keep = out["keep@x.com"]
-    assert keep["thread_count"] == 5
-    assert keep["company"] == "Acme"                                # filled from merge (keep was empty)
-    assert keep["tags"] == ["vip"]                                  # user column preserved
-    assert "dup@x.com" in keep["aliases"]                           # alias tracked
+    assert "keep@x.com" in out and "dup@x.com" in out, "both rows kept (non-destructive)"
+    assert out["keep@x.com"]["group_id"] == out["dup@x.com"]["group_id"]
+    assert out["keep@x.com"]["is_group_primary"] is True and out["dup@x.com"]["is_group_primary"] is False
+    assert sorted(out["keep@x.com"]["tags"]) == ["client", "vip"]   # group-level union on primary
+    assert "dup@x.com" in out["keep@x.com"]["aliases"]
+    assert out["keep@x.com"]["company"] == "Acme"                   # each row keeps its OWN company
+    assert out["dup@x.com"]["company"] == "Globex"
 
     cs.write_projection(tmp_path)
     proj = json.loads((tmp_path / "crm.json").read_text())["contacts"]
-    assert "dup@x.com" not in proj and "keep@x.com" in proj
+    assert "dup@x.com" in proj and "keep@x.com" in proj            # projection stays one-row-per-email
 
 
-def test_merge_contacts_is_lossless_union(tmp_path):
-    """Merge must STACK both sides' data, never overwrite: the merged-away contact's tags / notes /
-    priority / ignore survive, its email + name become alias/variant — nothing the user set is lost."""
+def test_group_contacts_user_fields_aggregate_on_primary(tmp_path):
+    """Group-level user fields (tags / priority / ignore / notes) fold onto the PRIMARY losslessly."""
     cs.replace_from_dict(tmp_path, {"contacts": {
-        "keep@x.com": _contact("keep@x.com", name="Jason Hao", thread_count=2,
-                               tags=["vip"], priority="low", notes="from keep", company="Acme"),
-        "dup@x.com":  _contact("dup@x.com", name="Hao Jason", thread_count=3,
-                               tags=["client"], priority="high", notes="from dup",
-                               ignore=True, company="Globex")}})
+        "keep@x.com": _contact("keep@x.com", tags=["vip"], priority="low", notes="from keep"),
+        "dup@x.com":  _contact("dup@x.com", tags=["client"], priority="high", notes="from dup", ignore=True)}})
+    db_cleaner.merge_contacts(tmp_path, "keep@x.com", "dup@x.com")
+    p = cs.load_crm(tmp_path)["contacts"]["keep@x.com"]
+    assert sorted(p["tags"]) == ["client", "vip"]
+    assert p["priority"] == "high" and p["ignore"] is True
+    assert "from keep" in p["notes"] and "from dup" in p["notes"]
 
-    r = db_cleaner.merge_contacts(tmp_path, "keep@x.com", "dup@x.com")
-    assert r["ok"]
 
-    keep = cs.load_crm(tmp_path)["contacts"]["keep@x.com"]
-    assert sorted(keep["tags"]) == ["client", "vip"]                      # tags UNIONED, dup's kept
-    assert keep["priority"] == "high"                                     # stronger priority wins
-    assert keep["ignore"] is True                                         # dup's ignore flag survives
-    assert "from keep" in keep["notes"] and "from dup" in keep["notes"]   # both notes kept
-    assert keep["thread_count"] == 5                                      # counts summed
-    assert "dup@x.com" in keep["aliases"]                                 # merged email kept as alias
-    assert "Hao Jason" in keep.get("name_variants", [])                  # merged name kept as variant
-    assert keep["company"] == "Acme" and "Globex" in keep["notes"]       # primary kept, other recorded
-    assert "dup@x.com" not in cs.load_crm(tmp_path)["contacts"]          # duplicate row gone
+def test_merge_with_chosen_primary(tmp_path):
+    """User picks which email is primary; that row is flagged + carries the group fields."""
+    cs.replace_from_dict(tmp_path, {"contacts": {
+        "junk@x.com": _contact("junk@x.com", tags=["a"]), "clean@x.com": _contact("clean@x.com", tags=["b"])}})
+    db_cleaner.merge_contacts(tmp_path, "junk@x.com", "clean@x.com", primary_email="clean@x.com")
+    out = cs.load_crm(tmp_path)["contacts"]
+    assert out["clean@x.com"]["is_group_primary"] is True and out["junk@x.com"]["is_group_primary"] is False
+    assert sorted(out["clean@x.com"]["tags"]) == ["a", "b"]
+
+
+def test_load_crm_resolved_maps_member_to_primary(tmp_path):
+    cs.replace_from_dict(tmp_path, {"contacts": {
+        "p@x.com": _contact("p@x.com", name="Primary"), "m@x.com": _contact("m@x.com", name="Member")}})
+    db_cleaner.merge_contacts(tmp_path, "p@x.com", "m@x.com")
+    resolved = cs.load_crm_resolved(tmp_path)["contacts"]
+    assert resolved["m@x.com"]["email"] == "p@x.com"               # member email -> primary record
+    assert resolved["p@x.com"]["email"] == "p@x.com"
+
+
+def test_collapse_groups_one_entry_per_group(tmp_path):
+    cs.replace_from_dict(tmp_path, {"contacts": {
+        "p@x.com": _contact("p@x.com", company="Acme", thread_count=2),
+        "m@x.com": _contact("m@x.com", company="Globex", thread_count=3),
+        "solo@x.com": _contact("solo@x.com")}})
+    db_cleaner.merge_contacts(tmp_path, "p@x.com", "m@x.com")
+    collapsed = cs.collapse_groups(tmp_path)["contacts"]
+    assert "m@x.com" not in collapsed and "p@x.com" in collapsed and "solo@x.com" in collapsed
+    card = collapsed["p@x.com"]
+    assert sorted(card["member_emails"]) == ["m@x.com", "p@x.com"]
+    assert set(card["member_companies"]) == {"Acme", "Globex"}
+    assert card["thread_count"] == 5                               # summed for display
+
+
+def test_get_ignored_emails_expands_group(tmp_path):
+    cs.replace_from_dict(tmp_path, {"contacts": {"p@x.com": _contact("p@x.com"), "m@x.com": _contact("m@x.com")}})
+    db_cleaner.merge_contacts(tmp_path, "p@x.com", "m@x.com")
+    cs.update_contact_field(tmp_path, "p@x.com", "ignore", True)   # ignore one identity
+    assert cs.get_ignored_emails(tmp_path) == {"p@x.com", "m@x.com"}  # -> ignores the whole person
+
+
+def test_resolve_primary_email_returns_clean_smtp(tmp_path):
+    cs.replace_from_dict(tmp_path, {"contacts": {
+        "jason@trustedai.ca": _contact("jason@trustedai.ca"),
+        "outlook_deadbeef@outlook.com": _contact("outlook_deadbeef@outlook.com")}})
+    db_cleaner.merge_contacts(tmp_path, "jason@trustedai.ca", "outlook_deadbeef@outlook.com",
+                              primary_email="jason@trustedai.ca")
+    assert cs.resolve_primary_email(tmp_path, "outlook_deadbeef@outlook.com") == "jason@trustedai.ca"
+    assert cs.resolve_primary_email(tmp_path, "stranger@x.com") == "stranger@x.com"
+
+
+def test_group_survives_rebuild(tmp_path):
+    """The daily rebuild (upsert_built_contacts with a fresh AI dict that has NO group fields) must
+    PRESERVE group_id / is_group_primary — they're user columns, not rebuild-authority."""
+    cs.replace_from_dict(tmp_path, {"contacts": {"p@x.com": _contact("p@x.com"), "m@x.com": _contact("m@x.com")}})
+    db_cleaner.merge_contacts(tmp_path, "p@x.com", "m@x.com")
+    gid = cs.load_crm(tmp_path)["contacts"]["p@x.com"]["group_id"]
+    cs.upsert_built_contacts(tmp_path, {                            # simulate a refresh, no group fields
+        "p@x.com": {"email": "p@x.com", "name": "P", "company": "NewCo", "thread_count": 9},
+        "m@x.com": {"email": "m@x.com", "name": "M", "company": "NewCo2", "thread_count": 4}})
+    out = cs.load_crm(tmp_path)["contacts"]
+    assert out["p@x.com"].get("group_id") == gid and out["p@x.com"].get("is_group_primary") is True
+    assert out["m@x.com"].get("group_id") == gid
+
+
+def test_ungroup_is_reversible(tmp_path):
+    cs.replace_from_dict(tmp_path, {"contacts": {
+        "p@x.com": _contact("p@x.com", company="Acme"), "m@x.com": _contact("m@x.com", company="Globex")}})
+    db_cleaner.merge_contacts(tmp_path, "p@x.com", "m@x.com")
+    db_cleaner.ungroup_contact(tmp_path, "m@x.com")
+    out = cs.load_crm(tmp_path)["contacts"]
+    assert "m@x.com" in out and "p@x.com" in out                   # nothing deleted
+    assert out["m@x.com"].get("group_id") is None                  # split out
+    assert out["m@x.com"]["company"] == "Globex"                   # kept its own data
+
+
+def test_find_contacts_by_name_returns_group_primary(tmp_path):
+    """The draft-recipient fix end-to-end: a person grouped with a junk + a clean address resolves to
+    the clean PRIMARY (deduped by group) — 'draft to <name>' never returns the proxy."""
+    from src.modules import crm
+    cs.replace_from_dict(tmp_path, {"contacts": {
+        "jason@trustedai.ca": _contact("jason@trustedai.ca", name="Jason Hao"),
+        "outlook_dead@outlook.com": _contact("outlook_dead@outlook.com", name="Jason Hao")}})
+    db_cleaner.merge_contacts(tmp_path, "jason@trustedai.ca", "outlook_dead@outlook.com",
+                              primary_email="jason@trustedai.ca")
+    cs.write_projection(tmp_path)                          # find_contacts_by_name reads crm.json
+    hits = crm.find_contacts_by_name(tmp_path, "Jason Hao")
+    assert len(hits) == 1, hits                            # deduped by group
+    assert hits[0]["email"] == "jason@trustedai.ca"        # the clean primary, not the proxy
 
 
 def test_archive_contact_persists_in_store(tmp_path):

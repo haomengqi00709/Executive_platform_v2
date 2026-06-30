@@ -271,6 +271,32 @@ def _meta(con, key, default=None):
         return default
 
 
+# ── grouping (non-destructive identity merge) ────────────────────────────────
+# A real person with several emails/companies is kept as SEPARATE rows linked by a shared
+# `group_id`; one member row is flagged `is_group_primary`. The canonical store stays one-row-per
+# -email; these helpers project the group semantics so readers stay simple. See db_cleaner.merge_contacts.
+
+def _rows_and_groups(con):
+    """Return ({email: contact}, {group_id: sorted[member_emails]}). Single read for all group helpers."""
+    rows = {r["email"]: json.loads(r["data"]) for r in con.execute("SELECT email, data FROM contacts")}
+    groups: dict = {}
+    for email, c in rows.items():
+        gid = c.get("group_id")
+        if gid:
+            groups.setdefault(gid, []).append(email)
+    for gid in groups:
+        groups[gid] = sorted(groups[gid])
+    return rows, groups
+
+
+def _primary_email(rows, members):
+    """The member email flagged is_group_primary; else the first (sorted) — deterministic."""
+    for e in members:
+        if rows.get(e, {}).get("is_group_primary"):
+            return e
+    return members[0] if members else None
+
+
 def load_crm(data_dir) -> dict:
     """Return the crm.json-shaped dict from the store (drop-in for crm.load_crm)."""
     con = _conn(data_dir)
@@ -282,16 +308,85 @@ def load_crm(data_dir) -> dict:
         con.close()
 
 
-def get_ignored_emails(data_dir) -> set:
-    """Emails of contacts with ignore=True or archived=True — fed to the screener (replaces the
-    inline scan in email_monitor.py)."""
+def load_crm_resolved(data_dir) -> dict:
+    """Like load_crm, but EVERY member email of a group maps to the group's PRIMARY record. So a
+    reader's `crm_contacts.get(email)` returns the canonical contact for ANY of a person's addresses
+    — group-aware with no call-site change. Non-grouped contacts are unchanged."""
     con = _conn(data_dir)
     try:
+        rows, groups = _rows_and_groups(con)
+        out = dict(rows)
+        for members in groups.values():
+            pe = _primary_email(rows, members)
+            if not pe:
+                continue
+            primary = rows[pe]
+            for e in members:
+                out[e] = primary
+        return {"last_scan": _meta(con, "last_scan"), "months_scanned": _meta(con, "months_scanned", 0),
+                "contacts": out}
+    finally:
+        con.close()
+
+
+def collapse_groups(data_dir) -> dict:
+    """One entry per group (the primary), augmented with member aggregates for DISPLAY/listing:
+    member_emails[], member_companies[], members[], summed thread_count, max last_contact. Non-grouped
+    contacts pass through. Returns the crm.json shape keyed by the primary email."""
+    con = _conn(data_dir)
+    try:
+        rows, groups = _rows_and_groups(con)
+        grouped = {e for ms in groups.values() for e in ms}
+        out = {email: c for email, c in rows.items() if email not in grouped}
+        for members in groups.values():
+            pe = _primary_email(rows, members)
+            if not pe:
+                continue
+            card = dict(rows[pe])
+            card["member_emails"] = members
+            card["members"] = [{"email": e, "company": rows[e].get("company", ""),
+                                "role": rows[e].get("role", "")} for e in members]
+            card["member_companies"] = sorted({rows[e].get("company", "") for e in members if rows[e].get("company")})
+            card["thread_count"] = sum(int(rows[e].get("thread_count") or 0) for e in members)
+            card["last_contact"] = max((rows[e].get("last_contact") or "") for e in members) or card.get("last_contact")
+            out[pe] = card
+        return {"last_scan": _meta(con, "last_scan"), "months_scanned": _meta(con, "months_scanned", 0),
+                "contacts": out}
+    finally:
+        con.close()
+
+
+def resolve_primary_email(data_dir, email: str) -> str:
+    """Any member email → the group's PRIMARY email (the clean SMTP picked for drafting). If the email
+    isn't grouped, returns it unchanged. This is the recipient-resolution chokepoint."""
+    e = (email or "").lower().strip()
+    if not e:
+        return email
+    con = _conn(data_dir)
+    try:
+        rows, groups = _rows_and_groups(con)
+        gid = rows.get(e, {}).get("group_id")
+        if gid:
+            return _primary_email(rows, groups.get(gid, [e])) or email
+        return email
+    finally:
+        con.close()
+
+
+def get_ignored_emails(data_dir) -> set:
+    """Emails of contacts with ignore=True or archived=True — fed to the screener. GROUP-AWARE: if any
+    identity of a person is ignored, ALL their addresses are ignored (else a second email slips past
+    the screener)."""
+    con = _conn(data_dir)
+    try:
+        rows, groups = _rows_and_groups(con)
         out = set()
-        for r in con.execute("SELECT email, data FROM contacts"):
-            c = json.loads(r["data"])
+        for email, c in rows.items():
             if c.get("ignore") or c.get("archived"):
-                out.add(r["email"])
+                out.add(email)
+                gid = c.get("group_id")
+                if gid:
+                    out.update(groups.get(gid, []))
         return out
     finally:
         con.close()

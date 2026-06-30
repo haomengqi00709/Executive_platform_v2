@@ -296,6 +296,28 @@ def update_contact(data_dir: Path, email: str, field: str, value) -> dict:
     return crm_store.update_contact_field(data_dir, email, field, value)
 
 
+def load_crm_resolved(data_dir: Path) -> dict:
+    """Like load_crm, but every member email of an identity group maps to the group's PRIMARY contact
+    record — so a reader's `crm_contacts.get(email)` is group-aware for ANY of a person's addresses,
+    with no call-site change. Routed through the store (which holds group_id)."""
+    from src.modules import crm_store
+    return crm_store.load_crm_resolved(data_dir)
+
+
+def collapse_groups(data_dir: Path) -> dict:
+    """One entry per identity group (the primary) with member emails/companies aggregated — for
+    listing/display surfaces (CRM table, /api/contacts)."""
+    from src.modules import crm_store
+    return crm_store.collapse_groups(data_dir)
+
+
+def resolve_primary_email(data_dir: Path, email: str) -> str:
+    """Any member email → the group's PRIMARY email (the clean SMTP picked for drafting); unchanged if
+    the email isn't grouped. The recipient-resolution chokepoint for send paths."""
+    from src.modules import crm_store
+    return crm_store.resolve_primary_email(data_dir, email)
+
+
 def add_contacts_bulk(data_dir: Path, raw_contacts: list, source: str,
                       tags: list | None = None) -> dict:
     """Add a batch of contacts to CRM.
@@ -446,7 +468,41 @@ def find_contacts_by_name(data_dir: Path, query: str, limit: int = 10) -> list:
             "tags":    c.get("tags") or [],
         }))
     scored.sort(key=lambda x: (x[0], x[1]))
-    return [c for _, _, c in scored[:limit]]
+    # Group-aware: a hit on a non-primary email/company resolves to the group's PRIMARY (clean SMTP),
+    # deduped by group — so "draft to <name>" never returns a junk proxy/alias address. Uses the
+    # already-loaded dict (crm.json carries group_id), no extra DB calls.
+    contacts = crm.get("contacts") or {}
+    _groups: dict = {}
+    for _em, _c in contacts.items():
+        _g = _c.get("group_id")
+        if _g:
+            _groups.setdefault(_g, []).append(_em)
+
+    def _primary_of(em):
+        c = contacts.get(em) or {}
+        gid = c.get("group_id")
+        if not gid:
+            return em
+        members = sorted(_groups.get(gid, [em]))
+        for m in members:
+            if (contacts.get(m) or {}).get("is_group_primary"):
+                return m
+        return members[0]
+
+    seen, out = set(), []
+    for _, _, c in scored:
+        pe = _primary_of(c["email"])
+        if pe in seen:
+            continue
+        seen.add(pe)
+        if pe != c["email"]:                       # hit a non-primary identity → return the primary's card
+            p = contacts.get(pe) or {}
+            c = {"email": pe, "name": p.get("name") or c["name"], "company": p.get("company") or "",
+                 "role": p.get("role") or "", "tags": p.get("tags") or []}
+        out.append(c)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def list_groups(data_dir: Path) -> list:
