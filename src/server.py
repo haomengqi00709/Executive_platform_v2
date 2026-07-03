@@ -4640,10 +4640,12 @@ def _run_cleanup_scan_for_user(uid: str, auto_apply: bool = False, send_digest: 
         if auto_apply:
             pending = load_pending(_udir(uid))
             auto_ids: list[str] = []
+            # Projects are NEVER auto-merged anymore (destructive + caused the conflation) — even
+            # if a caller passes auto_apply=True, only contact duplicates can auto-apply.
             if settings.get("auto_merge_high_confidence") in (True, "true"):
                 auto_ids += [c["id"] for c in pending
                              if c.get("confidence") == "high"
-                             and c.get("type") in ("project_duplicate", "contact_duplicate")]
+                             and c.get("type") == "contact_duplicate"]
             if settings.get("auto_archive_stale") in (True, "true"):
                 auto_ids += [c["id"] for c in pending
                              if c.get("type") in ("stale_project", "stale_contact")]
@@ -4698,7 +4700,10 @@ def _weekly_cleanup_scan_all_users() -> None:
     for f in sessions_dir.glob("*.json"):
         threading.Thread(
             target=_run_cleanup_scan_for_user,
-            kwargs={"uid": f.stem, "auto_apply": True, "send_digest": True},
+            # auto_apply=False: the weekly scan DETECTS + digests only. Merges/splits are
+            # destructive and now go exclusively through the CleanupTab review queue — no silent
+            # auto-merge (it was the root cause of same-company projects being wrongly conflated).
+            kwargs={"uid": f.stem, "auto_apply": False, "send_digest": True},
             daemon=True,
         ).start()
 

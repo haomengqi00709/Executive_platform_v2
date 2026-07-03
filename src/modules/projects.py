@@ -164,7 +164,7 @@ Below are email conversation clusters (grouped by thread). For each cluster that
 - List all conversation_ids that belong to this project
 
 IMPORTANT:
-- If multiple clusters belong to the same project, merge them (list all conversation_ids)
+- A single company may have MULTIPLE distinct projects — separate them by deliverable/topic. Only merge clusters that are the SAME deliverable; do NOT merge different initiatives just because they share people or a company name
 - Skip clusters that are purely transactional (receipts, calendar invites), newsletters, one-off admin emails, or internal notifications with no substantive back-and-forth
 - Return ONLY a JSON array of project objects with these exact fields:
   id, name, category, status, momentum, summary, last_activity, deadline, participants, next_action, key_topics, thread_count, conversation_ids
@@ -259,6 +259,68 @@ def _project_participants(proj: dict, owner_addrs: set[str]) -> set[str]:
     }
 
 
+# ── Topic-aware fold control ────────────────────────────────────────────────
+# A company can run MANY distinct projects with the same people — so folding by shared
+# participants alone conflates them (张冠李戴). Fold only when the TOPIC also matches.
+_FOLD_TOPIC_SIM = 0.30       # key_topics/name Jaccard ≥ this → same deliverable → fold
+_FOLD_TOPIC_SIM_LOW = 0.10   # ≤ this → clearly different deliverable → keep separate, no AI call
+
+_TOPIC_STOPWORDS = {
+    "project", "projects", "the", "and", "for", "of", "with", "strategy", "plan", "review",
+    "update", "meeting", "call", "email", "discussion", "work", "initial", "follow", "followup",
+    "intro", "introduction", "scheduling", "reschedule", "partnership", "collaboration",
+    "q1", "q2", "q3", "q4",
+}
+
+
+def _topic_tokens(proj: dict) -> set:
+    """Distinctive tokens from key_topics + name (generic/scheduling noise dropped)."""
+    text = " ".join((proj.get("key_topics") or []) + [proj.get("name") or ""])
+    toks = re.sub(r"[^\w\s]", " ", text.lower()).split()
+    return {t for t in toks if len(t) >= 3 and t not in _TOPIC_STOPWORDS}
+
+
+def _topic_similarity(a: dict, b: dict) -> float:
+    """Jaccard over distinctive topic/name tokens; 0.0 if either side has none."""
+    ta, tb = _topic_tokens(a), _topic_tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _are_marked_distinct(a: dict, b: dict) -> bool:
+    """True if either project lists the other in `distinct_from` (a split marker) — never re-fold
+    or re-merge those, else a split resurrects on the next refresh."""
+    aid, bid = a.get("id"), b.get("id")
+    return bool((bid and bid in (a.get("distinct_from") or [])) or
+                (aid and aid in (b.get("distinct_from") or [])))
+
+
+def _fold_into(ex: dict, np: dict) -> None:
+    """Absorb a new cluster's threads into an existing project (union conversation_ids)."""
+    ex["conversation_ids"] = sorted(set(ex.get("conversation_ids", [])) | set(np.get("conversation_ids", [])))
+    ex["thread_count"] = len(ex["conversation_ids"])
+
+
+def _ai_same_project_tiebreak(ai, np: dict, ex: dict) -> bool:
+    """One cheap yes/no for the borderline band. Bias to False (keep separate) on any failure —
+    folding is the harmful direction."""
+    prompt = (
+        "Two email clusters share the same people. Are they the SAME project/deliverable, or TWO "
+        "DIFFERENT projects with the same people? Same company is NOT enough — only 'same' if it is "
+        "literally the same deliverable.\n"
+        f'A: name="{ex.get("name", "")}", topics={(ex.get("key_topics") or [])[:6]}\n'
+        f'B: name="{np.get("name", "")}", topics={(np.get("key_topics") or [])[:6]}\n'
+        'Reply JSON: {"same": true or false}'
+    )
+    try:
+        raw = ai.extract_json(prompt)
+        out = json.loads(raw) if isinstance(raw, str) else raw
+        return out.get("same") is True
+    except Exception:
+        return False
+
+
 def _msg_date(m: dict) -> str:
     return (m.get("receivedDateTime") or m.get("sentDateTime") or "")[:10]
 
@@ -293,8 +355,9 @@ PROJECT:
   current summary: {proj.get('summary', '')}
 
 Below are recent email THREADS involving this project's people. IMPORTANT: these
-people also discuss OTHER topics/projects — only some threads are about THIS project.
-Exclude anything that is not about this specific project.
+people also run OTHER, SEPARATE projects with you (the same company can have several distinct
+projects). Include a thread ONLY if it is about THIS project's specific deliverable/topic —
+exclude any thread about a DIFFERENT deliverable, even if it's the same company or the same people.
 
 THREADS:
 {chr(10).join(blocks)}
@@ -545,6 +608,7 @@ def refresh_projects(
             new_raw.extend(_extract_projects_from_batch(
                 filtered[i:i + _BATCH_SIZE], ai, display_name, today_str))
         truly_new: list[dict] = []
+        _tiebreak_budget = [8]   # cap AI tiebreak calls per refresh (cost bound)
         for np in new_raw:
             np_parts = {p.lower() for p in (np.get("participants") or [])
                         if p and p.lower() not in owner_addrs and not _is_noise(p.lower())}
@@ -553,13 +617,21 @@ def refresh_projects(
                 ov = len(np_parts & _project_participants(proj, owner_addrs))
                 if ov > best_ov and ov >= 2:
                     best_pid, best_ov = pid, ov
-            if best_pid:  # same people as an existing project → fold in, no duplicate
+            folded = False
+            if best_pid:  # shares ≥2 external participants — but same people ≠ same project
                 ex = projects[best_pid]
-                ex["conversation_ids"] = sorted(
-                    set(ex.get("conversation_ids", [])) | set(np.get("conversation_ids", [])))
-                ex["thread_count"] = len(ex["conversation_ids"])
-                log(f"Folded new cluster into existing '{ex.get('name', best_pid)}' (shared {best_ov})")
-            else:
+                if not _are_marked_distinct(np, ex):
+                    sim = _topic_similarity(np, ex)
+                    if sim >= _FOLD_TOPIC_SIM:                       # same deliverable → fold
+                        _fold_into(ex, np); folded = True
+                        log(f"Folded into '{ex.get('name', best_pid)}' (shared {best_ov}, topic {sim:.2f})")
+                    elif sim > _FOLD_TOPIC_SIM_LOW and _tiebreak_budget[0] > 0:  # borderline → 1 AI check
+                        _tiebreak_budget[0] -= 1
+                        if _ai_same_project_tiebreak(ai, np, ex):
+                            _fold_into(ex, np); folded = True
+                            log(f"Folded into '{ex.get('name', best_pid)}' (AI tiebreak, topic {sim:.2f})")
+                    # else: same people but distinct topic → keep as a NEW project (张冠李戴 fix)
+            if not folded:
                 truly_new.append(np)
         if truly_new:
             log(f"Found {len(truly_new)} genuinely new project(s)")

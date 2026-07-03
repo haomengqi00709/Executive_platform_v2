@@ -111,10 +111,14 @@ def _leading_entity(name: str) -> str:
     return toks[0] if toks else ""
 
 
-def _project_pair_features(a: dict, b: dict) -> dict:
-    """Heuristic features to feed the AI for high/medium/low confidence."""
-    parts_a = set(p.lower() for p in (a.get("participants") or []))
-    parts_b = set(p.lower() for p in (b.get("participants") or []))
+def _project_pair_features(a: dict, b: dict, owner_addrs: set = None) -> dict:
+    """Heuristic features to feed the AI for high/medium/low confidence. Owner/internal addresses
+    are EXCLUDED — the owner (and their own org) is a participant in every project, so counting
+    them as 'shared participants' would make every same-company pair look related and defeat the
+    corroboration gate."""
+    owner_addrs = owner_addrs or set()
+    parts_a = set(p.lower() for p in (a.get("participants") or []) if p and p.lower() not in owner_addrs)
+    parts_b = set(p.lower() for p in (b.get("participants") or []) if p and p.lower() not in owner_addrs)
     shared_parts = parts_a & parts_b
 
     topics_a = set((t or "").lower() for t in (a.get("key_topics") or []))
@@ -153,26 +157,35 @@ def find_duplicate_projects(data_dir: Path, ai: AIClient, progress=None,
     if len(projects) < 2:
         return []
 
+    # Owner's own addresses — excluded from participant overlap (owner is in every project, so
+    # counting them would make every same-company pair look corroborated).
+    try:
+        from src.modules.projects import _owner_addresses
+        owner_addrs = _owner_addresses(data_dir, _read_json(data_dir / "settings.json", {}))
+    except Exception:
+        owner_addrs = set()
+
     # Stage 1: build candidate pairs from heuristics
     pairs: list[tuple[dict, dict, dict]] = []
     seen_pair_keys: set = set()
     for i, a in enumerate(projects):
         for b in projects[i + 1:]:
-            features = _project_pair_features(a, b)
+            features = _project_pair_features(a, b, owner_addrs)
             sig_a = _project_signature(a)
             sig_b = _project_signature(b)
             name_overlap = bool(sig_a and sig_b and (sig_a in sig_b or sig_b in sig_a))
             ent_a = _leading_entity(a.get("name", ""))
             same_entity = bool(ent_a and ent_a == _leading_entity(b.get("name", "")))
 
-            # Eligibility: ≥2 shared participants OR fuzzy name overlap OR same leading
-            # entity (company name) OR ≥2 shared topics. The same-entity rule catches
-            # "Nexus Capital — AI Strategy" vs "Nexus Capital AI Opportunity" even when
-            # neither name is a substring of the other and participants are owner-only.
+            # Eligibility: a shared COMPANY NAME alone is NOT enough — one company can have
+            # multiple distinct projects, and "same entity + zero shared people + zero shared
+            # topics" is exactly the 张冠李戴 case (two different deliverables). A name/entity
+            # match must be CORROBORATED by ≥1 shared participant or topic before it's a candidate.
+            corroborated = features["participant_overlap"] >= 1 or features["topic_overlap"] >= 1
             if (features["participant_overlap"] >= 2
-                or name_overlap
-                or same_entity
-                or features["topic_overlap"] >= 2):
+                or features["topic_overlap"] >= 2
+                or (name_overlap and corroborated)
+                or (same_entity and corroborated)):
                 key = tuple(sorted([a["id"], b["id"]]))
                 if key in seen_pair_keys:
                     continue
@@ -192,6 +205,10 @@ def find_duplicate_projects(data_dir: Path, ai: AIClient, progress=None,
             confidence = verdict.get("confidence", "low")
             if confidence not in ("high", "medium", "low"):
                 confidence = "low"
+            # Hard safety net: a same-company-only pair (0 shared people AND 0 shared topics) must
+            # never reach the auto-apply tier even if the AI over-confidently says "high".
+            if confidence == "high" and features["participant_overlap"] == 0 and features["topic_overlap"] == 0:
+                confidence = "medium"
             candidates.append({
                 "id":         _cand_id("project", a["id"], b["id"]),
                 "type":       "project_duplicate",
@@ -261,13 +278,15 @@ PROJECT B:
 Shared participants: {features['participant_overlap']} ({', '.join(features['shared_participants'][:5])})
 
 Rules:
-- They ARE the same project (duplicate) if the emails show the SAME client / initiative —
-  EVEN IF one record covers the kickoff/early phase and the other the wrap-up/later phase, or
-  the names differ (e.g. "Audit" vs "Audit Remediation", "Optimization" vs "Supply Chain
-  Optimization"). Sequential phases or sub-topics of one engagement = duplicate.
-- They are DISTINCT only if the emails show genuinely different initiatives (different
-  objective/deliverable for the same client is OK to keep separate, e.g. a strategy engagement
-  vs a separate financial-model review).
+- They ARE the same project (duplicate) ONLY if the emails show the SAME deliverable extracted
+  twice from different threads — the same engagement re-clustered (e.g. "Audit" vs "Audit
+  Remediation" that are literally the same work). Merging is DESTRUCTIVE and hard to reverse.
+- They are DISTINCT projects — KEEP SEPARATE — if they are different deliverables, workstreams,
+  or topics, EVEN FOR THE SAME CLIENT / COMPANY. A company routinely runs several separate
+  projects with the same people (e.g. a tender proposal vs a P&ID conversion for the same client;
+  a strategy engagement vs a financial-model review; a POC vs a signed-proposal). Same company is
+  NOT the same project.
+- When uncertain, answer is_duplicate:false.
 
 Return JSON: {{"is_duplicate": true/false, "confidence": "high"|"medium"|"low", "reasoning": "one sentence citing the emails"}}"""
     try:
