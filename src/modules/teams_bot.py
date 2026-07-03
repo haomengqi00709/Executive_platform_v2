@@ -204,12 +204,49 @@ def _extract_receipt_bytes(msg: dict, chat_id: str, graph, owner_graph=None) -> 
     return None, "", ""
 
 
+def _store_incoming_file(owner_graph, filename, file_bytes, mime, doc_type="file", summary="") -> dict | None:
+    """Upload an incoming Teams file to OneDrive (receipts → Receipts/, everything else → Inbox/) so the
+    conversational agent can act on it later ('forward this to X'). Returns a file-handle dict."""
+    folder = "Receipts" if doc_type == "receipt" else "Inbox"
+    onedrive_path = f"CEO Platform/{folder}/{filename}"
+    if owner_graph:
+        try:
+            owner_graph.upload_to_onedrive(onedrive_path, file_bytes, mime or "application/octet-stream")
+        except Exception as e:
+            print(f"[TeamsFile] OneDrive upload failed: {e}")
+    return {"filename": filename, "mime": mime, "doc_type": doc_type,
+            "summary": summary, "onedrive_path": onedrive_path}
+
+
+def _expense_summary(item: dict) -> str:
+    dt = item.get("document_type")
+    if dt == "invoice":
+        return (f"invoice from {item.get('vendor','?')} for {item.get('amount','?')} "
+                f"{item.get('currency','')} due {item.get('due_date') or '?'}")
+    if dt == "contract":
+        return f"contract with {item.get('counterparty','?')} — {item.get('subject','')}"
+    return f"receipt from {item.get('vendor','?')} for {item.get('amount','?')} {item.get('currency','')}"
+
+
+def _expense_capture_reply(item: dict) -> str:
+    dt = item.get("document_type")
+    if dt == "invoice":
+        return (f"🧾 Invoice saved — {item.get('vendor','?')} | {item.get('amount','?')} "
+                f"{item.get('currency','CAD')} | due {item.get('due_date') or '?'}. It's in your dashboard under Invoices.")
+    if dt == "contract":
+        return (f"📄 Contract saved — {item.get('counterparty','?')} · {item.get('subject','')}. "
+                f"It's in your dashboard under Contracts.")
+    return (f"✅ Receipt captured — {item.get('vendor','?')} | {item.get('amount','?')} "
+            f"{item.get('currency','CAD')} [{item.get('category','Other')}]. Added to your expense report.")
+
+
 def _handle_teams_receipt(msg: dict, chat_id: str, graph, ai,
-                           owner_graph=None, data_dir=None, settings=None) -> tuple:
+                           owner_graph=None, data_dir=None, settings=None, bot_state=None) -> tuple:
     """
     Route a Teams attachment to the right pipeline.
-    AI classifies the document — receipt/invoice/contract → expense flow;
-    business_card → CRM ingest + auto-draft outreach.
+    AI classifies the document — receipt/invoice/contract → expenses store (all three persist now);
+    business_card → CRM ingest + auto-draft outreach. The file is also stored to OneDrive and a handle
+    is put on bot_state["pending_file"] so the agent can act on it ("forward this to X").
     Returns (reply_str | None, pending_expense | None).
     """
     # Check for attachment bytes first — no heavy imports until we know there's a receipt
@@ -272,30 +309,24 @@ def _handle_teams_receipt(msg: dict, chat_id: str, graph, ai,
         meta  = hashes[h]
         _today = datetime.now().strftime("%Y-%m-%d")
         if isinstance(meta, dict):
-            new_row = {
-                "Date":           meta.get("date", ""),
-                "Vendor":         meta.get("vendor", ""),
-                "Amount":         meta.get("amount", 0),
-                "Currency":       meta.get("currency", "CAD"),
-                "GST_HST":        "",
-                "Net_Amount":     "",
-                "Category":       meta.get("category", "Other"),
-                "Attachment":     meta.get("filename", filename),
-                "Email_Subject":  "[Teams Chat]",
-                "From":           "teams",
-                "Msg_ID":         msg_id,
-                "Att_ID":         "",
-                "Processed_Date": _today,
+            item = {
+                "document_type": "receipt",
+                "vendor":        meta.get("vendor", ""),
+                "counterparty":  "",
+                "date":          meta.get("date", ""),
+                "due_date":      None,
+                "amount":        meta.get("amount", 0),
+                "currency":      meta.get("currency", "CAD"),
+                "gst_hst":       "", "net_amount": "",
+                "category":      meta.get("category", "Other"),
+                "subject":       "", "confidence": "",
+                "attachment":    meta.get("filename", filename),
+                "email_subject": "[Teams Chat]", "from": "teams",
+                "msg_id":        msg_id, "att_id": "",
+                "processed_at":  _today, "source_type": "teams", "sha256": h,
             }
-            pending = {
-                "new_row":      new_row,
-                "existing_row": meta,
-                "hash":         h,
-                "hashes_file":  str(hashes_file) if hashes_file else None,
-                "master_file":  str(master_file),
-                "expenses_dir": str(expenses_dir),
-                "is_hash_dup":  True,
-            }
+            pending = {"item": item, "hash": h,
+                       "hashes_file": str(hashes_file) if hashes_file else None, "is_hash_dup": True}
             reply = (
                 f"⚠️ This receipt was already captured on {meta.get('processed_date', '?')}.\n\n"
                 f"Vendor: {meta.get('vendor', '?')}\n"
@@ -415,93 +446,71 @@ def _handle_teams_receipt(msg: dict, chat_id: str, graph, ai,
 
         return "\n".join(lines), None
 
-    # ── Document is not a receipt — give a useful error ────────────────
+    # ── receipt / invoice / contract → expenses store (ALL THREE persist now) ──
     if doc_type not in ("receipt", "invoice", "contract"):
-        return ("I received your attachment but it doesn't look like a receipt, invoice, contract, or business card. "
-                "If you meant to capture something specific, please resend with a clearer image."), None
+        # A file we can't file as an expense or a card — still keep it so the agent can act on it.
+        if bot_state is not None:
+            bot_state["pending_file"] = _store_incoming_file(owner_graph, filename, img_bytes, mime, "file", "")
+        return ("I saved that file. Tell me what you'd like me to do with it — forward it to someone, "
+                "or file it as a receipt / invoice / contract."), None
 
-    # Back-compat with code below that checks is_receipt
-    if doc_type != "receipt":
-        return (f"Detected a {doc_type} — currently only receipts auto-add to your expense Excel. "
-                "I've logged it but skipped Excel write."), None
-
-    today      = datetime.now().strftime("%Y-%m-%d")
-    amount     = result.get("amount") or 0
-    gst_hst    = result.get("gst_hst") or 0
-    net_amount = result.get("net_amount") or (round(amount - gst_hst, 2) if gst_hst else "")
-
-    new_row = {
-        "Date":           result.get("date", today),
-        "Vendor":         result.get("vendor", ""),
-        "Amount":         amount,
-        "Currency":       result.get("currency", "CAD"),
-        "GST_HST":        gst_hst or "",
-        "Net_Amount":     net_amount,
-        "Category":       result.get("category", "Other"),
-        "Attachment":     filename,
-        "Email_Subject":  "[Teams Chat]",
-        "From":           "teams",
-        "Msg_ID":         msg_id,
-        "Att_ID":         "",
-        "Processed_Date": today,
+    today  = datetime.now().strftime("%Y-%m-%d")
+    amount = result.get("amount") or 0
+    gst    = result.get("gst_hst") or 0
+    net    = result.get("net_amount") or (round(amount - gst, 2) if gst else "")
+    item = {
+        "document_type": doc_type,
+        "vendor":        result.get("vendor", ""),
+        "counterparty":  result.get("counterparty", ""),
+        "date":          result.get("date", today),
+        "due_date":      result.get("due_date"),
+        "amount":        amount,
+        "currency":      result.get("currency", "CAD"),
+        "gst_hst":       gst or "",
+        "net_amount":    net,
+        "category":      result.get("category", "Other"),
+        "subject":       result.get("subject", ""),
+        "confidence":    result.get("confidence", ""),
+        "attachment":    filename,
+        "email_subject": "[Teams Chat]",
+        "from":          "teams",
+        "msg_id":        msg_id,
+        "att_id":        "",
+        "processed_at":  today,
+        "source_type":   "teams",
+        "sha256":        h,
     }
 
-    existing = _find_field_match(master_file, result.get("vendor",""), amount, result.get("date",""))
-    if existing:
-        pending = {
-            "new_row":       new_row,
-            "existing_row":  existing,
-            "new_file":      f"CEO Platform/Receipts/{filename}",
-            "existing_file": f"CEO Platform/Receipts/{existing.get('Attachment','')}",
-            "hash":          h,
-            "hashes_file":   str(hashes_file) if hashes_file else None,
-            "master_file":   str(master_file),
-            "expenses_dir":  str(expenses_dir),
-        }
-        reply = (
-            f"⚠️ Possible duplicate receipt detected!\n\n"
-            f"New:   {result.get('vendor','?')} | {amount} {result.get('currency','CAD')} | {result.get('date','?')}\n"
-            f"       📎 {filename} → OneDrive: CEO Platform/Receipts/{filename}\n\n"
-            f"Existing: {existing.get('Vendor','?')} | {existing.get('Amount','?')} "
-            f"{existing.get('Currency','CAD')} | {existing.get('Date','?')}\n\n"
-            f"Reply YES to record as a new expense, or NO to discard."
-        )
-        return reply, pending
+    # Receipt duplicate-by-fields confirm (reads the synced xlsx projection).
+    if doc_type == "receipt":
+        existing = _find_field_match(master_file, result.get("vendor", ""), amount, result.get("date", ""))
+        if existing:
+            pending = {"item": item, "hash": h,
+                       "hashes_file": str(hashes_file) if hashes_file else None, "is_hash_dup": False}
+            reply = (
+                f"⚠️ Possible duplicate receipt detected!\n\n"
+                f"New:   {result.get('vendor','?')} | {amount} {result.get('currency','CAD')} | {result.get('date','?')}\n"
+                f"Existing: {existing.get('Vendor','?')} | {existing.get('Amount','?')} "
+                f"{existing.get('Currency','CAD')} | {existing.get('Date','?')}\n\n"
+                f"Reply YES to record as a new expense, or NO to discard."
+            )
+            return reply, pending
 
-    if owner_graph:
-        try:
-            owner_graph.upload_to_onedrive(f"CEO Platform/Receipts/{filename}", img_bytes, mime)
-        except Exception as e:
-            print(f"[ExpenseAgent] OneDrive upload failed: {e}")
+    # Store the file to OneDrive + persist the expense (receipt/invoice/contract all go to the store).
+    file_info = _store_incoming_file(owner_graph, filename, img_bytes, mime, doc_type, _expense_summary(item))
+    item["onedrive_path"] = (file_info or {}).get("onedrive_path")
+    if data_dir:
+        from src.modules import expenses_store
+        expenses_store.upsert_expense(data_dir, item)
+    if h and hashes_file is not None:
+        hashes[h] = {"filename": filename, "vendor": item["vendor"], "amount": amount,
+                     "currency": item["currency"], "date": item["date"],
+                     "category": item["category"], "processed_date": today}
+        _save_hashes(hashes, hashes_file)
+    if bot_state is not None and file_info:
+        bot_state["pending_file"] = file_info
 
-    expenses_dir.mkdir(parents=True, exist_ok=True)
-    wb = openpyxl.load_workbook(master_file) if master_file.exists() else _init_workbook()
-    _append_row(wb.active, new_row)
-    wb.save(master_file)
-    hashes[h] = {
-        "filename":       filename,
-        "vendor":         result.get("vendor", ""),
-        "amount":         amount,
-        "currency":       result.get("currency", "CAD"),
-        "date":           result.get("date", ""),
-        "category":       result.get("category", "Other"),
-        "processed_date": today,
-    }
-    _save_hashes(hashes, hashes_file)
-
-    conf = {"high": "✅ High", "medium": "⚠️ Medium", "low": "⚠️ Low"}.get(
-        result.get("confidence", ""), "?"
-    )
-    return (
-        f"✅ Receipt captured!\n\n"
-        f"Vendor: {result.get('vendor','Unknown')}\n"
-        f"Date: {result.get('date','?')}\n"
-        f"Amount: {amount} {result.get('currency','CAD')}\n"
-        f"GST/HST: {gst_hst or 'N/A'}\n"
-        f"Category: {result.get('category','Other')}\n"
-        f"Confidence: {conf}\n\n"
-        f"Saved to expense report."
-    ), None
+    return _expense_capture_reply(item), None
 
 
 def _strip_html(text: str) -> str:
@@ -575,20 +584,25 @@ def poll_and_reply(bot_state: dict, graph, ai, owner_graph=None,
     for msg in new_msgs:
         last_seen_ts = msg["createdDateTime"]
 
-        # Attachment handling (routes to receipt/invoice/contract or business_card → CRM)
-        expense_reply, pending_expense = _handle_teams_receipt(
-            msg, chat_id, graph, ai, owner_graph, owner_data_dir, settings=settings
+        # ── Stage 1: deterministic auto-capture (receipt/invoice/contract → store, card → CRM).
+        # Also stores any incoming file to OneDrive + puts a handle on bot_state["pending_file"] so
+        # the agent (stage 3) can act on it ("forward this to X"). Runs cheaply, no agent needed.
+        capture_reply, pending_expense = _handle_teams_receipt(
+            msg, chat_id, graph, ai, owner_graph, owner_data_dir, settings=settings, bot_state=bot_state
         )
         if pending_expense:
             bot_state["pending_expense"] = pending_expense
-        if expense_reply is not None:
-            graph.send_chat_message(chat_id, expense_reply)
-            continue
+        if capture_reply is not None:
+            graph.send_chat_message(chat_id, capture_reply)
 
         text = _strip_html(msg.get("body", {}).get("content", "")).strip()
+
+        # ── Stage 2: a bare capture with no request text is done — skip the agent (cheap + automatic).
         if not text:
             continue
 
+        # ── Stage 3: the user asked something — run the agent WITH the file in context (pending_file),
+        # so requests like "forward this to Bob" work while the auto-capture above still happened.
         sender = msg.get("from", {}).get("user", {}).get("displayName", "Colleague")
         print(f"[TeamsBot] {sender}: {text[:80]}")
 

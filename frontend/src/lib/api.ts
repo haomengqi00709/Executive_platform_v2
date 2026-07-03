@@ -503,8 +503,11 @@ export function archiveRecord(kind: 'project' | 'contact', id: string): Promise<
 
 // ── Expenses (full master ledger) ─────────────────────────
 
+export type ExpenseDocType = 'receipt' | 'invoice' | 'contract';
+
 export interface ExpenseRow {
   id: string;
+  document_type?: ExpenseDocType;
   Date?: string;
   Vendor?: string;
   Amount?: number | string;
@@ -518,6 +521,10 @@ export interface ExpenseRow {
   Msg_ID?: string;
   Att_ID?: string;
   Processed_Date?: string;
+  // invoice/contract extras
+  Counterparty?: string;
+  Due_Date?: string | null;
+  Subject?: string;
   [key: string]: unknown;
 }
 

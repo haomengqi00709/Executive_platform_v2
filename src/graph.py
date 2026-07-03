@@ -502,6 +502,18 @@ class GraphClient:
             "toRecipients": recipients,
         })
 
+    def add_file_attachment(self, message_id: str, filename: str, content: bytes,
+                             mime: str = "application/octet-stream") -> dict:
+        """Attach a file to an existing draft message (used by the forward_file tool). Graph wants the
+        bytes base64-encoded on a fileAttachment resource."""
+        import base64
+        return self.post(f"/me/messages/{message_id}/attachments", {
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": filename,
+            "contentType": mime or "application/octet-stream",
+            "contentBytes": base64.b64encode(content).decode(),
+        })
+
     def send_mail(self, to: str, subject: str, html: str):
         r = requests.post(
             f"{BASE}/me/sendMail",

@@ -33,6 +33,7 @@ export default function ExpensesTab() {
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [categoryFilter, setCategoryFilter] = useState<string>('all');
+  const [docType, setDocType] = useState<'receipt' | 'invoice' | 'contract'>('receipt');
   const [savingId, setSavingId] = useState<string | null>(null);
   const [edit, setEdit] = useState<EditState | null>(null);
   const [viewingPhotoId, setViewingPhotoId] = useState<string | null>(null);
@@ -79,19 +80,31 @@ export default function ExpensesTab() {
     setEdit(null);
   };
 
+  const counts = useMemo(() => {
+    const c = { receipt: 0, invoice: 0, contract: 0 };
+    for (const r of rows) {
+      const dt = (r.document_type as 'receipt' | 'invoice' | 'contract') || 'receipt';
+      if (dt in c) c[dt]++;
+    }
+    return c;
+  }, [rows]);
+
   const visible = useMemo(() => {
     return rows.filter(r => {
-      if (categoryFilter !== 'all' && (r.Category || 'Other') !== categoryFilter) return false;
+      if (((r.document_type as string) || 'receipt') !== docType) return false;
+      if (docType === 'receipt' && categoryFilter !== 'all' && (r.Category || 'Other') !== categoryFilter) return false;
       if (search.trim()) {
         const q = search.toLowerCase();
         return (
           String(r.Vendor || '').toLowerCase().includes(q) ||
+          String(r.Counterparty || '').toLowerCase().includes(q) ||
+          String(r.Subject || '').toLowerCase().includes(q) ||
           String(r.Email_Subject || '').toLowerCase().includes(q)
         );
       }
       return true;
     });
-  }, [rows, search, categoryFilter]);
+  }, [rows, search, categoryFilter, docType]);
 
   const totalsByCategory = useMemo(() => {
     const totals: Record<string, number> = {};
@@ -107,10 +120,26 @@ export default function ExpensesTab() {
     <div className="space-y-4">
       <HistoricalScanBanner onRowsChanged={refresh} initialRowCount={rows.length} />
 
+      <div className="flex items-center gap-1 border-b border-executive-border">
+        {([['receipt', 'Receipts'], ['invoice', 'Invoices'], ['contract', 'Contracts']] as const).map(([t, label]) => (
+          <button
+            key={t}
+            onClick={() => setDocType(t)}
+            className={`px-3 py-1.5 text-xs font-medium border-b-2 -mb-px transition-colors ${
+              docType === t
+                ? 'border-executive-accent text-executive-text'
+                : 'border-transparent text-executive-muted hover:text-executive-text'
+            }`}
+          >
+            {label} <span className="text-executive-muted">({counts[t]})</span>
+          </button>
+        ))}
+      </div>
+
       <header className="flex flex-wrap items-center gap-3 justify-between">
         <div className="text-xs text-executive-muted">
-          {loading ? 'Loading…' : `${rows.length} receipts captured`}
-          {Object.keys(totalsByCategory).length > 0 && (
+          {loading ? 'Loading…' : `${visible.length} ${docType}${visible.length === 1 ? '' : 's'}`}
+          {docType === 'receipt' && Object.keys(totalsByCategory).length > 0 && (
             <span className="ml-3">
               Total: {Object.entries(totalsByCategory).map(([k, v]) => `${k} ${v.toFixed(2)}`).join(' · ')}
             </span>
@@ -127,14 +156,16 @@ export default function ExpensesTab() {
               className="pl-7 pr-3 py-1.5 text-xs bg-executive-bg border border-executive-border rounded-lg w-64 focus:outline-none focus:border-executive-accent/60"
             />
           </div>
-          <select
-            value={categoryFilter}
-            onChange={e => setCategoryFilter(e.target.value)}
-            className="px-2 py-1.5 text-xs bg-executive-bg border border-executive-border rounded-lg focus:outline-none focus:border-executive-accent/60"
-          >
-            <option value="all">All categories</option>
-            {CATEGORY_OPTIONS.map(c => <option key={c} value={c}>{c}</option>)}
-          </select>
+          {docType === 'receipt' && (
+            <select
+              value={categoryFilter}
+              onChange={e => setCategoryFilter(e.target.value)}
+              className="px-2 py-1.5 text-xs bg-executive-bg border border-executive-border rounded-lg focus:outline-none focus:border-executive-accent/60"
+            >
+              <option value="all">All categories</option>
+              {CATEGORY_OPTIONS.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+          )}
           <a
             href={expensesExportXlsxUrl}
             download
@@ -158,8 +189,16 @@ export default function ExpensesTab() {
         </div>
       ) : visible.length === 0 ? (
         <div className="text-center text-sm text-executive-muted py-12">
-          No receipts captured yet, or none match the filter.
+          No {docType}s captured yet, or none match the filter.
         </div>
+      ) : docType !== 'receipt' ? (
+        <DocTable
+          rows={visible}
+          docType={docType}
+          savingId={savingId}
+          onView={setViewingPhotoId}
+          onDelete={remove}
+        />
       ) : (
         <div className="bg-executive-card border border-executive-border rounded-xl overflow-hidden overflow-x-auto">
           <table className="w-full text-sm min-w-[900px]">
@@ -276,6 +315,76 @@ export default function ExpensesTab() {
 }
 
 // ───────────────────────────────────────────────────────────
+
+function DocTable({
+  rows, docType, savingId, onView, onDelete,
+}: {
+  rows: ExpenseRow[]; docType: 'invoice' | 'contract';
+  savingId: string | null; onView: (id: string) => void; onDelete: (id: string) => void;
+}) {
+  const isInvoice = docType === 'invoice';
+  const today = new Date().toISOString().slice(0, 10);
+  return (
+    <div className="bg-executive-card border border-executive-border rounded-xl overflow-hidden overflow-x-auto">
+      <table className="w-full text-sm min-w-[800px]">
+        <thead className="bg-executive-bg border-b border-executive-border">
+          <tr className="text-xs text-executive-muted uppercase tracking-wider">
+            <th className="text-left px-3 py-2 font-medium">Date</th>
+            <th className="text-left px-3 py-2 font-medium">{isInvoice ? 'Vendor' : 'Counterparty'}</th>
+            <th className="text-left px-3 py-2 font-medium">{isInvoice ? 'Description' : 'Agreement'}</th>
+            {isInvoice && <th className="text-right px-3 py-2 font-medium">Amount</th>}
+            {isInvoice && <th className="text-left px-3 py-2 font-medium">Due</th>}
+            <th className="text-center px-3 py-2 font-medium">File</th>
+            <th className="text-right px-3 py-2 font-medium"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(r => {
+            const hasAttachment = !!r.Attachment && String(r.Attachment).trim() !== '';
+            const overdue = isInvoice && !!r.Due_Date && String(r.Due_Date) < today;
+            return (
+              <tr key={r.id} className="border-b border-executive-border/60 last:border-b-0 hover:bg-executive-border/10">
+                <td className="px-3 py-2 text-xs text-executive-muted whitespace-nowrap">{r.Date || '—'}</td>
+                <td className="px-3 py-2">{(isInvoice ? r.Vendor : r.Counterparty) || '—'}</td>
+                <td className="px-3 py-2 text-executive-muted truncate max-w-[20rem]">{r.Subject || '—'}</td>
+                {isInvoice && <td className="px-3 py-2 text-right tabular-nums">{r.Amount ?? '—'} {r.Currency || ''}</td>}
+                {isInvoice && (
+                  <td className={`px-3 py-2 text-xs whitespace-nowrap ${overdue ? 'text-rose-400 font-medium' : 'text-executive-muted'}`}>
+                    {r.Due_Date || '—'}{overdue ? ' · overdue' : ''}
+                  </td>
+                )}
+                <td className="px-3 py-2 text-center">
+                  {hasAttachment ? (
+                    <button
+                      onClick={() => onView(r.id)}
+                      className="text-xs p-1 rounded-md text-executive-muted hover:text-executive-accent hover:bg-executive-accent/10 transition-colors"
+                      title={`View ${r.Attachment}`}
+                    >
+                      <ImageIcon size={14} />
+                    </button>
+                  ) : <span className="text-xs text-executive-muted/40">—</span>}
+                </td>
+                <td className="px-3 py-2 text-right">
+                  {savingId === r.id ? (
+                    <Loader2 size={12} className="inline animate-spin text-executive-muted" />
+                  ) : (
+                    <button
+                      onClick={() => onDelete(r.id)}
+                      className="text-xs p-1 rounded-md text-executive-muted hover:text-rose-400 hover:bg-rose-400/10 transition-colors"
+                      title="Delete"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
 
 function PhotoModal({
   rowId, row, onClose,

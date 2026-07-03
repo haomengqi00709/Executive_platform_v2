@@ -495,12 +495,27 @@ def reply(
         )
 
     if pending_expense:
-        vendor = pending_expense.get("new_row", {}).get("Vendor", "?")
-        amount = pending_expense.get("new_row", {}).get("Amount", "?")
+        _pit   = pending_expense.get("item", {})
+        vendor = _pit.get("vendor") or _pit.get("counterparty") or "?"
+        amount = _pit.get("amount", "?")
         pending_note += (
             f"\n\n⚠️ PENDING EXPENSE DUPLICATE — {vendor} {amount}. "
             f"If the user says YES → call confirm_expense(). "
             f"If they say NO → call discard_expense()."
+        )
+
+    pending_file = state.get("pending_file")
+    if pending_file:
+        _fn  = pending_file.get("filename", "a file")
+        _dt  = pending_file.get("doc_type", "file")
+        _sum = pending_file.get("summary") or ""
+        _saved = " as an expense" if _dt in ("receipt", "invoice", "contract") else ""
+        pending_note += (
+            f"\n\n📎 A FILE THE USER JUST SENT is available: '{_fn}' ({_dt})"
+            f"{(' — ' + _sum) if _sum else ''}. It has already been saved{_saved}. "
+            f"If the user asks to send / forward / email / attach this file to someone (e.g. 'send this "
+            f"to Bob', 'forward it to accounting') → call forward_file(to=<recipient email or name>). Do "
+            f"NOT ask them to resend the file — you already have it. If they ask what it says, use the summary."
         )
 
     pending_group = state.get("pending_group_email")

@@ -238,17 +238,9 @@ def run(
     # classify calls land in the per-user budget tally (not feature=unknown). Mirrors
     # email_monitor's set_usage_context and covers every caller of run(), not just the poll.
     set_usage_context("expenses", data_dir.name)
-    expenses_dir = data_dir / "expenses"
-    expenses_dir.mkdir(parents=True, exist_ok=True)
-    results_dir = data_dir / "results"
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    seen_path = expenses_dir / "_seen.json"
-    hashes_path = expenses_dir / "_receipt_hashes.json"
-    excel_path = expenses_dir / "expenses_master.xlsx"
-
-    seen: dict = _load_json(seen_path)
-    receipt_hashes: dict = _load_json(hashes_path)
+    from src.modules import expenses_store as store
+    (data_dir / "expenses").mkdir(parents=True, exist_ok=True)
+    (data_dir / "results").mkdir(parents=True, exist_ok=True)
 
     since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     log(f"Fetching emails with attachments (last {days} days)...")
@@ -284,15 +276,15 @@ def run(
             att_name = att.get("name") or "attachment"
             content_type = (att.get("contentType") or "").lower().split(";")[0].strip()
 
-            # Layer 1: seen check
+            # Layer 1: examined-attachment check (store-backed)
             seen_key = f"{msg_id}::{att_name}"
-            if seen_key in seen:
+            if store.is_seen(data_dir, seen_key):
                 continue
 
             # Extension/MIME filter
             ext = Path(att_name).suffix.lower()
             if content_type not in _ALLOWED_MIME and ext not in _ALLOWED_EXT:
-                seen[seen_key] = True
+                store.mark_seen(data_dir, seen_key)
                 continue
 
             # Get file bytes — either inline contentBytes or download
@@ -302,35 +294,32 @@ def run(
                 try:
                     file_bytes = base64.b64decode(file_bytes_b64)
                 except Exception:
-                    seen[seen_key] = True
+                    store.mark_seen(data_dir, seen_key)
                     continue
             else:
                 try:
                     file_bytes = graph.download(f"/me/messages/{msg_id}/attachments/{att_id}/$value")
                 except Exception:
-                    seen[seen_key] = True
+                    store.mark_seen(data_dir, seen_key)
                     continue
 
             if not file_bytes:
-                seen[seen_key] = True
+                store.mark_seen(data_dir, seen_key)
                 continue
 
-            # Layer 2: hash check
+            # Layer 2: file-hash dedup (store-backed)
             file_hash = hashlib.sha256(file_bytes).hexdigest()
-            if file_hash in receipt_hashes:
-                seen[seen_key] = True
+            if store.is_seen(data_dir, f"sha256:{file_hash}"):
+                store.mark_seen(data_dir, seen_key)
                 continue
 
             log(f"  Analyzing: {att_name} (from: {sender})")
 
             # Gemini extraction + classification
             extracted = _extract_document(ai, file_bytes, att_name)
-            seen[seen_key] = True
-            # Persist the "classified" mark IMMEDIATELY. The end-of-run save (below) is too
-            # late: if any later step (Excel append / OneDrive upload / next fetch) raises and
-            # aborts the run, seen would never persist and this attachment would be
-            # re-classified every cycle — the root cause of the expense token burn.
-            _save_json(seen_path, seen)
+            # Persist the "examined" mark IMMEDIATELY (token-burn guard): if any later step raises,
+            # this attachment must not be re-classified next cycle.
+            store.mark_seen(data_dir, seen_key)
 
             if not extracted:
                 continue
@@ -338,7 +327,7 @@ def run(
             if doc_type not in ("receipt", "invoice", "contract"):
                 continue
 
-            receipt_hashes[file_hash] = att_name
+            store.mark_seen(data_dir, f"sha256:{file_hash}")
 
             item = {
                 "document_type": doc_type,
@@ -359,54 +348,49 @@ def run(
                 "msg_id":        msg_id,
                 "att_id":        att_id,
                 "processed_at":  datetime.now().strftime("%Y-%m-%d"),
+                "source_type":   "email",
+                "sha256":        file_hash,
             }
-            new_items.append(item)
 
-            # Only receipts go to the reimbursement Excel
+            # Receipts get uploaded to OneDrive so the photo endpoint can render them; keep the path.
             if doc_type == "receipt":
-                # Upload receipt to OneDrive so the user can view it later.
-                # Failure is non-fatal — log and continue (we still want the Excel row).
-                ext = Path(att_name).suffix.lower() or ".bin"
+                ext_up = Path(att_name).suffix.lower() or ".bin"
                 mime_for_upload = {
                     ".pdf":  "application/pdf",
                     ".jpg":  "image/jpeg", ".jpeg": "image/jpeg",
                     ".png":  "image/png",  ".gif":  "image/gif",
                     ".webp": "image/webp", ".bmp":  "image/bmp",
                     ".tiff": "image/tiff", ".tif":  "image/tiff",
-                }.get(ext, "application/octet-stream")
+                }.get(ext_up, "application/octet-stream")
+                item["onedrive_path"] = f"CEO Platform/Receipts/{att_name}"
                 try:
-                    graph.upload_to_onedrive(
-                        f"CEO Platform/Receipts/{att_name}",
-                        file_bytes,
-                        mime_for_upload,
-                    )
+                    graph.upload_to_onedrive(item["onedrive_path"], file_bytes, mime_for_upload)
                 except Exception as up_err:
-                    log(f"    OneDrive upload failed (kept Excel row): {up_err}")
+                    log(f"    OneDrive upload failed (kept expense row): {up_err}")
 
-                try:
-                    _append_excel(excel_path, item)
-                except Exception as xl_err:
-                    log(f"    Excel append failed (kept seen + item): {xl_err}")
+            # Every type persists to the store now (receipt/invoice/contract) — project once at the end.
+            store.upsert_expense(data_dir, item, project=False)
+            new_items.append(item)
+
+            if doc_type == "receipt":
                 log(f"    Receipt: {item['vendor']} {item['amount']} {item['currency']} [{item['category']}]")
             elif doc_type == "invoice":
                 log(f"    Invoice: {item['vendor']} {item['amount']} {item['currency']} due {item.get('due_date') or '?'}")
             elif doc_type == "contract":
                 log(f"    Contract: {item['counterparty']} — {item['subject']}")
 
-    _save_json(seen_path, seen)
-    _save_json(hashes_path, receipt_hashes)
+    store.set_last_run(data_dir)
+    store.write_projection(data_dir)   # regenerate xlsx (receipts) + results/expenses.json (all types)
 
+    all_items = store.load_expenses(data_dir)
     result = {
         "id":       "expenses",
         "status":   "fresh",
         "last_run": datetime.now(timezone.utc).isoformat(),
-        "items":    new_items,
-        "count":    len(new_items),
-        "empty":    len(new_items) == 0,
+        "items":    all_items,
+        "count":    len(all_items),
+        "empty":    len(all_items) == 0,
     }
-
-    result_path = results_dir / "expenses.json"
-    _save_json(result_path, result)
 
     counts = {"receipt": 0, "invoice": 0, "contract": 0}
     for it in new_items:

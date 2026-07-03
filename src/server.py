@@ -3809,65 +3809,55 @@ def _expense_row_id(row: dict) -> str:
     return hashlib.sha1(key.encode()).hexdigest()[:16]
 
 
+# The frontend renders capitalised Excel-style keys; the store keeps lowercase item keys. This maps a
+# store expense item → the row shape the UI already reads, plus document_type + invoice/contract fields.
+_EXPENSE_FIELD_MAP = {"Vendor": "vendor", "Date": "date", "Amount": "amount", "Currency": "currency",
+                      "Category": "category", "GST_HST": "gst_hst", "Net_Amount": "net_amount"}
+
+
+def _expense_item_to_row(it: dict) -> dict:
+    return {
+        "id":             it.get("id"),
+        "document_type":  it.get("document_type", "receipt"),
+        "Date":           it.get("date", ""),
+        "Vendor":         it.get("vendor", ""),
+        "Amount":         it.get("amount", ""),
+        "Currency":       it.get("currency", ""),
+        "GST_HST":        it.get("gst_hst", ""),
+        "Net_Amount":     it.get("net_amount", ""),
+        "Category":       it.get("category", ""),
+        "Attachment":     it.get("attachment", ""),
+        "Email_Subject":  it.get("email_subject", ""),
+        "From":           it.get("from", ""),
+        "Msg_ID":         it.get("msg_id", ""),
+        "Att_ID":         it.get("att_id", ""),
+        "Processed_Date": it.get("processed_at", ""),
+        "Counterparty":   it.get("counterparty", ""),
+        "Due_Date":       it.get("due_date"),
+        "Subject":        it.get("subject", ""),
+    }
+
+
 @app.get("/api/expenses/all")
 def get_all_expenses(session: dict = Depends(require_session)):
-    """Return all rows from expenses_master.xlsx as a JSON list with stable ids."""
-    uid  = session["user_id"]
-    path = _udir(uid) / "expenses" / "expenses_master.xlsx"
-    if not path.exists():
-        return []
-    try:
-        from openpyxl import load_workbook
-        ws      = load_workbook(path).active
-        headers = [c.value for c in ws[1]]
-        rows = [
-            dict(zip(headers, row))
-            for row in ws.iter_rows(min_row=2, values_only=True)
-        ]
-        for r in rows:
-            r["id"] = _expense_row_id(r)
-        return rows
-    except Exception:
-        return []
+    """All expenses (receipts + invoices + contracts) from the store, each with a stable id and
+    document_type. Row shape mirrors the old Excel columns so the receipt table is unchanged."""
+    from src.modules import expenses_store
+    uid = session["user_id"]
+    return [_expense_item_to_row(it) for it in expenses_store.load_expenses(_udir(uid))]
 
 
 @app.patch("/api/expenses/{row_id}")
 def patch_expense(row_id: str, body: dict, session: dict = Depends(require_session)):
-    """Manually update a row in expenses_master.xlsx. Allowed fields: Vendor,
-    Date, Amount, Currency, Category, GST_HST, Net_Amount."""
-    uid  = session["user_id"]
-    path = _udir(uid) / "expenses" / "expenses_master.xlsx"
-    if not path.exists():
-        raise HTTPException(404, "No expense ledger yet")
-    try:
-        from openpyxl import load_workbook
-    except ImportError:
-        raise HTTPException(500, "openpyxl not installed")
-
-    wb = load_workbook(path)
-    ws = wb.active
-    headers = [c.value for c in ws[1]]
-    col_index = {h: i + 1 for i, h in enumerate(headers)}  # 1-based
-
-    target_row = None
-    for row_num in range(2, ws.max_row + 1):
-        row_dict = {h: ws.cell(row=row_num, column=col_index[h]).value for h in headers}
-        if _expense_row_id(row_dict) == row_id:
-            target_row = row_num
-            break
-    if target_row is None:
+    """Field-level edit of one expense (store-backed; regenerates the xlsx/json projections). Allowed
+    fields: Vendor, Date, Amount, Currency, Category, GST_HST, Net_Amount."""
+    from src.modules import expenses_store
+    uid = session["user_id"]
+    updates = {_EXPENSE_FIELD_MAP[k]: v for k, v in (body or {}).items() if k in _EXPENSE_EDITABLE_FIELDS}
+    item = expenses_store.update_expense_fields(_udir(uid), row_id, updates)
+    if item is None:
         raise HTTPException(404, f"Expense row '{row_id}' not found")
-
-    updates = {k: v for k, v in body.items() if k in _EXPENSE_EDITABLE_FIELDS}
-    for field, value in updates.items():
-        if field in col_index:
-            ws.cell(row=target_row, column=col_index[field]).value = value
-
-    wb.save(path)
-
-    updated_row = {h: ws.cell(row=target_row, column=col_index[h]).value for h in headers}
-    updated_row["id"] = _expense_row_id(updated_row)
-    return updated_row
+    return _expense_item_to_row(item)
 
 
 @app.post("/api/expenses/scan")
@@ -3932,86 +3922,52 @@ async def scan_expenses_historical(
 
 @app.post("/api/expenses")
 def create_expense(body: dict, session: dict = Depends(require_session)):
-    """Manually add a new receipt row to expenses_master.xlsx."""
-    uid  = session["user_id"]
-    expenses_dir = _udir(uid) / "expenses"
-    expenses_dir.mkdir(parents=True, exist_ok=True)
-    path = expenses_dir / "expenses_master.xlsx"
-    try:
-        from openpyxl import Workbook, load_workbook
-    except ImportError:
-        raise HTTPException(500, "openpyxl not installed")
-
-    headers = [
-        "Date", "Vendor", "Amount", "Currency", "GST_HST", "Net_Amount",
-        "Category", "Attachment", "Email_Subject", "From", "Msg_ID", "Att_ID", "Processed_Date",
-    ]
-    if path.exists():
-        wb = load_workbook(path)
-        ws = wb.active
-    else:
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Expenses"
-        ws.append(headers)
-
+    """Manually add a receipt (store-backed)."""
+    from src.modules import expenses_store
+    uid = session["user_id"]
     today = today_local_str(_udir(uid))
     manual_id = f"manual_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
-    new_row = [
-        body.get("Date") or today,
-        body.get("Vendor", ""),
-        body.get("Amount", ""),
-        body.get("Currency", "CAD"),
-        body.get("GST_HST", ""),
-        body.get("Net_Amount", ""),
-        body.get("Category", "Other"),
-        body.get("Attachment", ""),
-        body.get("Email_Subject", "(manual entry)"),
-        body.get("From", ""),
-        manual_id,                # Msg_ID
-        manual_id,                # Att_ID — stable id source
-        today,                    # Processed_Date
-    ]
-    ws.append(new_row)
-    wb.save(path)
-
-    row_dict = dict(zip(headers, new_row))
-    row_dict["id"] = _expense_row_id(row_dict)
-    return row_dict
+    item = {
+        "document_type": "receipt",
+        "date":          body.get("Date") or today,
+        "vendor":        body.get("Vendor", ""),
+        "amount":        body.get("Amount", ""),
+        "currency":      body.get("Currency", "CAD"),
+        "gst_hst":       body.get("GST_HST", ""),
+        "net_amount":    body.get("Net_Amount", ""),
+        "category":      body.get("Category", "Other"),
+        "attachment":    body.get("Attachment", ""),
+        "email_subject": body.get("Email_Subject", "(manual entry)"),
+        "from":          body.get("From", ""),
+        "counterparty":  "", "due_date": None, "subject": "", "confidence": "",
+        "msg_id":        manual_id,
+        "att_id":        manual_id,
+        "processed_at":  today,
+        "source_type":   "manual",
+    }
+    eid = expenses_store.upsert_expense(_udir(uid), item)
+    return _expense_item_to_row({**item, "id": eid})
 
 
 @app.get("/api/expenses/{row_id}/photo")
 def get_expense_photo(row_id: str, session: dict = Depends(require_session)):
-    """Stream the receipt photo from OneDrive (CEO Platform/Receipts/{attachment})."""
+    """Stream the receipt photo from OneDrive (the store item's onedrive_path, or Receipts/{name})."""
     from fastapi.responses import Response
+    from src.modules import expenses_store
     uid  = session["user_id"]
-    path = _udir(uid) / "expenses" / "expenses_master.xlsx"
-    if not path.exists():
-        raise HTTPException(404, "No expense ledger yet")
-    try:
-        from openpyxl import load_workbook
-    except ImportError:
-        raise HTTPException(500, "openpyxl not installed")
-
-    wb = load_workbook(path)
-    ws = wb.active
-    headers = [c.value for c in ws[1]]
-    col_index = {h: i + 1 for i, h in enumerate(headers)}
-
-    attachment_name = None
-    for row_num in range(2, ws.max_row + 1):
-        row_dict = {h: ws.cell(row=row_num, column=col_index[h]).value for h in headers}
-        if _expense_row_id(row_dict) == row_id:
-            attachment_name = row_dict.get("Attachment")
-            break
-    if not attachment_name:
-        raise HTTPException(404, "Receipt row not found or has no attachment")
+    item = next((it for it in expenses_store.load_expenses(_udir(uid)) if it.get("id") == row_id), None)
+    if not item:
+        raise HTTPException(404, "Expense not found")
+    od_path = item.get("onedrive_path") or (
+        f"CEO Platform/Receipts/{item.get('attachment')}" if item.get("attachment") else None)
+    if not od_path:
+        raise HTTPException(404, "Expense has no attachment")
 
     try:
         token = auth.get_valid_access_token(uid)
         graph = GraphClient(token)
         from urllib.parse import quote
-        encoded = quote(f"CEO Platform/Receipts/{attachment_name}", safe="/")
+        encoded = quote(od_path, safe="/")
         # Get item metadata + downloadUrl
         meta = graph.get(f"/me/drive/root:/{encoded}")
         download_url = meta.get("@microsoft.graph.downloadUrl")
@@ -4032,32 +3988,11 @@ def get_expense_photo(row_id: str, session: dict = Depends(require_session)):
 
 @app.delete("/api/expenses/{row_id}")
 def delete_expense(row_id: str, session: dict = Depends(require_session)):
-    """Delete a row from expenses_master.xlsx."""
-    uid  = session["user_id"]
-    path = _udir(uid) / "expenses" / "expenses_master.xlsx"
-    if not path.exists():
-        raise HTTPException(404, "No expense ledger yet")
-    try:
-        from openpyxl import load_workbook
-    except ImportError:
-        raise HTTPException(500, "openpyxl not installed")
-
-    wb = load_workbook(path)
-    ws = wb.active
-    headers = [c.value for c in ws[1]]
-    col_index = {h: i + 1 for i, h in enumerate(headers)}
-
-    target_row = None
-    for row_num in range(2, ws.max_row + 1):
-        row_dict = {h: ws.cell(row=row_num, column=col_index[h]).value for h in headers}
-        if _expense_row_id(row_dict) == row_id:
-            target_row = row_num
-            break
-    if target_row is None:
+    """Delete one expense (store-backed; regenerates the xlsx/json projections)."""
+    from src.modules import expenses_store
+    uid = session["user_id"]
+    if not expenses_store.delete_expense(_udir(uid), row_id):
         raise HTTPException(404, f"Expense row '{row_id}' not found")
-
-    ws.delete_rows(target_row, 1)
-    wb.save(path)
     return {"ok": True}
 
 
