@@ -382,14 +382,17 @@ def run(
     store.set_last_run(data_dir)
     store.write_projection(data_dir)   # regenerate xlsx (receipts) + results/expenses.json (all types)
 
-    all_items = store.load_expenses(data_dir)
+    # Return ONLY what THIS run newly captured. The 10-min expense poll pushes "N new receipts" to
+    # Teams when items is non-empty (server.py _poll_expense_scan_all_users) — returning all stored
+    # items here made it re-announce the same receipts every cycle. The dashboard reads the store
+    # directly (/api/expenses/all), so it still shows the full ledger.
     result = {
         "id":       "expenses",
         "status":   "fresh",
         "last_run": datetime.now(timezone.utc).isoformat(),
-        "items":    all_items,
-        "count":    len(all_items),
-        "empty":    len(all_items) == 0,
+        "items":    new_items,
+        "count":    len(new_items),
+        "empty":    len(new_items) == 0,
     }
 
     counts = {"receipt": 0, "invoice": 0, "contract": 0}
