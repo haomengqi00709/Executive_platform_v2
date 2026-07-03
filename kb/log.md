@@ -24,3 +24,4 @@ Append-only. One line per event. Grep recent: `grep '^## \[' kb/log.md | tail -5
 ## [2026-06-25] sync | data-management — companies → store (Phase 3c, store-backed + edit-preserving); list_companies + tag_contact bot tools @97215fd
 ## [2026-06-25] sync | workflow-tools — new tools (list_companies/tag_contact); shown-list invalidated after a mutating action so #N re-resolves live @97215fd
 ## [2026-06-25] sync | overview + sections-framework + delivery — companies store migration (server.py); non-behavioral bumps @97215fd
+## [2026-07-02] sync | expenses — migrated to store.db (expenses table, dual xlsx/json projection); Teams invoices/contracts now PERSIST (were dropped) + dashboard Receipts/Invoices/Contracts tabs; attachments are a first-class agent input (pending_file + forward_file tool, Drafts-only) @bd0f97d

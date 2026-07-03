@@ -8,8 +8,9 @@ describes_files:
   - src/bot_tools/contacts/list_crm_contacts/tool.py
   - src/bot_tools/contacts/tag_contact/tool.py
   - src/bot_tools/companies/list_companies/tool.py
-derived_from_commit: 97215fd
-last_synced: 2026-06-25
+  - src/bot_tools/files/forward_file/tool.py
+derived_from_commit: bd0f97d
+last_synced: 2026-07-02
 ---
 
 # Workflow Tools (Outreach / Draft Composer)
@@ -112,6 +113,9 @@ one pass with no verifier call.
   named contact (see [data-management](data-management.md)).
 - **`list_companies`** — list the company database, default = the companies Company Intelligence
   actually monitors (see [data-management](data-management.md)).
+- **`forward_file`** — attach the file the user just sent in Teams (receipt / invoice / contract / any
+  document, held on `pending_file`) to a NEW Outlook draft addressed to someone; resolves a contact
+  name to its email. Drafts-only, never sends. See [expenses](expenses.md).
 
 ## The hard rule
 **Drafts are never auto-sent.** Everything the AI writes is saved to Outlook Drafts;
