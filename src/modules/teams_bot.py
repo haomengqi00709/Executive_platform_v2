@@ -334,6 +334,9 @@ def _handle_teams_receipt(msg: dict, chat_id: str, graph, ai,
                 f"Date: {meta.get('date', '?')}\n\n"
                 f"Reply YES to add as a new expense entry anyway, or NO to discard."
             )
+            if bot_state is not None:
+                bot_state["pending_file"] = _store_incoming_file(
+                    owner_graph, filename, img_bytes, mime, "receipt", "receipt (already captured)")
             return reply, pending
         return "This receipt has already been captured (exact duplicate). No action taken.", None
 
@@ -494,6 +497,9 @@ def _handle_teams_receipt(msg: dict, chat_id: str, graph, ai,
                 f"{existing.get('Currency','CAD')} | {existing.get('Date','?')}\n\n"
                 f"Reply YES to record as a new expense, or NO to discard."
             )
+            if bot_state is not None:
+                bot_state["pending_file"] = _store_incoming_file(
+                    owner_graph, filename, img_bytes, mime, "receipt", _expense_summary(item))
             return reply, pending
 
     # Store the file to OneDrive + persist the expense (receipt/invoice/contract all go to the store).
