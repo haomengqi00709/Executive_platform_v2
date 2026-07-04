@@ -34,7 +34,7 @@ def _resolve_date(day_word: str, now: datetime):
 def build(ctx):
     def create_calendar_event(subject: str, start_iso: str = "", day: str = "",
                               end_iso: str = "", attendee_emails: str = "",
-                              location: str = "", is_online_meeting: bool = False) -> str:
+                              location: str = "", is_online_meeting: bool = True) -> str:
         from src.modules.tz import get_user_tz
         owner_graph = ctx.owner_graph
         if owner_graph is None:
@@ -85,9 +85,13 @@ def build(ctx):
                 is_online=is_online_meeting,
             )
             web_link = result.get("webLink", "")
+            join_url = (result.get("onlineMeeting") or {}).get("joinUrl", "")
             msg = f"✅ Event created: '{subject}' from {start_iso} to {end_iso}"
             if attendees:
                 msg += f" · Invites sent to: {', '.join(attendees)}"
+            if join_url:
+                msg += f"\n🔗 Teams link: {join_url}"
+                ctx.state["_last_event_join_url"] = join_url
             if web_link:
                 ctx.state["_last_event_web_link"] = web_link
             return msg

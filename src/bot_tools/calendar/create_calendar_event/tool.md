@@ -11,4 +11,6 @@ start_iso: ISO 8601 carrying the TIME of day (the date part is ignored when `day
 end_iso: optional; if omitted, defaults to 30 minutes after start. Set it only when
   the user gave a duration or end time. (So 'schedule X tomorrow at 5:30pm' is enough to book.)
 attendee_emails: comma-separated email addresses (leave empty for solo blocks).
-is_online_meeting: set true to add a Teams meeting link.
+is_online_meeting: defaults to TRUE — every event gets a Teams meeting link so attendees
+  can join online. Set it false ONLY when the user explicitly asks for an in-person /
+  offline event with no online link.
