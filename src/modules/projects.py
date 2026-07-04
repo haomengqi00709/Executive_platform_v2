@@ -19,7 +19,7 @@ from pathlib import Path
 from src.graph import GraphClient
 from src.ai import AIClient
 from src.modules.screener import screen_emails
-from src.modules.crm import _is_noise
+from src.modules.crm import _is_noise, _FREE_EMAIL_DOMAINS
 from src.modules.profile import load_profile_context
 
 _EXPENSE_SUBJECTS = re.compile(
@@ -132,10 +132,12 @@ def _extract_projects_from_batch(
     ai: AIClient,
     display_name: str,
     today_str: str,
-) -> list[dict]:
+) -> list[dict] | None:
     """
     Send a batch of conversations to Gemini and extract project entries.
-    Returns a list of project dicts.
+    Returns a list of project dicts, [] if the batch genuinely holds no project,
+    or None if the AI call FAILED (timeout/error) — so the caller can split-and-retry
+    instead of silently dropping every project in the batch.
     """
     conv_blocks = "\n\n".join(
         _build_conversation_text(cid, msgs) for cid, msgs in batch
@@ -186,7 +188,7 @@ Return only the JSON array, no explanation."""
         return projects
     except Exception as e:
         print(f"[Projects] Batch extraction failed: {e}")
-        return []
+        return None
 
 
 def _merge_projects(existing: dict, new_projects: list[dict]) -> dict:
@@ -257,6 +259,104 @@ def _project_participants(proj: dict, owner_addrs: set[str]) -> set[str]:
         p.lower() for p in (proj.get("participants") or [])
         if p and p.lower() not in owner_addrs and not _is_noise(p.lower())
     }
+
+
+# ── Client-aware batching ───────────────────────────────────────────────────
+# Extraction runs per batch and _merge_projects dedups by id only. If a client's
+# threads scatter across batches, each batch coins its own project for that client
+# and they never collapse → the same engagement fragments into near-duplicates
+# (e.g. Vistergy ×4). Batching by client keeps a client's whole thread history in
+# ONE prompt, so the model sees the full picture and emits one project per real
+# deliverable — the way a human would cluster it.
+_CLIENT_BATCH_SIZE = 14   # soft target; a client is never split below this
+_CLIENT_BATCH_CAP = 18    # hard cap: only a single client bigger than this splits
+# 14/18 keep the AI prompt small enough to finish inside the 60s call budget — a 24-conv
+# batch timed out and dropped a whole client's projects. _extract_batches split-retries
+# anyway, but small batches avoid the round-trip.
+
+
+def _conversation_client_key(msgs: list[dict], owner_addrs: set[str]) -> str:
+    """Primary client of a conversation: its most common external company domain.
+    Falls back to the dominant freemail address (keeps distinct people apart), then
+    to a stable per-thread bucket so ungrouped threads don't clump together."""
+    company: dict[str, int] = {}
+    person: dict[str, int] = {}
+    for m in msgs:
+        for a in _msg_external_addrs(m, owner_addrs):
+            person[a] = person.get(a, 0) + 1
+            dom = a.split("@", 1)[1] if "@" in a else ""
+            if dom and dom not in _FREE_EMAIL_DOMAINS:
+                company[dom] = company.get(dom, 0) + 1
+    if company:
+        return max(company.items(), key=lambda kv: (kv[1], kv[0]))[0]
+    if person:
+        return max(person.items(), key=lambda kv: (kv[1], kv[0]))[0]
+    cid = (msgs[0].get("conversationId") or msgs[0].get("id", "")) if msgs else ""
+    return f"~thread:{cid}"
+
+
+def _batch_by_client(
+    filtered: list[tuple[str, list[dict]]],
+    owner_addrs: set[str],
+) -> list[list[tuple[str, list[dict]]]]:
+    """Group conversations by client, then pack whole clients into batches without
+    splitting a client (unless one client alone exceeds the hard cap). Client order
+    follows `filtered` (recency), so recent clients batch first."""
+    groups: dict[str, list[tuple[str, list[dict]]]] = {}
+    order: list[str] = []
+    for cid, msgs in filtered:
+        key = _conversation_client_key(msgs, owner_addrs)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append((cid, msgs))
+
+    batches: list[list[tuple[str, list[dict]]]] = []
+    cur: list[tuple[str, list[dict]]] = []
+    for key in order:
+        convs = groups[key]
+        if len(convs) >= _CLIENT_BATCH_SIZE:
+            if cur:
+                batches.append(cur)
+                cur = []
+            for i in range(0, len(convs), _CLIENT_BATCH_CAP):
+                batches.append(convs[i:i + _CLIENT_BATCH_CAP])
+            continue
+        if cur and len(cur) + len(convs) > _CLIENT_BATCH_SIZE:
+            batches.append(cur)
+            cur = []
+        cur.extend(convs)
+    if cur:
+        batches.append(cur)
+    return batches
+
+
+def _extract_batches(
+    batches: list[list[tuple[str, list[dict]]]],
+    ai: AIClient,
+    display_name: str,
+    today_str: str,
+    log=None,
+) -> list[dict]:
+    """Run extraction over batches; on a FAILED call (None) split the batch in half and
+    retry, so a timeout never silently drops a whole client. Halving terminates at ≤3."""
+    raw: list[dict] = []
+    queue = [b for b in batches if b]
+    while queue:
+        batch = queue.pop(0)
+        res = _extract_projects_from_batch(batch, ai, display_name, today_str)
+        if res is None:
+            if len(batch) > 3:
+                mid = len(batch) // 2
+                queue.insert(0, batch[mid:])
+                queue.insert(0, batch[:mid])
+                if log:
+                    log(f"  batch of {len(batch)} failed — split into {mid}+{len(batch)-mid} and retrying")
+            elif log:
+                log(f"  batch of {len(batch)} failed after splitting — dropped (rare)")
+        else:
+            raw.extend(res)
+    return raw
 
 
 # ── Topic-aware fold control ────────────────────────────────────────────────
@@ -463,14 +563,12 @@ def build_projects(
     filtered = _filter_conversations(groups)
     log(f"After noise filtering: {len(filtered)} conversations (max {_MAX_CONVERSATIONS})")
 
-    # ── Phase 4: AI batch extraction ─────────────────────
-    all_projects_raw: list[dict] = []
-    batches = [filtered[i:i + _BATCH_SIZE] for i in range(0, len(filtered), _BATCH_SIZE)]
-    for i, batch in enumerate(batches, 1):
-        log(f"Extracting projects from batch {i}/{len(batches)} ({len(batch)} conversations)...")
-        extracted = _extract_projects_from_batch(batch, ai, display_name, today_str)
-        log(f"  → {len(extracted)} project(s) found")
-        all_projects_raw.extend(extracted)
+    # ── Phase 4: AI batch extraction (batched by client, not recency) ────
+    owner_addrs = _owner_addresses(data_dir, settings)
+    batches = _batch_by_client(filtered, owner_addrs)
+    log(f"Extracting projects from {len(batches)} client-grouped batch(es)...")
+    all_projects_raw = _extract_batches(batches, ai, display_name, today_str, log)
+    log(f"  → {len(all_projects_raw)} raw project(s) across all batches")
 
     # ── Phase 5: Deduplicate and merge ───────────────────
     projects_dict: dict = {}
@@ -603,10 +701,8 @@ def refresh_projects(
     filtered = _filter_conversations(_group_by_conversation(unclaimed))
     if filtered:
         log(f"Checking {len(filtered)} unclaimed conversation(s) for new projects...")
-        new_raw: list[dict] = []
-        for i in range(0, len(filtered), _BATCH_SIZE):
-            new_raw.extend(_extract_projects_from_batch(
-                filtered[i:i + _BATCH_SIZE], ai, display_name, today_str))
+        new_raw = _extract_batches(
+            _batch_by_client(filtered, owner_addrs), ai, display_name, today_str, log)
         truly_new: list[dict] = []
         _tiebreak_budget = [8]   # cap AI tiebreak calls per refresh (cost bound)
         for np in new_raw:
