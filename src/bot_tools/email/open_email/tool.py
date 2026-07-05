@@ -15,6 +15,33 @@ def build(ctx):
         if not eid:
             return ("Provide the email_id — the canonical id carried by a commitment, a reply_needed "
                     "item, a follow-up, or get_recent_emails.")
+        # "#N" / bare position → resolve through the list the user actually saw (deterministic,
+        # same pattern as commitments resolve_ref). Transcribing a 150-char Graph id is exactly
+        # the kind of long canonical value the model corrupts (live failure: 'open 1' → model
+        # copy-typed the id with repeated substrings → Graph 400). Positions can't be corrupted.
+        ref = eid.lstrip("#").strip()
+        if ref.isdigit():
+            try:
+                buckets = (getattr(ctx, "state", None) or {}).get("_shown_lists") or {}
+            except Exception:
+                buckets = {}
+            em = buckets.get("emails") or {}
+            shown = em.get("items") or []
+            newest_ts = max((b.get("ts") or 0) for b in buckets.values()) if buckets else 0
+            # Only positional-resolve when the EMAIL list is the freshest thing the user saw —
+            # "open 1" right after a commitments list must not open stale email #1.
+            if shown and (em.get("ts") or 0) >= newest_ts:
+                hit = next((it for it in shown if it.get("pos") == int(ref) and it.get("id")), None)
+                if hit:
+                    eid = hit["id"]
+                else:
+                    return (f"No email at position {ref} in the last shown email list "
+                            f"(it has {len(shown)} items). Ask the user which one they mean.")
+            elif not shown:
+                return ("No email list is currently shown — run search/get_recent_emails first, "
+                        "then open by its [#N] position.")
+            # else: a fresher non-email list is on screen — fall through so a commitment id /
+            # full email_id still works; a bare digit will fail Graph and return the honest error.
         # The model often passes a COMMITMENT's id (a short hash) instead of its email_id (a long
         # Graph id). If the value matches a commitment row, follow that pointer to the real email_id.
         try:

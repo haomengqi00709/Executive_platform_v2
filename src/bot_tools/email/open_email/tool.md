@@ -8,4 +8,6 @@ Do NOT use this to answer "where is this from", "what is it about", "who sent it
 subject, sender, and date are ALREADY on the commitment / reply_needed / follow-up item in front of
 you; answer those directly from that data, with no fetch. Returns subject, from, to, received, and the
 full body (the cached lists only carry a ~200-char preview).
-email_id: the email's canonical id; you may also pass a commitment's id (resolved to its source email).
+email_id: PREFER the [#N] position from the last shown email list — pass just "1" or "2"; the
+system resolves it to the exact email. NEVER re-type a long Graph id from context (you will corrupt
+it). A full email_id or a commitment's id (resolved to its source email) also works.
