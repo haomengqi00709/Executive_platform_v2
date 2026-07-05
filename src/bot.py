@@ -48,6 +48,50 @@ BUDGET_NUDGE_AT = 2        # rounds-remaining threshold to push the model to act
 MAX_CORRECTIONS = 2        # completion gate: how many times we re-drive an unfinished action
 HONEST_FALLBACK = "I looked into that but didn't finish — want me to try again?"
 
+# ── Failed-ask carryover ─────────────────────────────────────────────────────
+# A fallback turn is deliberately NOT saved to history (anti-poisoning), but HONEST_FALLBACK
+# invites "try again" — so the retry arrived with its referent erased, and the model bound
+# "try again" to the freshest thing in surviving history (a pushed Market Intel briefing →
+# it re-ran the section). The failed ask is carried in STATE instead: recorded on fallback,
+# injected into the next turn's prompt as a one-shot note, never written to history.
+_FAILED_ASK_TTL = 1800   # 30 min — an old failure must not hijack a much later "try again"
+_RETRY_PHRASES = ("try again", "retry", "再试", "重试", "again")
+
+
+def _retryish(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return len(t) < 30 and any(p in t for p in _RETRY_PHRASES)
+
+
+def _record_failed_ask(state: dict, text: str, prev_failed: dict | None) -> None:
+    """Called when a turn falls back (and is dropped from history). If THIS turn was already
+    a retry ("try again"), keep the ORIGINAL ask — storing the retry phrase would be useless."""
+    try:
+        ask = (prev_failed or {}).get("text") if (_retryish(text) and prev_failed) else text
+        if ask and ask.strip():
+            state["_last_failed_ask"] = {"text": ask.strip()[:300], "ts": time.time()}
+    except Exception:
+        pass
+
+
+def _failed_ask_note(state: dict) -> tuple[str, dict | None]:
+    """Pop the failed-ask marker (one-shot) and format its prompt note. Returns
+    (note_or_empty, the_popped_marker) — the marker is passed back to _record_failed_ask
+    so a failing retry chain keeps pointing at the original request."""
+    failed = None
+    try:
+        failed = (state or {}).pop("_last_failed_ask", None)
+    except Exception:
+        return "", None
+    if not failed or (time.time() - (failed.get("ts") or 0)) > _FAILED_ASK_TTL:
+        return "", None
+    return (
+        f"\n\n⚠️ PREVIOUS REQUEST FAILED (it is NOT in the chat history): «{failed.get('text','')}». "
+        f"If the user asks to retry ('try again', '再试一次', 'retry'), THAT is the request to retry — "
+        f"do NOT re-run a section/briefing or guess from older messages unless the failed request "
+        f"itself was that. If the user starts a new topic instead, ignore this note."
+    ), failed
+
 # Borrowed from Hermes (anti history-poisoning): a "fetch fresh / never answer from memory" contract.
 # The flat replayed history makes the model parrot a stale answer it gave earlier (e.g. a contact list
 # produced WITHOUT calling the lookup tool) instead of calling the tool again. This block forbids that.
@@ -476,6 +520,11 @@ def reply(
     current_views = _build_current_views(state)
 
     pending_note = ""
+    # One-shot note: the previous turn failed and was dropped from history — give "try again"
+    # its referent. _prev_failed is threaded to _record_failed_ask so a failing retry chain
+    # keeps pointing at the original request.
+    _failed_note, _prev_failed = _failed_ask_note(state)
+    pending_note += _failed_note
     pending_draft   = state.get("pending_draft")
     pending_expense = state.get("pending_expense")
     pending_queue   = state.get("pending_queue") or []
@@ -949,5 +998,7 @@ def reply(
         print("[Bot] turn NOT saved — answered from memory (record listing with no tool call) "
               f"finish={finish_mode}")
     else:
+        # Dropped from history — carry the ask in state so the user's "try again" has a referent.
+        _record_failed_ask(state, text, _prev_failed)
         print("[Bot] fallback turn — NOT saved to history (avoids empty-response feedback loop)")
     return final_text, state
