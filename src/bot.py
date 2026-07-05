@@ -811,6 +811,28 @@ def reply(
     # or we honestly tell them it is not done and what is needed. No hollow "Done", no dropped tail.
     final_text = _run_agent_rounds(MAX_ROUNDS)
 
+    # ── Fabricated-search guard (deterministic) ─────────────────────────────
+    # A search-shaped request ("find / search / 有没有…") answered with ZERO tool calls is an
+    # answer from memory/history, not a lookup — the "didn't find the file" fabrication while
+    # the file existed on OneDrive. Re-drive once demanding a real search; if the model still
+    # won't call a tool, fall back honestly rather than send a made-up verdict.
+    _SEARCH_ASKS = ("find ", "search", "look for", "look up", "do i have", "is there",
+                    "有没有", "找一下", "找找", "搜一", "搜索", "查一下", "帮我找", "帮我查")
+    _asked_search = any(w in (text or "").lower() for w in _SEARCH_ASKS)
+    if _asked_search and final_text and not tools_called and total_rounds < MAX_ROUNDS:
+        print("[Bot] fabricated-search guard — search-shaped ask answered with NO tool; re-driving")
+        contents.append(types.Content(role="user", parts=[types.Part(text=(
+            "[system] The user asked you to FIND/SEARCH something, but you called NO tool — your "
+            "answer came from memory/history and may be wrong. Call the `search` tool NOW (pick the "
+            "right `what`: emails/attachments/contacts/meetings/files — or another read tool that "
+            "fits) and answer ONLY from its result."))]))
+        finish_mode = "redrive"
+        new_text = _run_agent_rounds(max(1, MAX_ROUNDS - total_rounds))
+        if new_text and tools_called:
+            final_text = new_text
+        elif not tools_called:
+            final_text = ""   # → empty-path below sends HONEST_FALLBACK and skips history save
+
     verdict     = "done"
     corrections = 0
 

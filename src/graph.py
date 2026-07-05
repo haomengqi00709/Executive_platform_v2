@@ -236,6 +236,21 @@ class GraphClient:
                   f"{' …' if len(folders) > 6 else ''}")
         return self._inbox_folder_ids_cache
 
+    def search_messages(self, query: str, top: int = 25) -> list:
+        """Full-mailbox search via Exchange's search index ($search) — subject, body,
+        sender and attachment names all match, across ALL folders with no date window.
+        KQL is allowed in `query` (e.g. 'attachment:report.pdf', 'from:alice budget').
+        $search cannot be combined with $orderby/$filter; results are relevance-ranked."""
+        q = (query or "").strip().replace('"', '')
+        if not q:
+            return []
+        params = {
+            "$search": f'"{q}"',
+            "$top": min(max(int(top), 1), 25),
+            "$select": "id,subject,from,receivedDateTime,isRead,importance,hasAttachments,conversationId,bodyPreview,webLink",
+        }
+        return self.get("/me/messages", params).get("value", [])
+
     def get_messages(self, top: int = 10, filter: str = None, orderby: str = "receivedDateTime desc",
                      mailbox: str = None, folder: str = None,
                      include_subfolders: bool = True) -> list:
