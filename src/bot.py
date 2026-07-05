@@ -74,23 +74,29 @@ def _record_failed_ask(state: dict, text: str, prev_failed: dict | None) -> None
         pass
 
 
-def _failed_ask_note(state: dict) -> tuple[str, dict | None]:
-    """Pop the failed-ask marker (one-shot) and format its prompt note. Returns
-    (note_or_empty, the_popped_marker) — the marker is passed back to _record_failed_ask
-    so a failing retry chain keeps pointing at the original request."""
-    failed = None
+def _pop_failed_ask(state: dict) -> dict | None:
+    """Pop the failed-ask marker (one-shot, TTL-bounded). The caller substitutes the retry
+    text DETERMINISTICALLY — a prompt note asking the model to 'understand' the note lost to
+    history pull in testing (it re-answered an old topic, zero tools). Code decides, not flash."""
     try:
         failed = (state or {}).pop("_last_failed_ask", None)
     except Exception:
-        return "", None
+        return None
     if not failed or (time.time() - (failed.get("ts") or 0)) > _FAILED_ASK_TTL:
-        return "", None
-    return (
-        f"\n\n⚠️ PREVIOUS REQUEST FAILED (it is NOT in the chat history): «{failed.get('text','')}». "
-        f"If the user asks to retry ('try again', '再试一次', 'retry'), THAT is the request to retry — "
-        f"do NOT re-run a section/briefing or guess from older messages unless the failed request "
-        f"itself was that. If the user starts a new topic instead, ignore this note."
-    ), failed
+        return None
+    return failed
+
+
+def _effective_ask(text: str, prev_failed: dict | None) -> str:
+    """What the MODEL should treat as this turn's request. A retry phrase after a failed
+    (history-dropped) turn is rewritten to the original ask in code — the model never has to
+    resolve the dangling reference, so it can't bind it to stale history or a pushed section."""
+    if prev_failed and _retryish(text):
+        return (f"{prev_failed.get('text', '')}\n"
+                f"[The user said \"{(text or '').strip()}\" — RETRY the request above. The previous "
+                f"attempt failed and is not shown in the history. Complete it now with tools; do not "
+                f"re-run a section/briefing unless the request itself asks for that.]")
+    return text
 
 # Borrowed from Hermes (anti history-poisoning): a "fetch fresh / never answer from memory" contract.
 # The flat replayed history makes the model parrot a stale answer it gave earlier (e.g. a contact list
@@ -520,11 +526,11 @@ def reply(
     current_views = _build_current_views(state)
 
     pending_note = ""
-    # One-shot note: the previous turn failed and was dropped from history — give "try again"
-    # its referent. _prev_failed is threaded to _record_failed_ask so a failing retry chain
-    # keeps pointing at the original request.
-    _failed_note, _prev_failed = _failed_ask_note(state)
-    pending_note += _failed_note
+    # One-shot failed-ask carryover: the previous turn failed and was dropped from history
+    # (anti-poisoning), so a bare "try again" would dangle. _effective_ask rewrites it to the
+    # original request in CODE; _prev_failed is threaded to _record_failed_ask so a failing
+    # retry chain keeps pointing at the original request.
+    _prev_failed = _pop_failed_ask(state)
     pending_draft   = state.get("pending_draft")
     pending_expense = state.get("pending_expense")
     pending_queue   = state.get("pending_queue") or []
@@ -723,7 +729,10 @@ def reply(
 
     # ── Gemini function calling loop ───────────────────────
     client   = _client()
-    contents = list(history) + [types.Content(role="user", parts=[types.Part(text=text)])]
+    # The model sees the EFFECTIVE ask ("try again" → the failed original, resolved in code);
+    # history keeps the user's literal words (_save_turn below uses `text`).
+    effective_text = _effective_ask(text, _prev_failed)
+    contents = list(history) + [types.Content(role="user", parts=[types.Part(text=effective_text)])]
     fn_map   = {f.__name__: f for f in all_tools}
     _action_set = set(ACTION_TOOLS) | _reg_actions   # inline frozenset + migrated tools
 
@@ -803,7 +812,7 @@ def reply(
             "You are a completion checker for an executive assistant bot. Decide whether the bot "
             "ACTUALLY did what the user asked THIS turn. Trust the ground-truth facts below, NOT what "
             "the draft reply claims.\n\n"
-            f"User's request: {text}\n\n"
+            f"User's request: {effective_text}\n\n"
             f"Tools the bot called this turn: {tools_called or 'none'}\n"
             f"ACTION tools that SUCCEEDED: {succeeded or 'none'}\n"
             f"Draft reply the bot wants to send: {(candidate_reply or '')[:600]}\n\n"
@@ -867,7 +876,7 @@ def reply(
     # won't call a tool, fall back honestly rather than send a made-up verdict.
     _SEARCH_ASKS = ("find ", "search", "look for", "look up", "do i have", "is there",
                     "有没有", "找一下", "找找", "搜一", "搜索", "查一下", "帮我找", "帮我查")
-    _asked_search = any(w in (text or "").lower() for w in _SEARCH_ASKS)
+    _asked_search = any(w in (effective_text or "").lower() for w in _SEARCH_ASKS)
     if _asked_search and final_text and not tools_called and total_rounds < MAX_ROUNDS:
         print("[Bot] fabricated-search guard — search-shaped ask answered with NO tool; re-driving")
         contents.append(types.Content(role="user", parts=[types.Part(text=(
