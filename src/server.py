@@ -4751,6 +4751,22 @@ async def db_cleanup_reject(request: Request, session: dict = Depends(require_se
     return reject_candidates(_udir(uid), [str(i) for i in ids])
 
 
+@app.post("/api/db-cleanup/unsplit-project")
+async def db_cleanup_unsplit_project(request: Request, session: dict = Depends(require_session)):
+    """Revert an approved split: restore the kept row's pre-split state, delete the resurrected row."""
+    from src.modules.db_cleaner import unsplit_project
+    uid  = session["user_id"]
+    body = await request.json()
+    keep_id     = str(body.get("keep_id") or "").strip()
+    restored_id = str(body.get("restored_id") or "").strip()
+    if not keep_id or not restored_id:
+        raise HTTPException(400, "keep_id and restored_id are required")
+    result = unsplit_project(_udir(uid), keep_id, restored_id)
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "unsplit failed"))
+    return result
+
+
 @app.post("/api/db-cleanup/merge-projects-direct")
 async def db_cleanup_merge_projects_direct(request: Request, session: dict = Depends(require_session)):
     """Manual merge: user picks both projects, no AI candidate required."""

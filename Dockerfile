@@ -14,7 +14,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 # cache-bust: Railway kept redeploying a stale image (same digest) instead of rebuilding the
 # source layer. Bump this token to force a real rebuild that picks up the latest src/.
-RUN echo "cachebust 2026-07-05-failed-ask-deterministic-rewrite"
+RUN echo "cachebust 2026-07-05-project-split-review"
 COPY . .
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 EXPOSE 8080

@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { RefreshCw, CheckCircle2, X, Loader2, AlertCircle, ChevronDown, ChevronRight } from 'lucide-react';
 
 type Confidence = 'high' | 'medium' | 'low';
-type CandidateType = 'project_duplicate' | 'contact_duplicate' | 'stale_project' | 'stale_contact';
+type CandidateType = 'project_duplicate' | 'contact_duplicate' | 'stale_project' | 'stale_contact' | 'project_split';
 
 interface Preview {
   id?: string; email?: string;
@@ -23,6 +23,7 @@ interface Candidate {
   type: CandidateType;
   primary: Preview;
   duplicate: Preview | null;
+  restore?: Preview[];          // project_split: the two pre-merge snapshots to restore
   confidence: Confidence;
   reasoning: string;
   discovered_at: string;
@@ -161,6 +162,7 @@ export default function CleanupTab() {
     medium: cands.filter(c => (c.type === 'project_duplicate' || c.type === 'contact_duplicate') && c.confidence === 'medium'),
     low:    cands.filter(c => (c.type === 'project_duplicate' || c.type === 'contact_duplicate') && c.confidence === 'low'),
     stale:  cands.filter(c => c.type === 'stale_project' || c.type === 'stale_contact'),
+    splits: cands.filter(c => c.type === 'project_split'),
   };
 
   const lastScan = data?.last_scan?.timestamp
@@ -254,6 +256,15 @@ export default function CleanupTab() {
         onItemToggle={toggle}
       />
       <Group
+        title="Wrongly merged — split back into separate projects"
+        confidence={null}
+        items={grouped.splits}
+        expanded={expanded.has('splits')}
+        onToggle={() => toggleGroup('splits')}
+        selected={selected}
+        onItemToggle={toggle}
+      />
+      <Group
         title="Stale records (auto-archivable)"
         confidence={null}
         items={grouped.stale}
@@ -309,6 +320,7 @@ function Group({
 
 function CandidateRow({ candidate, checked, onToggle }: { candidate: Candidate; checked: boolean; onToggle: () => void }) {
   const isStale = candidate.type === 'stale_project' || candidate.type === 'stale_contact';
+  const isSplit = candidate.type === 'project_split';
   return (
     <label className="flex items-start gap-3 px-4 py-3 cursor-pointer hover:bg-executive-border/20 transition">
       <input
@@ -318,7 +330,17 @@ function CandidateRow({ candidate, checked, onToggle }: { candidate: Candidate; 
         className="mt-1 w-4 h-4 rounded border-executive-border text-executive-accent focus:ring-executive-accent"
       />
       <div className="flex-1 min-w-0 space-y-2">
-        {!isStale ? (
+        {isSplit ? (
+          <>
+            <PreviewCard label="Currently one project" preview={candidate.primary} />
+            <div className="grid grid-cols-2 gap-3">
+              {(candidate.restore || []).map((p, i) => (
+                <PreviewCard key={p.id || i} label={`Split back into #${i + 1}`} preview={p} />
+              ))}
+            </div>
+            <p className="text-xs text-executive-muted italic">→ {candidate.reasoning} (reversible)</p>
+          </>
+        ) : !isStale ? (
           <>
             <div className="grid grid-cols-2 gap-3">
               <PreviewCard label="Keep" preview={candidate.primary} />

@@ -77,6 +77,16 @@ def _append_merge_log(data_dir: Path, entry: dict) -> None:
     _write_json(_merge_log_path(data_dir), log)
 
 
+def _split_log_path(data_dir: Path) -> Path:
+    return _cleanup_dir(data_dir) / "split_log.json"
+
+
+def _append_split_log(data_dir: Path, entry: dict) -> None:
+    log = _read_json(_split_log_path(data_dir), [])
+    log.append({**entry, "logged_at": _now_iso()})
+    _write_json(_split_log_path(data_dir), log)
+
+
 # ── Duplicate detection: PROJECTS ──────────────────────────
 
 def _project_signature(p: dict) -> str:
@@ -166,10 +176,18 @@ def find_duplicate_projects(data_dir: Path, ai: AIClient, progress=None,
         owner_addrs = set()
 
     # Stage 1: build candidate pairs from heuristics
+    try:
+        from src.modules.projects import _are_marked_distinct
+    except Exception:
+        _are_marked_distinct = lambda a, b: False
     pairs: list[tuple[dict, dict, dict]] = []
     seen_pair_keys: set = set()
     for i, a in enumerate(projects):
         for b in projects[i + 1:]:
+            # A user-approved split marks both rows distinct_from each other — never propose
+            # re-merging a pair the user explicitly tore apart.
+            if _are_marked_distinct(a, b):
+                continue
             features = _project_pair_features(a, b, owner_addrs)
             sig_a = _project_signature(a)
             sig_b = _project_signature(b)
@@ -521,6 +539,141 @@ def merge_projects(data_dir: Path, keep_id: str, merge_id: str) -> dict:
     return {"ok": True, "keep_id": keep_id, "removed_id": merge_id}
 
 
+# ── Split detection + execution: undo wrong merges from the ledger ──────────
+# The old weekly auto-merge (same_entity rule) silently fused DISTINCT projects of the same
+# company (张冠李戴). Every merge left a ledger entry with full before-snapshots, so detection
+# is deterministic: re-judge each logged merge with TODAY's eligibility features — a pair with
+# 0 shared external participants AND 0 shared topics would not even be a candidate now. The
+# snapshots double as the exact split plan: zero AI, zero email refetch.
+
+def find_wrongly_merged_projects(data_dir: Path, progress=None) -> list[dict]:
+    """Split candidates from the merge ledger (review-only; nothing is applied here)."""
+    data_dir = Path(data_dir)
+    entries = [e for e in _read_json(_merge_log_path(data_dir), [])
+               if e.get("op") == "merge_projects" and e.get("before")]
+    if not entries:
+        return []
+    from src.modules import projects_store
+    projects = projects_store.load_projects(data_dir).get("projects", {})
+    try:
+        from src.modules.projects import _owner_addresses
+        owner_addrs = _owner_addresses(data_dir, _read_json(data_dir / "settings.json", {}))
+    except Exception:
+        owner_addrs = set()
+
+    out: list[dict] = []
+    seen: set = set()
+    for e in reversed(entries):          # newest entry per pair wins
+        keep_id, merge_id = e.get("keep_id"), e.get("merge_id")
+        key = (keep_id, merge_id)
+        if not keep_id or not merge_id or key in seen:
+            continue
+        seen.add(key)
+        cur = projects.get(keep_id)
+        if cur is None or merge_id in projects:      # merged row gone / already restored
+            continue
+        if cur.get("ignore") or cur.get("archived"):
+            continue
+        bk = e["before"].get("keep") or {}
+        bm = e["before"].get("merge") or {}
+        f = _project_pair_features(bk, bm, owner_addrs)
+        if f["participant_overlap"] == 0 and f["topic_overlap"] == 0:
+            out.append({
+                "id":         _cand_id("split", keep_id, merge_id),
+                "type":       "project_split",
+                "primary":    _project_preview(cur),
+                "restore":    [_project_preview(bk), _project_preview(bm)],
+                "confidence": "high",
+                "reasoning":  (f"Merged on {(e.get('logged_at') or '')[:10]} with 0 shared external "
+                               f"participants and 0 shared topics — under today's rules this pair "
+                               f"would not even be a merge candidate; likely two distinct projects."),
+                "discovered_at": _now_iso(),
+                "merge_ref":  {"keep_id": keep_id, "merge_id": merge_id,
+                               "logged_at": e.get("logged_at")},
+            })
+    if progress:
+        progress(f"Merge-ledger review: {len(out)} likely-wrong merge(s) → split candidates")
+    return out
+
+
+def split_project(data_dir: Path, keep_id: str, merge_id: str) -> dict:
+    """Undo a LOGGED merge: resurrect the removed project from its before-snapshot and subtract
+    from the kept row exactly what that merge contributed — later merges and user edits on the
+    kept row survive (chained merges each undo only their own contribution). Both rows get
+    distinct_from marks so the fold gate and dedup never re-fuse them. Mirror-logged to
+    split_log.json; unsplit_project reverts."""
+    from src.modules import projects_store
+    data_dir = Path(data_dir)
+    matches = [e for e in _read_json(_merge_log_path(data_dir), [])
+               if e.get("op") == "merge_projects" and e.get("keep_id") == keep_id
+               and e.get("merge_id") == merge_id and e.get("before")]
+    if not matches:
+        return {"ok": False, "error": "No logged merge found for this pair"}
+    entry = matches[-1]
+    before_keep  = entry["before"].get("keep") or {}
+    before_merge = entry["before"].get("merge") or {}
+
+    projects = projects_store.load_projects(data_dir).get("projects", {})
+    cur = projects.get(keep_id)
+    if cur is None:
+        return {"ok": False, "error": f"Project {keep_id} no longer exists"}
+    if merge_id in projects:
+        return {"ok": False, "error": f"Project {merge_id} already exists — nothing to restore"}
+
+    pre_split_keep = dict(cur)   # exact revert point for unsplit_project
+
+    # Subtract only what the merge ADDED (present on the removed side, absent on the kept side
+    # pre-merge). Set-based: anything the user already removed by hand is a no-op.
+    keep_convs  = set(before_keep.get("conversation_ids") or [])
+    keep_parts  = {p.lower() for p in (before_keep.get("participants") or [])}
+    keep_topics = {t.lower() for t in (before_keep.get("key_topics") or [])}
+    added_convs  = {c for c in (before_merge.get("conversation_ids") or []) if c not in keep_convs}
+    added_parts  = {p.lower() for p in (before_merge.get("participants") or [])} - keep_parts
+    added_topics = {t.lower() for t in (before_merge.get("key_topics") or [])} - keep_topics
+
+    cur["conversation_ids"] = [c for c in (cur.get("conversation_ids") or []) if c not in added_convs]
+    cur["participants"]     = [p for p in (cur.get("participants") or []) if p.lower() not in added_parts]
+    cur["key_topics"]       = [t for t in (cur.get("key_topics") or []) if t.lower() not in added_topics]
+    cur["thread_count"]     = max(0, (cur.get("thread_count") or 0) - (before_merge.get("thread_count") or 0))
+    cur["updated_at"]       = datetime.now().strftime("%Y-%m-%d")
+
+    restored = dict(before_merge)
+    # Anti-resurrection marks — honored by the refresh fold gate (projects._are_marked_distinct)
+    # and by dedup eligibility here, so the next scan/refresh can't silently re-fuse the pair.
+    cur.setdefault("distinct_from", [])
+    if merge_id not in cur["distinct_from"]:
+        cur["distinct_from"].append(merge_id)
+    restored.setdefault("distinct_from", [])
+    if keep_id not in restored["distinct_from"]:
+        restored["distinct_from"].append(keep_id)
+
+    projects_store.replace_from_dict(data_dir, {"projects": {keep_id: cur, merge_id: restored}})
+    _append_split_log(data_dir, {
+        "op": "split_project", "keep_id": keep_id, "restored_id": merge_id,
+        "pre_split_keep": pre_split_keep, "restored": restored,
+        "source_merge_logged_at": entry.get("logged_at"),
+    })
+    return {"ok": True, "keep_id": keep_id, "restored_id": merge_id}
+
+
+def unsplit_project(data_dir: Path, keep_id: str, restored_id: str) -> dict:
+    """Revert a split: put the kept row back to its exact pre-split state and delete the
+    resurrected row (its distinct_from mark dies with it)."""
+    from src.modules import projects_store
+    data_dir = Path(data_dir)
+    matches = [e for e in _read_json(_split_log_path(data_dir), [])
+               if e.get("op") == "split_project" and e.get("keep_id") == keep_id
+               and e.get("restored_id") == restored_id]
+    if not matches:
+        return {"ok": False, "error": "No logged split found for this pair"}
+    entry = matches[-1]
+    projects_store.replace_from_dict(data_dir, {"projects": {keep_id: entry["pre_split_keep"]}})
+    projects_store.delete_project(data_dir, restored_id)
+    _append_split_log(data_dir, {"op": "unsplit_project", "keep_id": keep_id,
+                                 "restored_id": restored_id})
+    return {"ok": True, "keep_id": keep_id, "removed_id": restored_id}
+
+
 # Priority is a scalar STATE, not a list — when two duplicates disagree the stronger one wins
 # (you can't keep "two priorities"). Everything below "high/medium/low" ranks 0 so an unset side
 # never overrides a set one.
@@ -722,8 +875,10 @@ def run_full_scan(data_dir: Path, ai: AIClient, progress=None) -> dict:
     contact_cands = find_duplicate_contacts(data_dir, ai, progress=log)
     log("Scanning for stale records...")
     stale_cands = find_stale_records(data_dir)
+    log("Reviewing merge ledger for wrongly-merged projects...")
+    split_cands = find_wrongly_merged_projects(data_dir, progress=log)
 
-    all_candidates = project_cands + contact_cands + stale_cands
+    all_candidates = project_cands + contact_cands + stale_cands + split_cands
 
     # Preserve previously-dismissed candidates so we don't re-surface them
     previous = load_pending(data_dir)
@@ -737,6 +892,7 @@ def run_full_scan(data_dir: Path, ai: AIClient, progress=None) -> dict:
         "medium": sum(1 for c in all_candidates if c["confidence"] == "medium" and c["type"] in ("project_duplicate", "contact_duplicate")),
         "low":    sum(1 for c in all_candidates if c["confidence"] == "low"    and c["type"] in ("project_duplicate", "contact_duplicate")),
         "stale":  sum(1 for c in all_candidates if c["type"] in ("stale_project", "stale_contact")),
+        "splits": sum(1 for c in all_candidates if c["type"] == "project_split"),
         "total":  len(all_candidates),
     }
     _write_json(_last_scan_path(data_dir), {
@@ -753,13 +909,20 @@ def approve_candidates(data_dir: Path, candidate_ids: list[str]) -> dict:
     pending = load_pending(data_dir)
     by_id = {c["id"]: c for c in pending}
 
-    counts = {"merged_projects": 0, "merged_contacts": 0, "archived": 0, "errors": []}
+    counts = {"merged_projects": 0, "merged_contacts": 0, "archived": 0, "split_projects": 0, "errors": []}
     for cid in candidate_ids:
         c = by_id.get(cid)
         if not c:
             counts["errors"].append(f"Candidate {cid} not found")
             continue
-        if c["type"] == "project_duplicate":
+        if c["type"] == "project_split":
+            ref = c.get("merge_ref") or {}
+            r = split_project(data_dir, ref.get("keep_id", ""), ref.get("merge_id", ""))
+            if r.get("ok"):
+                counts["split_projects"] += 1
+            else:
+                counts["errors"].append(f"{cid}: {r.get('error')}")
+        elif c["type"] == "project_duplicate":
             r = merge_projects(data_dir, c["primary"]["id"], c["duplicate"]["id"])
             if r.get("ok"):
                 counts["merged_projects"] += 1
