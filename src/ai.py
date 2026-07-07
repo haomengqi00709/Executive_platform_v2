@@ -14,7 +14,8 @@ from dotenv import load_dotenv
 # (scripts.measure_tokens with a local_test_key) to the PRODUCTION key/project. Preserve
 # any of these that were already set in the environment, restoring them after the load.
 _PRESERVE_ENV = {k: os.environ[k]
-                 for k in ("GEMINI_API_KEY", "GEMINI_MODEL", "GEMINI_SEARCH_TIMEOUT_SECS", "DATA_DIR")
+                 for k in ("GEMINI_API_KEY", "GEMINI_MODEL", "GEMINI_SEARCH_TIMEOUT_SECS", "DATA_DIR",
+                           "FALLBACK_API_KEY", "FALLBACK_MODEL", "FALLBACK_BASE_URL")
                  if k in os.environ}
 load_dotenv(override=True)
 os.environ.update(_PRESERVE_ENV)

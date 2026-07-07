@@ -14,6 +14,7 @@ from pathlib import Path
 
 from google import genai
 from google.genai import types
+from src import bot_fallback
 
 from src.ai import DEFAULT_GEMINI_MODEL
 from src.modules.db_helpers import open_sqlite
@@ -751,6 +752,10 @@ def reply(
     action_results = {}          # action tool name -> succeeded at least once this turn
     finish_mode    = "normal"    # normal | redrive | needs_user | exhausted | fallback
     total_rounds   = 0
+    # Turn-scoped: once the primary (Gemini) keeps failing this turn and a fallback model is
+    # configured, we switch to it for the REST of the turn (incl. re-drives). Fresh per reply()
+    # → the fallback never persists across turns (Hermes turn-scoped restore, for free).
+    _use_fallback  = [False]
 
     def _run_agent_rounds(max_rounds: int) -> str:
         """Run the function-calling loop until the model returns a text answer (no tool call)
@@ -760,16 +765,25 @@ def reply(
 
         def _generate_once():
             """One model call → (parts, finish_reason, prompt_feedback). Reads the current
-            `contents` (mutated by the nudge below between attempts)."""
-            response = client.models.generate_content(
-                model   = MODEL,
-                contents= contents,
-                config  = types.GenerateContentConfig(
-                    system_instruction = system,
-                    tools              = all_tools,
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                ),
-            )
+            `contents` (mutated by the nudge below between attempts). Once _use_fallback is set,
+            routes to the OpenAI-compatible fallback model instead of Gemini."""
+            if _use_fallback[0] and bot_fallback.is_enabled():
+                return bot_fallback.generate(contents, system, all_tools)
+            try:
+                response = client.models.generate_content(
+                    model   = MODEL,
+                    contents= contents,
+                    config  = types.GenerateContentConfig(
+                        system_instruction = system,
+                        tools              = all_tools,
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                    ),
+                )
+            except Exception as e:
+                # 429 / timeout / provider outage — treat as empty so the same empty→fallback
+                # path engages (this is exactly the Gemini-key-capped case from the June incident).
+                print(f"[Bot] primary generate error: {e}")
+                return [], "ERROR", None
             _record_bot_usage(response, "bot")
             cand  = response.candidates[0] if response.candidates else None
             parts = (cand.content.parts if cand and cand.content else None) or []
@@ -792,6 +806,12 @@ def reply(
                       f"— nudge+retry {_n}/{_MAX_EMPTY_RETRY}")
                 contents.append(types.Content(role="model", parts=[types.Part(text="(no response)")]))
                 contents.append(types.Content(role="user",  parts=[types.Part(text=_EMPTY_NUDGE)]))
+                parts, fr, pf = _generate_once()
+            # Nudge exhausted and still nothing (or the primary errored). If a fallback model is
+            # configured, hand this turn to it — it drives the SAME tools for the rest of the turn.
+            if not parts and not _use_fallback[0] and bot_fallback.is_enabled():
+                print(f"[Bot] primary exhausted (finish_reason={fr}) — switching to fallback model")
+                _use_fallback[0] = True
                 parts, fr, pf = _generate_once()
             fn_calls   = [p for p in parts if p.function_call]
             text_parts = [p.text for p in parts if p.text]
