@@ -48,6 +48,16 @@ BUDGET_NUDGE_AT = 2        # rounds-remaining threshold to push the model to act
 MAX_CORRECTIONS = 2        # completion gate: how many times we re-drive an unfinished action
 HONEST_FALLBACK = "I looked into that but didn't finish — want me to try again?"
 
+# Empty-response recovery (Hermes rung 1). Gemini flash returns an empty candidate
+# (finish_reason=STOP, 0 parts, out=0) for certain inputs — and a byte-identical retry is
+# deterministically empty again (repro on Daniel's context: "Try again" → 3/3 empty). So on
+# empty we NUDGE: append a synthetic exchange to `contents` and retry, changing the payload so
+# the model isn't asked the identical question. Ephemeral — `contents` is never persisted to
+# history (_save_turn writes only text+final_text), so this can't poison the chat log.
+_MAX_EMPTY_RETRY = 3
+_EMPTY_NUDGE = ("[system] Your previous reply came back empty. Answer the user's request NOW — "
+                "call a tool if you need data, or reply in plain text. Never return an empty message.")
+
 # ── Failed-ask carryover ─────────────────────────────────────────────────────
 # A fallback turn is deliberately NOT saved to history (anti-poisoning), but HONEST_FALLBACK
 # invites "try again" — so the retry arrived with its referent erased, and the model bound
@@ -747,28 +757,42 @@ def reply(
         or the round budget runs out. Mutates tools_called / action_results / contents in place.
         Returns the model's final text ('' if it never produced one)."""
         nonlocal total_rounds
+
+        def _generate_once():
+            """One model call → (parts, finish_reason, prompt_feedback). Reads the current
+            `contents` (mutated by the nudge below between attempts)."""
+            response = client.models.generate_content(
+                model   = MODEL,
+                contents= contents,
+                config  = types.GenerateContentConfig(
+                    system_instruction = system,
+                    tools              = all_tools,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                ),
+            )
+            _record_bot_usage(response, "bot")
+            cand  = response.candidates[0] if response.candidates else None
+            parts = (cand.content.parts if cand and cand.content else None) or []
+            fr    = getattr(cand, "finish_reason", None) if cand else "NO_CANDIDATE"
+            pf    = getattr(response, "prompt_feedback", None)
+            return parts, fr, pf
+
         for _j in range(max_rounds):
             total_rounds += 1
-            # Gemini intermittently returns an empty candidate (out=0, no parts) under load.
-            # Retry a few times before treating it as 'no output', so a transient blank doesn't
-            # surface to the user as a hollow "I looked into that but didn't finish" fallback.
-            parts = []
-            for _attempt in range(3):
-                response = client.models.generate_content(
-                    model   = MODEL,
-                    contents= contents,
-                    config  = types.GenerateContentConfig(
-                        system_instruction = system,
-                        tools              = all_tools,
-                        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                    ),
-                )
-                _record_bot_usage(response, "bot")
-                candidate = response.candidates[0] if response.candidates else None
-                parts     = (candidate.content.parts if candidate and candidate.content else None) or []
-                if parts:
-                    break
-                print(f"[Bot] empty model response (attempt {_attempt + 1}/3) — retrying")
+            # Gemini returns an empty candidate (finish_reason=STOP, 0 parts, out=0) for certain
+            # inputs. A byte-identical retry stays empty — so instead of re-sending the same
+            # payload, NUDGE: append a synthetic exchange to `contents` so the model isn't asked
+            # the identical question, then retry. (Same in-turn append pattern as the
+            # fabricated-search guard / completion re-drive; never persisted to history.)
+            parts, fr, pf = _generate_once()
+            _n = 0
+            while not parts and _n < _MAX_EMPTY_RETRY:
+                _n += 1
+                print(f"[Bot] empty model response finish_reason={fr} prompt_feedback={pf} "
+                      f"— nudge+retry {_n}/{_MAX_EMPTY_RETRY}")
+                contents.append(types.Content(role="model", parts=[types.Part(text="(no response)")]))
+                contents.append(types.Content(role="user",  parts=[types.Part(text=_EMPTY_NUDGE)]))
+                parts, fr, pf = _generate_once()
             fn_calls   = [p for p in parts if p.function_call]
             text_parts = [p.text for p in parts if p.text]
             if not fn_calls:
