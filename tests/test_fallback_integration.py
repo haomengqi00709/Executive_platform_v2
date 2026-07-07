@@ -112,6 +112,24 @@ def test_both_fail_lands_honest_fallback(tmp_path, monkeypatch):
     assert fb_calls["n"] >= 1
 
 
+def test_slash_fallback_forces_fallback_from_first_call(tmp_path, monkeypatch):
+    # "/fallback …" routes the whole turn to the fallback even though the primary would succeed
+    out, primary, fb_calls, _ = _run(
+        [_text("primary would answer")],
+        lambda n, c, t: ([types.Part(text="answered by fallback")], "stop", None),
+        tmp_path, monkeypatch, user_text="/fallback what can you do")
+    assert "answered by fallback" in out and "🔁 [fallback:" in out
+    assert fb_calls["n"] == 1 and primary.calls == 0     # primary never called; fallback from the start
+
+
+def test_slash_fallback_when_disabled_explains(tmp_path, monkeypatch):
+    out, primary, fb_calls, _ = _run(
+        [_text("x")], lambda n, c, t: ([types.Part(text="x")], "stop", None),
+        tmp_path, monkeypatch, user_text="/fallback hi", enabled=False)
+    assert "not configured" in out.lower()
+    assert fb_calls["n"] == 0 and primary.calls == 0
+
+
 def test_disabled_fallback_is_never_called(tmp_path, monkeypatch):
     out, primary, fb_calls, _ = _run(
         [_empty()],

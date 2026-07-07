@@ -495,6 +495,18 @@ def reply(
     history    = _load_history(db_path)
     user_model = _load_user_model(user_model_path)
 
+    # "/fallback <msg>" — force this ONE turn straight onto the configured fallback model
+    # (Gemini works normally in prod, so this is the only way to exercise/health-check the
+    # fallback from Teams). Harmless: a normal user never types it; it only routes their own
+    # query to the fallback provider. Stripped from the model input and from saved history.
+    _force_fb = False
+    _t0 = (text or "").strip()
+    if _t0.lower().startswith("/fallback"):
+        if not bot_fallback.is_enabled():
+            return "⚠️ Fallback is not configured (set FALLBACK_API_KEY / FALLBACK_MODEL).", state
+        _force_fb = True
+        text = _t0[len("/fallback"):].strip() or "hi"
+
     # Migrated tools live in src/bot_tools/<domain>/<tool>/ and bind to a context
     # sharing this turn's mutable `state`. Tools still defined inline below are merged
     # with these in `all_tools`; their routing lines are appended to TOOL ROUTING.
@@ -755,7 +767,8 @@ def reply(
     # Turn-scoped: once the primary (Gemini) keeps failing this turn and a fallback model is
     # configured, we switch to it for the REST of the turn (incl. re-drives). Fresh per reply()
     # → the fallback never persists across turns (Hermes turn-scoped restore, for free).
-    _use_fallback  = [False]
+    # `/fallback …` forces it on from the first call.
+    _use_fallback  = [bool(_force_fb)]
 
     def _run_agent_rounds(max_rounds: int) -> str:
         """Run the function-calling loop until the model returns a text answer (no tool call)
@@ -1054,4 +1067,7 @@ def reply(
         # Dropped from history — carry the ask in state so the user's "try again" has a referent.
         _record_failed_ask(state, text, _prev_failed)
         print("[Bot] fallback turn — NOT saved to history (avoids empty-response feedback loop)")
+
+    if _force_fb:  # make the /fallback test unambiguous in Teams
+        final_text = f"🔁 [fallback: {bot_fallback._model()}]\n\n{final_text}"
     return final_text, state
