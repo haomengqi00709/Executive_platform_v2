@@ -1,6 +1,61 @@
 import json
+from datetime import datetime, timezone, timedelta
 
 IS_ACTION = False
+
+# Read-time freshness. Sections bake status:"fresh" at WRITE time and never revisit it, so a
+# cached results file is served as "fresh" forever (a 3-day-old meetings_today shown as today —
+# the recurring bug). read_module_result recomputes status from `last_run` (present on every
+# section) here. Conservative windows: normally-scheduled data read the same day stays fresh;
+# only clearly-old data is flagged stale. meetings_today is fetched LIVE (never reaches this).
+_FRESH_WINDOW = {
+    "market_intelligence":  timedelta(days=8),   # weekly
+    "company_intelligence": timedelta(days=8),
+    "business_insights":    timedelta(days=8),
+    "relationship_health":  timedelta(days=8),
+}
+_DEFAULT_FRESH = timedelta(hours=48)
+
+
+def _as_of(data: dict) -> str:
+    return data.get("date") or (data.get("last_run") or "")[:10]
+
+
+def _is_stale(data_dir, section_id: str, data: dict) -> bool:
+    # Date-anchored sections must match the expected local date, regardless of age.
+    if section_id == "yesterday_recap":
+        try:
+            from src.modules.tz import now_local
+            y = (now_local(data_dir) - timedelta(days=1)).strftime("%Y-%m-%d")
+            return (data.get("date") or "") != y
+        except Exception:
+            return False
+    lr = data.get("last_run")
+    if not lr:
+        return False   # unknown age → don't cry wolf
+    try:
+        ts = datetime.fromisoformat(str(lr).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+    except Exception:
+        return False
+    return (datetime.now(timezone.utc) - ts) > _FRESH_WINDOW.get(section_id, _DEFAULT_FRESH)
+
+
+def _load_cached_with_freshness(data_dir, section_id: str) -> dict | None:
+    """Load results/{section_id}.json, then RECOMPUTE status from last_run/date so a stale cache
+    is never served as 'fresh'. Returns None if the section has never run."""
+    result_path = data_dir / "results" / f"{section_id}.json"
+    if not result_path.exists():
+        return None
+    data = json.loads(result_path.read_text())
+    try:
+        if _is_stale(data_dir, section_id, data):
+            data["status"] = "stale"
+            data["as_of"] = _as_of(data)
+    except Exception:
+        pass
+    return data
 
 
 def build(ctx):
@@ -65,11 +120,26 @@ def build(ctx):
                 } for p in raw]
                 data = {"id": section_id, "status": "fresh", "items": items,
                         "count": len(items), "empty": not items}
+            elif section_id == "meetings_today":
+                # LIVE calendar fetch, AI-free — never the cached results/meetings_today.json.
+                # A calendar-day snapshot goes stale in ONE day; the cache showing "fresh" is the
+                # exact bug (a 3-day-old snapshot presented as today's meetings). owner_graph missing
+                # or a Graph error → fall through to the cached read, where the date check flags it stale.
+                from src.modules.tz import today_local_str
+                _owner_graph = getattr(ctx, "owner_graph", None)
+                if _owner_graph is not None:
+                    from src.sections import meetings_today
+                    items = meetings_today.live_items(_owner_graph, ctx.data_dir)
+                    data = {"id": section_id, "status": "fresh", "date": today_local_str(ctx.data_dir),
+                            "items": items, "count": len(items), "empty": not items}
+                else:
+                    data = _load_cached_with_freshness(ctx.data_dir, section_id)
+                    if data is None:
+                        return f"No results for '{section_id}' yet. Run the section first with run_skill()."
             else:
-                result_path = ctx.data_dir / "results" / f"{section_id}.json"
-                if not result_path.exists():
+                data = _load_cached_with_freshness(ctx.data_dir, section_id)
+                if data is None:
                     return f"No results for '{section_id}' yet. Run the section first with run_skill()."
-                data = json.loads(result_path.read_text())
                 # Read-time handled overlay: an email the user already acted on (recorded live in
                 # the store) drops off IMMEDIATELY here — no re-run of the slow/costly Graph+AI
                 # section. The list stays the cached snapshot; only the cheap status is live.

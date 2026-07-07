@@ -1,8 +1,10 @@
 """
 meetings_today section — Event/On-demand.
 
-Live Graph calendarView call for today (UTC midnight → tomorrow UTC midnight).
-No caching, no AI. Each call returns the current view of the day.
+Live Graph calendarView call for the user's LOCAL day. `live_items()` is the AI-free core
+(Graph fetch + item build, no validator, no file write) — reused by the interactive bot read
+so it always sees today's real calendar, never a stale cached snapshot. `run()` wraps it with
+the AI preference-validator + writes the results file for the dashboard/briefing path.
 """
 import hashlib
 import json
@@ -70,6 +72,23 @@ def _build_item(event: dict, tz: ZoneInfo) -> dict:
     }
 
 
+def live_items(graph: GraphClient, data_dir: Path, progress=None) -> list[dict]:
+    """AI-free live fetch of today's meetings (local calendar day). No validator, no file write.
+    The interactive bot read uses this so it never serves a stale results/meetings_today.json."""
+    data_dir = Path(data_dir)
+    tz = get_user_tz(data_dir)
+    start_utc_iso, end_utc_iso = local_day_window_utc(data_dir, 0)
+    if progress:
+        progress(f"Fetching calendar for {today_local_str(data_dir)} ({tz.key})")
+    try:
+        events = graph.get_calendar_view(start_utc_iso, end_utc_iso, top=50)
+    except Exception as e:
+        print(f"[meetings_today] Calendar fetch failed: {e}")
+        events = []
+    events.sort(key=lambda e: (e.get("start") or {}).get("dateTime") or "")
+    return [_build_item(e, tz) for e in events]
+
+
 def run(
     graph: GraphClient,
     ai: AIClient,
@@ -87,20 +106,9 @@ def run(
     results_path = data_dir / "results" / f"{_RESULT_ID}.json"
     results_path.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
-    tz = get_user_tz(data_dir)
     today_str = today_local_str(data_dir)
-    start_utc_iso, end_utc_iso = local_day_window_utc(data_dir, 0)
 
-    _p(f"Fetching calendar for {today_str} ({tz.key})")
-
-    try:
-        events = graph.get_calendar_view(start_utc_iso, end_utc_iso, top=50)
-    except Exception as e:
-        _p(f"Calendar fetch failed: {e}")
-        events = []
-
-    events.sort(key=lambda e: (e.get("start") or {}).get("dateTime") or "")
-    items = [_build_item(e, tz) for e in events]
+    items = live_items(graph, data_dir, progress=_p)
 
     _p(f"{len(items)} meeting(s) before user-preference review")
 
