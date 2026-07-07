@@ -78,6 +78,8 @@ def _maybe_import(con, data_dir) -> None:
         for email, contact in contacts.items():
             if not email:
                 continue
+            if isinstance(contact, dict):
+                contact.setdefault("email", email.lower())   # invariant (see replace_from_dict)
             con.execute("INSERT OR REPLACE INTO contacts (email, data, updated_at) VALUES (?,?,?)",
                         (email.lower(), json.dumps(contact, ensure_ascii=False), now))
         con.execute("INSERT OR REPLACE INTO crm_meta (k, v) VALUES ('last_scan', ?)",
@@ -202,6 +204,12 @@ def replace_from_dict(data_dir, crm: dict) -> None:
         for email, contact in contacts.items():
             if not email:
                 continue
+            # Invariant: the value must carry its own `email` (the KEY is the source of truth).
+            # The enrichment merge can produce a value without it (empty base + AI never outputs
+            # email), and downstream readers do `c["email"]` — enforce it here, the single save
+            # chokepoint, so an email-less row can never be persisted (KeyError'd the weekly scan).
+            if isinstance(contact, dict):
+                contact.setdefault("email", email.lower())
             con.execute("INSERT OR REPLACE INTO contacts (email, data, updated_at) VALUES (?,?,?)",
                         (email.lower(), json.dumps(contact, ensure_ascii=False), now))
         if "last_scan" in (crm or {}):
@@ -230,6 +238,33 @@ def delete_contact(data_dir, email: str) -> bool:
         con.close()
     write_projection(data_dir)
     return removed
+
+
+def backfill_missing_email(data_dir) -> int:
+    """One-time hygiene: inject `email` = row key into any stored contact whose value dict is
+    missing it (legacy rows from the enrichment-merge gap). Idempotent; regenerates the projection.
+    Returns how many rows were repaired. New writes can't create these (replace_from_dict setdefaults)."""
+    con = _conn(data_dir)
+    fixed = 0
+    try:
+        rows = con.execute("SELECT email, data FROM contacts").fetchall()
+        for r in rows:
+            email = r["email"]
+            try:
+                c = json.loads(r["data"])
+            except Exception:
+                continue
+            if isinstance(c, dict) and not c.get("email"):
+                c["email"] = email
+                con.execute("UPDATE contacts SET data=? WHERE email=?",
+                            (json.dumps(c, ensure_ascii=False), email))
+                fixed += 1
+        con.commit()
+    finally:
+        con.close()
+    if fixed:
+        write_projection(data_dir)
+    return fixed
 
 
 def clear(data_dir) -> None:

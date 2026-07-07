@@ -332,9 +332,16 @@ def find_duplicate_contacts(data_dir: Path, ai: AIClient, progress=None) -> list
         return []
 
     crm = _read_json(crm_path, {})
-    contacts = list(crm.get("contacts", {}).values())
-    # Skip archived / ignored
-    contacts = [c for c in contacts if not c.get("ignore") and not c.get("archived")]
+    # The KEY is the authoritative email — a value can lack its own `email` field (enrichment
+    # merge with an empty base). Iterate .items() and backfill from the key so downstream
+    # `c["email"]` never KeyErrors (it silently crashed the whole weekly scan for weeks).
+    contacts = []
+    for email, c in (crm.get("contacts") or {}).items():
+        if not isinstance(c, dict) or c.get("ignore") or c.get("archived"):
+            continue
+        if not c.get("email"):
+            c = {**c, "email": email}
+        contacts.append(c)
 
     if len(contacts) < 2:
         return []
@@ -869,14 +876,25 @@ def run_full_scan(data_dir: Path, ai: AIClient, progress=None) -> dict:
             progress(msg)
         print(f"[db_cleaner] {msg}")
 
+    # Stage isolation: one detector raising must NOT kill the whole scan (a single email-less
+    # contact KeyError'd find_duplicate_contacts → the entire weekly scan died for weeks, so
+    # project splits/merges never surfaced). Each stage runs independently; a failure logs and
+    # contributes zero candidates rather than aborting the others.
+    def _stage(name, fn):
+        try:
+            return fn()
+        except Exception as e:
+            log(f"[stage FAILED] {name}: {e}")
+            return []
+
     log("Scanning for duplicate projects...")
-    project_cands = find_duplicate_projects(data_dir, ai, progress=log)
+    project_cands = _stage("duplicate_projects", lambda: find_duplicate_projects(data_dir, ai, progress=log))
     log("Scanning for duplicate contacts...")
-    contact_cands = find_duplicate_contacts(data_dir, ai, progress=log)
+    contact_cands = _stage("duplicate_contacts", lambda: find_duplicate_contacts(data_dir, ai, progress=log))
     log("Scanning for stale records...")
-    stale_cands = find_stale_records(data_dir)
+    stale_cands = _stage("stale_records", lambda: find_stale_records(data_dir))
     log("Reviewing merge ledger for wrongly-merged projects...")
-    split_cands = find_wrongly_merged_projects(data_dir, progress=log)
+    split_cands = _stage("wrongly_merged_projects", lambda: find_wrongly_merged_projects(data_dir, progress=log))
 
     all_candidates = project_cands + contact_cands + stale_cands + split_cands
 
