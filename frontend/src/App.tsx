@@ -535,6 +535,22 @@ function SettingsPage({ user, onBrandingChange }: { user: AuthUser; onBrandingCh
         </Section>
 
         <Section icon={<Bot size={16} />} title="AI Assistant" color="text-sky-500">
+          <div className="flex flex-col gap-1.5 mb-2">
+            <label className="text-xs font-mono text-executive-muted">AI Model</label>
+            <select
+              value={settings.ai_provider || ''}
+              onChange={e => setSettings(p => ({ ...p, ai_provider: e.target.value }))}
+              className="self-start px-2 py-1.5 text-xs bg-executive-bg border border-executive-border rounded-lg focus:outline-none focus:border-executive-accent/60"
+            >
+              <option value="">Platform default</option>
+              <option value="kimi">Kimi (Moonshot)</option>
+              <option value="gemini">Gemini (Google)</option>
+            </select>
+            <p className="text-[11px] text-executive-muted">
+              Applies to chat and email analysis. Industry-news search, receipt scanning and
+              meeting transcription always use Gemini.
+            </p>
+          </div>
           {botConnected ? (
             <div className="flex flex-col gap-4">
               <div className="flex items-center gap-3 p-4 bg-emerald-500/8 border border-emerald-500/20 rounded-xl">

@@ -10,7 +10,7 @@ def build(ctx):
         try:
             from src.modules.outreach import run as _run_outreach
             from src.ai import AIClient
-            _ai = AIClient()
+            _ai = AIClient(settings=ctx.settings)
             result = _run_outreach(
                 graph=owner_graph,
                 ai=_ai,

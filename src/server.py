@@ -180,7 +180,6 @@ def _poll_push_qa_all_users() -> None:
     sessions_dir = auth.DATA_DIR / "_sessions"
     if not sessions_dir.exists():
         return
-    ai = AIClient()
     roll_up = {"generated_at": datetime.now(timezone.utc).isoformat(), "users": []}
     for token_file in sessions_dir.glob("*.json"):
         uid = token_file.stem
@@ -194,6 +193,8 @@ def _poll_push_qa_all_users() -> None:
         try:
             settings = _read_json(_user_settings(uid))
             display_name = settings.get("display_name") or "the executive"
+            # Per-user client (was one shared across the whole fleet — provider routing is per-user)
+            ai = AIClient(settings=settings)
             summary = push_qa.run_for_user(_udir(uid), ai, graph, display_name)
             roll_up["users"].append({
                 "uid":      uid,
@@ -671,7 +672,7 @@ def _poll_teams_bot_all_users():
             except Exception:
                 pass
             new_state = poll_and_reply(
-                state, graph, AIClient(),
+                state, graph, AIClient(settings=owner_settings),
                 owner_graph=owner_graph,
                 owner_wiki_dir=_udir(owner_uid) / "wiki",
                 owner_settings=owner_settings,
@@ -746,7 +747,7 @@ def _poll_expense_scan_all_users():
             continue
         try:
             owner_graph = GraphClient(auth.get_valid_access_token(uid))
-            ai          = AIClient()
+            ai          = AIClient(data_dir=_udir(uid))
             with usage_context("expenses", uid):
                 result  = expenses.run(owner_graph, ai, _udir(uid), days=1)
             new_items   = result.get("items", [])
@@ -784,7 +785,7 @@ def _poll_meeting_prep_all_users():
             if not sched.get("meeting", {}).get("prep_enabled"):
                 continue
             owner_graph = GraphClient(auth.get_valid_access_token(uid))
-            ai          = AIClient()
+            ai          = AIClient(data_dir=_udir(uid))
             settings    = _read_json(_user_settings(uid))
             result      = meeting_prep.run(owner_graph, ai, _udir(uid), settings)
             preps       = result.get("items", [])
@@ -828,7 +829,7 @@ def _poll_meeting_recordings_all_users():
         try:
             token    = auth.get_valid_access_token(uid)
             graph    = GraphClient(token)
-            ai       = AIClient()
+            ai       = AIClient(data_dir=_udir(uid))
             settings = _read_json(_user_settings(uid))
             result   = m03_run(graph, ai, _udir(uid), settings=settings,
                                months=6, max_to_process=3)
@@ -1568,7 +1569,7 @@ def _generate_profile(uid: str, progress_cb=None, on_doc_ready=None) -> None:
     from src.modules.profile_init import run_profile_init
     token    = auth.get_valid_access_token(uid)
     graph    = GraphClient(token)
-    ai       = AIClient()
+    ai       = AIClient(data_dir=_udir(uid))
     settings = _read_json(_user_settings(uid))
     run_profile_init(_udir(uid), graph, ai, settings,
                      progress=progress_cb, on_doc_ready=on_doc_ready)
@@ -1604,7 +1605,7 @@ def _build_crm_with_progress(uid: str, progress_cb, months: int = 6) -> None:
     try:
         token  = auth.get_valid_access_token(uid)
         graph  = GraphClient(token)
-        ai     = AIClient()
+        ai     = AIClient(data_dir=_udir(uid))
         seg, biz = _get_crm_ai_context(uid)
         result = build_crm(graph, ai, _udir(uid),
                            months=months,
@@ -1623,7 +1624,7 @@ def _build_projects_with_progress(uid: str, progress_cb, months: int = 6) -> Non
     try:
         token    = auth.get_valid_access_token(uid)
         graph    = GraphClient(token)
-        ai       = AIClient()
+        ai       = AIClient(data_dir=_udir(uid))
         settings = _read_json(_user_settings(uid))
         result   = build_projects(graph, ai, _udir(uid), settings=settings,
                                   months=months,
@@ -1817,7 +1818,7 @@ def _run_meeting_backfill_for_user(uid: str) -> None:
     try:
         token    = auth.get_valid_access_token(uid)
         graph    = GraphClient(token)
-        ai       = AIClient()
+        ai       = AIClient(data_dir=_udir(uid))
         settings = _read_json(_user_settings(uid))
         result = m03_run(graph, ai, _udir(uid), settings=settings, months=6)
         print(f"[m03 backfill] {uid} done — {result.get('processed', 0)} processed, "
@@ -1846,7 +1847,7 @@ def _build_crm_for_user(uid: str) -> None:
     try:
         token  = auth.get_valid_access_token(uid)
         graph  = GraphClient(token)
-        ai     = AIClient()
+        ai     = AIClient(data_dir=_udir(uid))
         seg, biz = _get_crm_ai_context(uid)
         result = build_crm(graph, ai, _udir(uid),
                            market_segments_content=seg,
@@ -1864,7 +1865,7 @@ def _refresh_crm_for_user(uid: str) -> None:
     try:
         token  = auth.get_valid_access_token(uid)
         graph  = GraphClient(token)
-        ai     = AIClient()
+        ai     = AIClient(data_dir=_udir(uid))
         seg, biz = _get_crm_ai_context(uid)
         with usage_context("crm_refresh", uid):
             result = refresh_crm(graph, ai, _udir(uid),
@@ -1891,7 +1892,7 @@ def _build_projects_for_user(uid: str) -> None:
     try:
         token    = auth.get_valid_access_token(uid)
         graph    = GraphClient(token)
-        ai       = AIClient()
+        ai       = AIClient(data_dir=_udir(uid))
         settings = _read_json(_user_settings(uid))
         with usage_context("projects_build", uid):
             result   = build_projects(graph, ai, _udir(uid), settings=settings)
@@ -1908,7 +1909,7 @@ def _refresh_projects_for_user(uid: str) -> None:
     try:
         token    = auth.get_valid_access_token(uid)
         graph    = GraphClient(token)
-        ai       = AIClient()
+        ai       = AIClient(data_dir=_udir(uid))
         settings = _read_json(_user_settings(uid))
         with usage_context("projects_refresh", uid):
             result   = refresh_projects(graph, ai, _udir(uid), settings=settings)
@@ -2724,7 +2725,7 @@ def run_section(section_id: str, background_tasks: BackgroundTasks,
         try:
             token    = auth.get_valid_access_token(uid)
             graph    = GraphClient(token)
-            ai       = AIClient()
+            ai       = AIClient(data_dir=_udir(uid))
             settings = _read_json(_user_settings(uid))
 
             with usage_context(section_id, uid):
@@ -2801,7 +2802,7 @@ def _run_section_for_user(uid: str, section_id: str) -> None:
     try:
         token    = auth.get_valid_access_token(uid)
         graph    = GraphClient(token)
-        ai       = AIClient()
+        ai       = AIClient(data_dir=_udir(uid))
         settings = _read_json(_user_settings(uid))
         with usage_context(section_id, uid):
             result   = _SECTION_RUNNERS[section_id](graph, ai, _udir(uid), settings, None)
@@ -2934,7 +2935,7 @@ def trigger_crm_scan(background_tasks: BackgroundTasks,
             from src.ai import AIClient
             token = auth.get_valid_access_token(uid)
             graph = GraphClient(token)
-            ai    = AIClient()
+            ai    = AIClient(data_dir=_udir(uid))
             seg, biz = _get_crm_ai_context(uid)
             result = build_crm(graph, ai, _udir(uid),
                                months=months,
@@ -2961,7 +2962,7 @@ def trigger_projects_scan(background_tasks: BackgroundTasks,
             from src.ai import AIClient
             token    = auth.get_valid_access_token(uid)
             graph    = GraphClient(token)
-            ai       = AIClient()
+            ai       = AIClient(data_dir=_udir(uid))
             settings = _read_json(_user_settings(uid))
             result   = build_projects(graph, ai, _udir(uid), settings=settings)
             save_projects(_udir(uid), result)
@@ -3003,7 +3004,7 @@ async def crm_bulk_upload(files: list[UploadFile] = File(...),
     if not uploads:
         return {"contacts": [], "files": []}
 
-    ai = AIClient()
+    ai = AIClient(data_dir=_udir(session["user_id"]))
     all_contacts: list[dict] = []
     file_summaries: list[dict] = []
     for data, name in uploads:
@@ -3099,7 +3100,7 @@ async def projects_bulk_upload(files: list[UploadFile] = File(...),
     if not uploads:
         return {"projects": [], "files": []}
 
-    ai = AIClient()
+    ai = AIClient(data_dir=_udir(session["user_id"]))
     all_projects: list[dict] = []
     file_summaries: list[dict] = []
     for data, name in uploads:
@@ -3363,7 +3364,7 @@ def trigger_m03_scan(background_tasks: BackgroundTasks,
             from src.ai import AIClient
             token    = auth.get_valid_access_token(uid)
             graph    = GraphClient(token)
-            ai       = AIClient()
+            ai       = AIClient(data_dir=_udir(uid))
             settings = _read_json(_user_settings(uid))
             with usage_context("m03_meeting", uid):
                 result = m03_run(graph, ai, _udir(uid), settings=settings, force=force, use_mock=use_mock)
@@ -3678,7 +3679,7 @@ def draft_generate(body: dict, session: dict = Depends(require_session)):
         )
 
     try:
-        body_text = AIClient().generate(prompt).strip()
+        body_text = AIClient(data_dir=_udir(uid)).generate(prompt).strip()
     except Exception as e:
         raise HTTPException(500, f"AI generation failed: {e}")
     body_text = body_text.strip('"').strip("'").strip()
@@ -3731,7 +3732,7 @@ def draft_refine(body: dict, session: dict = Depends(require_session)):
         "change. Plain text only."
     )
     try:
-        revised = AIClient().generate(prompt).strip()
+        revised = AIClient(data_dir=_udir(uid)).generate(prompt).strip()
     except Exception as e:
         raise HTTPException(500, f"AI refine failed: {e}")
     return {"body": revised.strip('"').strip("'").strip()}
@@ -3901,7 +3902,7 @@ async def scan_expenses_historical(
         try:
             token = auth.get_valid_access_token(uid)
             graph = GraphClient(token)
-            ai    = AIClient()
+            ai    = AIClient(data_dir=_udir(uid))
             result = expenses_run(graph, ai, _udir(uid), days=days, progress=_progress)
             result["logs"] = logs[-20:]
             _write_json(expense_result_path, result)
@@ -4015,7 +4016,7 @@ async def trigger_outreach(request: Request, session: dict = Depends(require_ses
         from src.modules.outreach import run as _run_outreach
         token    = auth.get_valid_access_token(uid)
         graph    = GraphClient(token)
-        ai       = AIClient()
+        ai       = AIClient(data_dir=_udir(uid))
         settings = _read_json(_user_settings(uid))
         result   = _run_outreach(
             graph=graph, ai=ai, data_dir=_udir(uid),
@@ -4074,7 +4075,7 @@ async def bulk_email_generate(request: Request, background_tasks: BackgroundTask
     def _run():
         try:
             from src.modules.outreach import generate_bulk
-            ai       = AIClient()
+            ai       = AIClient(data_dir=_udir(uid))
             settings = _read_json(_user_settings(uid))
             result = generate_bulk(
                 ai=ai, data_dir=_udir(uid), settings=settings,
@@ -4327,7 +4328,7 @@ def refresh_signature(session: dict = Depends(require_session)):
     uid      = session["user_id"]
     token    = auth.get_valid_access_token(uid)
     graph    = GraphClient(token)
-    ai       = AIClient()
+    ai       = AIClient(data_dir=_udir(uid))
     settings = _read_json(_user_settings(uid))
 
     samples = _collect_signature_samples(graph, log=lambda m: print(f"[RefreshSig] {m}"))
@@ -4393,7 +4394,7 @@ async def enrich_company_website(request: Request, session: dict = Depends(requi
         raise HTTPException(400, "url is required")
 
     try:
-        info = extract_company_info(url, AIClient())
+        info = extract_company_info(url, AIClient(data_dir=_udir(session["user_id"])))
         # AI sometimes returns empty company_name even on a 200 response.
         if not info.get("company_name"):
             info["company_name"] = extract_company_name_fallback(url)
@@ -4632,7 +4633,7 @@ def _run_cleanup_scan_for_user(uid: str, auto_apply: bool = False, send_digest: 
         return
 
     try:
-        ai = AIClient()
+        ai = AIClient(data_dir=_udir(uid))
         settings = _read_json(_user_settings(uid))
         run_full_scan(_udir(uid), ai)
 
@@ -4869,7 +4870,7 @@ def _run_briefing_for_user(uid: str, briefing_id: str, force: bool = False) -> N
             else:
                 token    = auth.get_valid_access_token(uid)
                 graph    = GraphClient(token)
-                ai       = AIClient()
+                ai       = AIClient(data_dir=_udir(uid))
                 settings = _read_json(_user_settings(uid))
                 with usage_context(sid, uid):
                     result   = _SECTION_RUNNERS[sid](graph, ai, _udir(uid), settings, None)

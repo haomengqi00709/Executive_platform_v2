@@ -25,32 +25,78 @@ from google.genai import types
 _DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
 _client_lock = threading.Lock()
-_oai_client = None
+_oai_clients: dict = {}          # base_url → OpenAI client (one httpx transport per endpoint)
 _schema_cache: list | None = None
 _genai_schema_client = None
 
 
-# ── config / gating ──────────────────────────────────────────────────────────
+# ── provider rows ────────────────────────────────────────────────────────────
+# A provider row is a dict {base_url, model, key_env[, key_env_fallback]} — the same shape as
+# ai.PROVIDERS entries. provider=None everywhere means the legacy FALLBACK_* env trio, kept
+# for backward compatibility (tests, /fallback health checks, non-registry deployments).
+
+def _legacy_row() -> dict:
+    return {"base_url": os.getenv("FALLBACK_BASE_URL", "").strip() or _DEFAULT_BASE_URL,
+            "model": os.getenv("FALLBACK_MODEL", "").strip(),
+            "_key": os.getenv("FALLBACK_API_KEY", "").strip()}
+
+
+def _row(provider: dict | None) -> dict:
+    return dict(provider) if provider else _legacy_row()
+
+
+def _row_key(row: dict) -> str:
+    if row.get("_key"):
+        return row["_key"]
+    return (os.getenv(row.get("key_env") or "", "")
+            or os.getenv(row.get("key_env_fallback") or "", "")).strip()
+
+
+def model_name(provider: dict | None = None) -> str:
+    return _row(provider).get("model", "")
+
+
+def available(provider: dict | None = None) -> bool:
+    """True when this engine config has both a key and a model resolvable."""
+    row = _row(provider)
+    return bool(_row_key(row) and row.get("model"))
+
+
+def default_alt_row() -> dict | None:
+    """The OpenAI-compatible engine to use as the ALTERNATE when the primary is Gemini:
+    the registry's kimi row if its key resolves, else the legacy FALLBACK_* env config."""
+    try:
+        from src.ai import PROVIDERS
+        kimi = PROVIDERS.get("kimi")
+        if kimi and available(kimi):
+            return kimi
+    except Exception:
+        pass
+    return _legacy_row() if available(None) else None
+
+
 def _model() -> str:
-    return os.getenv("FALLBACK_MODEL", "").strip()
+    # legacy accessor (back-compat for callers/tests that predate provider rows)
+    return _legacy_row()["model"]
 
 
 def is_enabled() -> bool:
-    """Fallback is active only when both a key and a model are configured."""
-    return bool(os.getenv("FALLBACK_API_KEY", "").strip() and _model())
+    """Legacy gate: the FALLBACK_* env trio is configured (back-compat)."""
+    return available(None)
 
 
-def _client():
-    global _oai_client
-    if _oai_client is None:
+def _client(provider: dict | None = None):
+    row = _row(provider)
+    base = (row.get("base_url") or _DEFAULT_BASE_URL).strip()
+    cli = _oai_clients.get(base)
+    if cli is None:
         with _client_lock:
-            if _oai_client is None:
+            cli = _oai_clients.get(base)
+            if cli is None:
                 from openai import OpenAI
-                _oai_client = OpenAI(
-                    api_key=os.getenv("FALLBACK_API_KEY", "").strip(),
-                    base_url=os.getenv("FALLBACK_BASE_URL", "").strip() or _DEFAULT_BASE_URL,
-                )
-    return _oai_client
+                cli = OpenAI(api_key=_row_key(row), base_url=base)
+                _oai_clients[base] = cli
+    return cli
 
 
 # ── tool schemas: generated ONCE from the raw callables, reused every call ────
@@ -164,7 +210,7 @@ def _response_to_parts(resp):
     return [], "empty", None
 
 
-def _record_usage(resp):
+def _record_usage(resp, model: str, feature: str = "bot_fallback"):
     try:
         from src.modules import token_usage
         u = getattr(resp, "usage", None)
@@ -173,26 +219,51 @@ def _record_usage(resp):
         p = getattr(u, "prompt_tokens", 0) or 0
         o = getattr(u, "completion_tokens", 0) or 0
         t = getattr(u, "total_tokens", 0) or (p + o)
-        token_usage.record("bot_fallback", "bot", p, o, t, model=_model())
+        token_usage.record(feature, "bot", p, o, t, model=model)
     except Exception:
         pass
 
 
-# ── entry point (same (parts, finish_reason, prompt_feedback) shape as _generate_once) ─
-def generate(contents, system: str, all_tools):
-    """Run one turn-round on the fallback provider. Returns ([], 'ERROR', None) on any
-    failure so the caller falls through to HONEST_FALLBACK — never crashes the turn."""
+# ── entry points (same (parts, finish_reason, prompt_feedback) shape as _generate_once) ─
+def generate(contents, system: str, all_tools, provider: dict | None = None,
+             feature: str = "bot_fallback"):
+    """Run one turn-round on an OpenAI-compatible engine (a provider row, or the legacy
+    FALLBACK_* env config when provider is None). Returns ([], 'ERROR', None) on any
+    failure so the caller falls through to HONEST_FALLBACK — never crashes the turn.
+    `feature` tags the usage: "bot" when this engine IS the user's primary, "bot_fallback"
+    when it engaged as the alternate."""
+    row = _row(provider)
+    model = row.get("model", "")
     try:
-        resp = _client().chat.completions.create(
-            model=_model(),
+        resp = _client(provider).chat.completions.create(
+            model=model,
             messages=_contents_to_messages(contents, system),
             tools=_tool_schemas(all_tools),
             tool_choice="auto",
         )
-        _record_usage(resp)
+        _record_usage(resp, model, feature)
         parts, fr, pf = _response_to_parts(resp)
-        print(f"[BotFallback] model={_model()} finish={fr} parts={len(parts)}")
+        print(f"[BotFallback] model={model} finish={fr} parts={len(parts)}")
         return parts, fr, pf
     except Exception as e:
         print(f"[BotFallback] error: {e}")
         return [], "ERROR", None
+
+
+def generate_text(prompt: str, provider: dict | None = None,
+                  feature: str = "bot") -> str:
+    """Plain text completion on the engine (no tools) — used by the bot's completion
+    verifier when the user's primary is an OpenAI-compatible provider. Returns "" on
+    failure (the verifier fail-safes to verdict=done)."""
+    row = _row(provider)
+    model = row.get("model", "")
+    try:
+        resp = _client(provider).chat.completions.create(
+            model=model, messages=[{"role": "user", "content": prompt}])
+        _record_usage(resp, model, feature)
+        if getattr(resp, "choices", None):
+            return resp.choices[0].message.content or ""
+        return ""
+    except Exception as e:
+        print(f"[BotFallback] generate_text error: {e}")
+        return ""

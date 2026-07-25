@@ -56,13 +56,18 @@ class FakeGraph:
         return _m
 
 
+_FAKE_ROW = {"base_url": "https://fake.example/v1", "model": "fake-alt-model", "_key": "k"}
+
+
 def _run(primary_script, fallback_gen, tmp_path, monkeypatch, user_text="hello there", enabled=True):
     pc = FakePrimaryClient(primary_script)
     monkeypatch.setattr(bot, "_client", lambda: pc)
-    monkeypatch.setattr(bot_fallback, "is_enabled", lambda: enabled)
+    # New architecture: the alternate engine is a provider ROW resolved via default_alt_row
+    # (None = no alternate configured). Primary here = gemini (no ai_provider in settings).
+    monkeypatch.setattr(bot_fallback, "default_alt_row", lambda: (_FAKE_ROW if enabled else None))
     fb_calls = {"n": 0}
 
-    def _wrapped(contents, system, all_tools):
+    def _wrapped(contents, system, all_tools, provider=None, feature="bot_fallback"):
         fb_calls["n"] += 1
         return fallback_gen(fb_calls["n"], contents, all_tools)
     monkeypatch.setattr(bot_fallback, "generate", _wrapped)
@@ -126,8 +131,47 @@ def test_slash_fallback_when_disabled_explains(tmp_path, monkeypatch):
     out, primary, fb_calls, _ = _run(
         [_text("x")], lambda n, c, t: ([types.Part(text="x")], "stop", None),
         tmp_path, monkeypatch, user_text="/fallback hi", enabled=False)
-    assert "not configured" in out.lower()
+    assert "no alternate engine" in out.lower()
     assert fb_calls["n"] == 0 and primary.calls == 0
+
+
+def _run_kimi_primary(primary_script, fallback_gen, tmp_path, monkeypatch, user_text="hello there"):
+    """settings.ai_provider=kimi → the OPENAI engine is the primary; genai is the alternate."""
+    pc = FakePrimaryClient(primary_script)            # this is the GENAI engine (alternate now)
+    monkeypatch.setattr(bot, "_client", lambda: pc)
+    fb_calls = {"n": 0, "features": []}
+
+    def _wrapped(contents, system, all_tools, provider=None, feature="bot_fallback"):
+        fb_calls["n"] += 1
+        fb_calls["features"].append(feature)
+        return fallback_gen(fb_calls["n"], contents, all_tools)
+    monkeypatch.setattr(bot_fallback, "generate", _wrapped)
+    monkeypatch.setattr(bot_fallback, "generate_text", lambda *a, **k: '{"verdict":"done"}')
+    g = FakeGraph()
+    out, _ = bot.reply({}, user_text, g, g,
+                       {"display_name": "Jason", "ai_provider": "kimi"},
+                       tmp_path / "wiki", tmp_path)
+    return out, pc.models, fb_calls, g
+
+
+def test_kimi_primary_uses_openai_engine_first(tmp_path, monkeypatch):
+    out, genai_engine, fb_calls, _ = _run_kimi_primary(
+        [_text("genai should not answer")],
+        lambda n, c, t: ([types.Part(text="kimi as primary")], "stop", None),
+        tmp_path, monkeypatch)
+    assert out == "kimi as primary"
+    assert fb_calls["n"] >= 1 and fb_calls["features"][0] == "bot"   # primary usage tagged "bot"
+    assert genai_engine.calls == 0                                    # genai never touched
+
+
+def test_kimi_primary_falls_back_to_gemini(tmp_path, monkeypatch):
+    # openai engine returns nothing → after nudges the loop must flip to the genai engine
+    out, genai_engine, fb_calls, _ = _run_kimi_primary(
+        [_text("gemini rescued the turn")],
+        lambda n, c, t: ([], "ERROR", None),
+        tmp_path, monkeypatch)
+    assert out == "gemini rescued the turn"
+    assert genai_engine.calls >= 1                                    # alternate engaged
 
 
 def test_disabled_fallback_is_never_called(tmp_path, monkeypatch):

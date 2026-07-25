@@ -27,6 +27,12 @@ from pathlib import Path
 _MODEL_PRICING = {
     "gemini-2.5-flash": {"in": 0.30 / 1e6, "out": 2.50 / 1e6, "search_unit": "request", "search": 35 / 1000},
     "gemini-3.5-flash": {"in": 1.50 / 1e6, "out": 9.00 / 1e6, "search_unit": "query",   "search": 14 / 1000},
+    # Moonshot Kimi (OpenAI-compatible provider). Official platform.moonshot.ai list price
+    # 2026-07 ($0.95/M in, $4.00/M out — sources vary $0.60-0.95; priced at the HIGH end so we
+    # never under-estimate; reconcile against the Moonshot bill once real traffic flows).
+    # No search SKU (Kimi has no grounded search). Also fixes the pre-existing bug where
+    # bot_fallback's Kimi rows silently fell back to gemini-3.5-flash pricing.
+    "kimi-k2.6": {"in": 0.95 / 1e6, "out": 4.00 / 1e6, "search_unit": "request", "search": 0.0},
 }
 # Records that predate model tracking (or use an unknown model) are priced as the pricier
 # 3.5 so we never UNDER-estimate (3.5 was the 2026-06 incident default).

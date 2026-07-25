@@ -15,7 +15,8 @@ from dotenv import load_dotenv
 # any of these that were already set in the environment, restoring them after the load.
 _PRESERVE_ENV = {k: os.environ[k]
                  for k in ("GEMINI_API_KEY", "GEMINI_MODEL", "GEMINI_SEARCH_TIMEOUT_SECS", "DATA_DIR",
-                           "FALLBACK_API_KEY", "FALLBACK_MODEL", "FALLBACK_BASE_URL")
+                           "FALLBACK_API_KEY", "FALLBACK_MODEL", "FALLBACK_BASE_URL",
+                           "KIMI_API_KEY", "KIMI_MODEL", "AI_DEFAULT_PROVIDER")
                  if k in os.environ}
 load_dotenv(override=True)
 os.environ.update(_PRESERVE_ENV)
@@ -26,6 +27,67 @@ os.environ.update(_PRESERVE_ENV)
 # Change the model in ONE place: this default, or the GEMINI_MODEL env var
 # (lets you switch models on Railway/Azure without a redeploy).
 DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+
+# ── Provider registry: per-user model routing (TEXT path only) ──────────────
+# The text/JSON path (generate / extract_json — ~80% of call volume) routes by the user's
+# `ai_provider` setting. Search grounding, audio/video transcription, and the Files-API
+# multimodal sites are CAPABILITY-PINNED to Gemini (`self.client`) — the OpenAI-compatible
+# providers have no equivalent — and never route. Adding a provider = one dict row.
+PROVIDERS = {
+    "kimi": {
+        "api": "openai",
+        "base_url": "https://api.moonshot.ai/v1",
+        "key_env": "KIMI_API_KEY",
+        "key_env_fallback": "FALLBACK_API_KEY",   # prod has carried the Kimi key here since the bot-fallback rollout
+        "model": os.getenv("KIMI_MODEL", "kimi-k2.6"),
+    },
+    "gemini": {"api": "genai", "model": DEFAULT_GEMINI_MODEL},
+}
+# Platform default provider. Ships as "gemini" (zero behavior change); flipped to "kimi" on
+# Railway once the graduated rollout validates. Per-user settings.ai_provider overrides it.
+AI_DEFAULT_PROVIDER = os.getenv("AI_DEFAULT_PROVIDER", "gemini")
+
+
+def resolve_provider(settings: dict = None, data_dir=None) -> str:
+    """The user's ai_provider (from a settings dict, else data_dir/settings.json), else the
+    platform default. Unknown names fall through to the default so a typo can't kill a job."""
+    name = ""
+    try:
+        if settings and settings.get("ai_provider"):
+            name = str(settings["ai_provider"]).strip().lower()
+        elif data_dir is not None:
+            import json as _json
+            from pathlib import Path as _Path
+            p = _Path(data_dir) / "settings.json"
+            if p.exists():
+                name = str((_json.loads(p.read_text()) or {}).get("ai_provider") or "").strip().lower()
+    except Exception:
+        name = ""
+    if name in PROVIDERS:
+        return name
+    return AI_DEFAULT_PROVIDER if AI_DEFAULT_PROVIDER in PROVIDERS else "gemini"
+
+
+# OpenAI-compatible client cache, keyed by base_url (mirrors bot_fallback's singleton;
+# one httpx transport per endpoint for the whole process).
+_OAI_CLIENTS: dict = {}
+_OAI_CLIENTS_LOCK = threading.Lock()
+
+
+def _openai_client(prov: dict):
+    base = (prov.get("base_url") or "https://api.openai.com/v1").strip()
+    cli = _OAI_CLIENTS.get(base)
+    if cli is None:
+        with _OAI_CLIENTS_LOCK:
+            cli = _OAI_CLIENTS.get(base)
+            if cli is None:
+                from openai import OpenAI
+                key = (os.getenv(prov.get("key_env") or "", "")
+                       or os.getenv(prov.get("key_env_fallback") or "", "")).strip()
+                cli = OpenAI(api_key=key, base_url=base)
+                _OAI_CLIENTS[base] = cli
+    return cli
 
 
 # Default per-call timeouts. Text generation should always return quickly;
@@ -230,11 +292,19 @@ def _budget_guard() -> None:
 
 
 class AIClient:
-    def __init__(self):
+    def __init__(self, settings: dict = None, data_dir=None):
+        # The genai client is ALWAYS constructed: the capability-pinned surfaces (search
+        # grounding, audio/video transcription, and the 5 Files-API multimodal sites that
+        # reach into `self.client` directly) stay on Gemini regardless of the user's
+        # text-provider choice. Only the TEXT path (generate/extract_json) routes.
         self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
         self.model = DEFAULT_GEMINI_MODEL
+        self.provider = resolve_provider(settings, data_dir)
+        self.text_model = PROVIDERS[self.provider]["model"]
 
     def generate(self, prompt: str) -> str:
+        if PROVIDERS[self.provider]["api"] == "openai":
+            return self._generate_openai(prompt)
         _budget_guard()
         _late = _late_usage_recorder(dict(_usage_ctx.get()), self.model, is_search=False)
         for attempt in range(2):
@@ -267,6 +337,61 @@ class AIClient:
                     time.sleep(5)
                 else:
                     raise
+
+    def _generate_openai(self, prompt: str) -> str:
+        """OpenAI-compatible text path (Kimi/DeepSeek/OpenAI — whatever the provider row says).
+        Mirrors the Gemini path's semantics exactly: budget guard, 2 attempts, per-call timeout,
+        quota errors fatal, usage recorded under the provider's model for correct pricing."""
+        _budget_guard()
+        prov = PROVIDERS[self.provider]
+        cli = _openai_client(prov)
+        for attempt in range(2):
+            try:
+                resp = _call_with_timeout(
+                    lambda: cli.chat.completions.create(
+                        model=self.text_model,
+                        messages=[{"role": "user", "content": prompt}]),
+                    _GEMINI_TIMEOUT_SECS,
+                )
+                text = (resp.choices[0].message.content or "") if getattr(resp, "choices", None) else ""
+                if not text.strip():
+                    if attempt < 1:
+                        time.sleep(5)
+                        continue
+                    raise ValueError(f"{self.provider} returned empty response")
+                self._record_openai_usage(resp)
+                return text
+            except Exception as e:
+                if _is_quota_error(e):
+                    raise
+                if isinstance(e, TimeoutError):
+                    if attempt < 1:
+                        print(f"  {self.provider} timeout after {_GEMINI_TIMEOUT_SECS}s, retrying once...")
+                        time.sleep(3)
+                        continue
+                    print(f"  {self.provider} timeout twice — giving up.")
+                    raise
+                if attempt < 1:
+                    time.sleep(5)
+                else:
+                    raise
+
+    def _record_openai_usage(self, resp) -> None:
+        """OpenAI usage shape (usage.prompt_tokens/…) → token_usage, tagged with the provider's
+        model so pricing resolves correctly (mirrors bot_fallback's reader)."""
+        try:
+            from src.modules import token_usage
+            u = getattr(resp, "usage", None)
+            if not u:
+                return
+            tag = _usage_ctx.get()
+            p = getattr(u, "prompt_tokens", 0) or 0
+            o = getattr(u, "completion_tokens", 0) or 0
+            t = getattr(u, "total_tokens", 0) or (p + o)
+            token_usage.record(tag.get("feature", "unknown"), tag.get("uid", "unknown"),
+                               p, o, t, model=self.text_model)
+        except Exception:
+            pass
 
     def transcribe_audio(self, audio_bytes: bytes, filename: str = "recording.mp3") -> str:
         """Transcribe an audio file (mp3/m4a)."""

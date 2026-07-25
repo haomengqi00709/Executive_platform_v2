@@ -24,7 +24,7 @@ def build(ctx):
             try:
                 from src.modules.outreach import generate_bulk, commit_bulk
                 from src.ai import AIClient
-                ai = AIClient()
+                ai = AIClient(settings=_settings)
                 preview = generate_bulk(
                     ai=ai, data_dir=_data_dir, settings=_settings,
                     emails=emails, subject="", body=intent,

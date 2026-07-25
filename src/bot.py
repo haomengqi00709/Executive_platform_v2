@@ -16,7 +16,7 @@ from google import genai
 from google.genai import types
 from src import bot_fallback
 
-from src.ai import DEFAULT_GEMINI_MODEL
+from src.ai import DEFAULT_GEMINI_MODEL, PROVIDERS, resolve_provider
 from src.modules.db_helpers import open_sqlite
 from src.modules.profile import load_profile_context, get_user_signature, append_signature_to_body
 from src.modules.subject_match import normalize_subject
@@ -495,15 +495,30 @@ def reply(
     history    = _load_history(db_path)
     user_model = _load_user_model(user_model_path)
 
-    # "/fallback <msg>" — force this ONE turn straight onto the configured fallback model
-    # (Gemini works normally in prod, so this is the only way to exercise/health-check the
-    # fallback from Teams). Harmless: a normal user never types it; it only routes their own
-    # query to the fallback provider. Stripped from the model input and from saved history.
+    # ── Per-user engine selection (dual-provider architecture) ────────────────
+    # The user's ai_provider setting picks the PRIMARY engine for this turn: an
+    # OpenAI-compatible provider (kimi/…) drives the same tool loop via bot_fallback's
+    # translation; gemini uses the native genai path. The OTHER engine is the alternate,
+    # engaged when the primary keeps failing (mutual fallback, kimi↔gemini).
+    _primary_provider  = resolve_provider(settings, data_dir)
+    _primary_is_openai = PROVIDERS.get(_primary_provider, {}).get("api") == "openai"
+    _openai_row = (PROVIDERS[_primary_provider] if _primary_is_openai
+                   else bot_fallback.default_alt_row())
+    def _alt_available() -> bool:
+        # primary openai → alternate is genai (always constructible);
+        # primary gemini → alternate is the OpenAI-compatible row, if configured.
+        return True if _primary_is_openai else (_openai_row is not None)
+
+    # "/fallback <msg>" — force this ONE turn onto the NON-primary engine (the only way to
+    # exercise/health-check the alternate from Teams, since the primary normally works).
+    # Harmless: a normal user never types it; it only routes their own query. Stripped from
+    # the model input and from saved history.
     _force_fb = False
     _t0 = (text or "").strip()
     if _t0.lower().startswith("/fallback"):
-        if not bot_fallback.is_enabled():
-            return "⚠️ Fallback is not configured (set FALLBACK_API_KEY / FALLBACK_MODEL).", state
+        if not _alt_available():
+            return ("⚠️ No alternate engine is configured (set KIMI_API_KEY or the "
+                    "FALLBACK_* env vars)."), state
         _force_fb = True
         text = _t0[len("/fallback"):].strip() or "hi"
 
@@ -780,8 +795,13 @@ def reply(
             """One model call → (parts, finish_reason, prompt_feedback). Reads the current
             `contents` (mutated by the nudge below between attempts). Once _use_fallback is set,
             routes to the OpenAI-compatible fallback model instead of Gemini."""
-            if _use_fallback[0] and bot_fallback.is_enabled():
-                return bot_fallback.generate(contents, system, all_tools)
+            # Engine = primary XOR alternate-switch. Primary openai (kimi/…) → openai engine,
+            # flipping to genai on failure; primary gemini → genai, flipping to the openai row.
+            _on_alt = _use_fallback[0]
+            if (_primary_is_openai != _on_alt) and _openai_row is not None:
+                return bot_fallback.generate(
+                    contents, system, all_tools, provider=_openai_row,
+                    feature=("bot_fallback" if _on_alt else "bot"))
             try:
                 response = client.models.generate_content(
                     model   = MODEL,
@@ -820,10 +840,12 @@ def reply(
                 contents.append(types.Content(role="model", parts=[types.Part(text="(no response)")]))
                 contents.append(types.Content(role="user",  parts=[types.Part(text=_EMPTY_NUDGE)]))
                 parts, fr, pf = _generate_once()
-            # Nudge exhausted and still nothing (or the primary errored). If a fallback model is
-            # configured, hand this turn to it — it drives the SAME tools for the rest of the turn.
-            if not parts and not _use_fallback[0] and bot_fallback.is_enabled():
-                print(f"[Bot] primary exhausted (finish_reason={fr}) — switching to fallback model")
+            # Nudge exhausted and still nothing (or the primary errored). Switch to the OTHER
+            # engine (kimi↔gemini) — it drives the SAME tools for the rest of the turn.
+            if not parts and not _use_fallback[0] and _alt_available():
+                _target = "gemini" if _primary_is_openai else bot_fallback.model_name(_openai_row)
+                print(f"[Bot] primary ({_primary_provider}) exhausted (finish_reason={fr}) "
+                      f"— switching to alternate engine ({_target})")
                 _use_fallback[0] = True
                 parts, fr, pf = _generate_once()
             fn_calls   = [p for p in parts if p.function_call]
@@ -907,11 +929,15 @@ def reply(
             "what is needed; empty string if done>\"}"
         )
         try:
-            resp = client.models.generate_content(
-                model=MODEL, contents=check_prompt,
-                config=types.GenerateContentConfig())
-            _record_bot_usage(resp, "bot")
-            raw = (resp.text or "").strip()
+            # The verifier follows the user's PRIMARY engine (plain text→JSON, no tools).
+            if _primary_is_openai and _openai_row is not None:
+                raw = (bot_fallback.generate_text(check_prompt, provider=_openai_row) or "").strip()
+            else:
+                resp = client.models.generate_content(
+                    model=MODEL, contents=check_prompt,
+                    config=types.GenerateContentConfig())
+                _record_bot_usage(resp, "bot")
+                raw = (resp.text or "").strip()
             s, e = raw.find("{"), raw.rfind("}")
             if s != -1 and e > s:
                 obj = json.loads(raw[s:e + 1])
@@ -1069,5 +1095,6 @@ def reply(
         print("[Bot] fallback turn — NOT saved to history (avoids empty-response feedback loop)")
 
     if _force_fb:  # make the /fallback test unambiguous in Teams
-        final_text = f"🔁 [fallback: {bot_fallback._model()}]\n\n{final_text}"
+        _forced = DEFAULT_GEMINI_MODEL if _primary_is_openai else bot_fallback.model_name(_openai_row)
+        final_text = f"🔁 [fallback: {_forced}]\n\n{final_text}"
     return final_text, state

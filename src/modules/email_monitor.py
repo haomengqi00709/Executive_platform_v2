@@ -693,7 +693,7 @@ def poll_and_notify(graph, owner_graph, data_dir: Path, settings: dict, chat_id:
             pass
 
         from src.ai import AIClient
-        ai = AIClient()
+        ai = AIClient(settings=settings)
 
         # Screen (CLAUDE.md Principle 5)
         try:
