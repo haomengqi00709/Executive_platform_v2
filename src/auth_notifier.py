@@ -15,6 +15,7 @@ Sender selection (the broken account can't send its own alert):
 
 import json
 import os
+import threading
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -26,6 +27,15 @@ from src.graph import GraphClient
 
 REMINDER_AFTER_DAYS = 7
 MAX_EMAILS = 2
+# Don't re-attempt a notification (send OR dead-letter) more than once per this window.
+# Fixes the runaway where a dead account that can't be emailed (no working sender) never
+# advances sent_count, so _should_send stayed "first" and every failure re-entered.
+_ATTEMPT_BACKOFF = timedelta(days=1)
+
+# Reentrancy guard: check_and_notify → _pick_sender_uid → get_valid_access_token(partner)
+# → (partner fails) → check_and_notify(partner) → ... is a mutual recursion when an
+# owner and its bot are both broken. This thread-local makes any nested call a no-op.
+_notifying = threading.local()
 
 _app_url = os.getenv("APP_URL") or os.getenv("REDIRECT_URI", "").rsplit("/auth/", 1)[0]
 if not _app_url:
@@ -44,13 +54,8 @@ def _dead_letter_path(broken_uid: str) -> Path:
 def _log_dead_letter(broken_uid: str, line: str):
     """Records an undeliverable notification for the broken account. Per-user
     file so we can pull one user's dead-letter history via the admin diag endpoint."""
-    try:
-        path = _dead_letter_path(broken_uid)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a") as f:
-            f.write(f"{datetime.now(timezone.utc).isoformat()}  {line}\n")
-    except Exception:
-        pass
+    auth._capped_append(_dead_letter_path(broken_uid),
+                        f"{datetime.now(timezone.utc).isoformat()}  {line}")
 
 
 def _bot_state(user_id: str) -> dict | None:
@@ -114,6 +119,10 @@ def _pick_sender_uid(broken_uid: str) -> str | None:
             candidates.append(bot)
 
     for uid in candidates:
+        # A broken partner can't send AND probing it re-enters the failure→notify loop.
+        # Skip it before ever calling get_valid_access_token.
+        if auth.get_auth_health(uid).get("status") == "broken":
+            continue
         try:
             auth.get_valid_access_token(uid)
             return uid
@@ -206,11 +215,29 @@ You'll need your IT administrator to fix this — re-signing in won't work.</p>
 def check_and_notify(broken_uid: str):
     """Called after each auth failure. Decides whether to send an email
     based on the user's current health + notification history."""
+    if getattr(_notifying, "active", False):
+        return   # already inside a notify on this thread — never recurse (owner↔bot)
+    _notifying.active = True
     try:
         health = auth.get_auth_health(broken_uid)
         decision = _should_send(health)
         if decision == "skip":
             return
+
+        # Attempt backoff: stamp BEFORE any work so a failure that ends in a dead-letter
+        # (no working sender) doesn't re-enter every cycle. This is the fix for the
+        # unbounded dead-letter growth — sent_count only advanced on a successful send.
+        notes = health.get("notifications") or {}
+        last_attempt = notes.get("last_attempt_at")
+        if last_attempt:
+            try:
+                if datetime.now(timezone.utc) - datetime.fromisoformat(last_attempt) < _ATTEMPT_BACKOFF:
+                    return
+            except Exception:
+                pass
+        notes["last_attempt_at"] = datetime.now(timezone.utc).isoformat()
+        health["notifications"] = notes
+        auth._save_health(broken_uid, health)
 
         recipient = _recipient_email(broken_uid)
         if not recipient:
@@ -247,3 +274,5 @@ def check_and_notify(broken_uid: str):
 
     except Exception as e:
         _log_dead_letter(broken_uid, f"reason=exception  err={e!r}  tb={traceback.format_exc()[-300:]}")
+    finally:
+        _notifying.active = False

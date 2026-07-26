@@ -306,6 +306,9 @@ def auth_callback(code: str = None, state: str = None, error: str = None,
         "expiry":        expiry,
         "username":      username,
     })
+    # Fresh interactive login → clear any "broken" status so the account is un-quarantined
+    # immediately (a previously-broken user who reconnects resumes polling this cycle).
+    auth._record_auth_success(user_id, op="login")
 
     jwt_token = auth.create_jwt(user_id, username)
     resp = RedirectResponse(f"{FRONTEND_URL}/")
@@ -663,6 +666,8 @@ def _poll_teams_bot_all_users():
                     state["_orphan_logged"] = True
                     _write_json(path, state)
                 continue
+            if auth.is_quarantined(uid) or auth.is_quarantined(owner_uid):
+                continue   # broken account within re-probe backoff — skip, no MSAL attempt
             token       = auth.get_valid_access_token(uid)
             graph       = GraphClient(token)
             owner_settings = _read_json(_user_settings(owner_uid))
@@ -712,6 +717,8 @@ def _poll_email_monitor_all_users():
             chat_id   = state.get("chat_id")
             if not chat_id:
                 continue
+            if auth.is_quarantined(uid) or auth.is_quarantined(owner_uid):
+                continue   # broken account within re-probe backoff — skip, no MSAL attempt
             owner_settings = _read_json(_user_settings(owner_uid))
             owner_graph = None
             try:

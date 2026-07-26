@@ -169,6 +169,21 @@ def exchange_code(code: str, redirect_uri: str = None) -> dict:
         raise Exception(result.get("error_description", "Auth failed"))
     return result
 
+# How long a "broken" account is left alone between re-probes. A deleted/expired account
+# never recovers on its own, so retrying it every poll only hammers Azure AD and floods
+# the diag log (the Max Wu incident: 2M+ refreshes, 682MB log, container never sleeps).
+_QUARANTINE_BACKOFF = timedelta(hours=1)
+
+
+class AuthQuarantinedError(Exception):
+    """get_valid_access_token fast-fails with this when an account is 'broken' and still
+    within its re-probe backoff — no MSAL round-trip, no diag line. Callers treat it like
+    any other auth failure (skip this account this cycle)."""
+    def __init__(self, user_id: str):
+        super().__init__(f"Auth quarantined for {user_id} (broken, within backoff)")
+        self.user_id = user_id
+
+
 def get_valid_access_token(user_id: str) -> str:
     """Get a valid MS access token for user, refreshing if needed.
     Tries web-app refresh first; falls back to MSAL cache for device-flow accounts."""
@@ -182,6 +197,25 @@ def get_valid_access_token(user_id: str) -> str:
 
     if datetime.now(timezone.utc) < expiry - timedelta(minutes=5):
         return data["access_token"]
+
+    # Circuit breaker — the token is stale and needs a refresh, but if this account is
+    # already "broken" we re-probe at most once per _QUARANTINE_BACKOFF. Within that
+    # window: fast-fail WITHOUT an MSAL call or a diag line. This is what stops a dead
+    # account from spinning the refresh loop 24/7. A genuine recovery still works: an
+    # interactive re-login writes a fresh valid token + resets health, so it returns via
+    # the cached-token path above and never reaches here.
+    _health = _load_health(user_id)
+    if _health.get("status") == "broken":
+        _last = _health.get("last_refresh_attempt_at")
+        if _last:
+            try:
+                within = datetime.now(timezone.utc) - datetime.fromisoformat(_last) < _QUARANTINE_BACKOFF
+            except Exception:
+                within = False
+            if within:
+                raise AuthQuarantinedError(user_id)
+        _health["last_refresh_attempt_at"] = datetime.now(timezone.utc).isoformat()
+        _save_health(user_id, _health)
 
     last_msal_error: dict | None = None
 
@@ -251,6 +285,45 @@ def get_valid_access_token(user_id: str) -> str:
 
 _BROKEN_THRESHOLD = 4  # consecutive failures before status flips to "broken"
 
+# Structural guard: no matter what writes to a diagnostic log, it can never balloon the
+# volume again. On crossing the cap, ring-buffer down to the last N lines before appending.
+_DIAG_LOG_CAP_BYTES = 2 * 1024 * 1024   # 2MB
+_DIAG_LOG_KEEP_LINES = 500
+
+
+def _capped_append(path: Path, line: str, cap_bytes: int = _DIAG_LOG_CAP_BYTES,
+                   keep_lines: int = _DIAG_LOG_KEEP_LINES):
+    """Append a line; if the file exceeds cap_bytes, first truncate it to its last
+    keep_lines. Bounds every diagnostic log regardless of any upstream loop."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > cap_bytes:
+            try:
+                tail = path.read_text(errors="replace").splitlines()[-keep_lines:]
+                path.write_text("\n".join(tail) + "\n")
+            except Exception:
+                path.write_text("")
+        with open(path, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def is_quarantined(user_id: str) -> bool:
+    """True when an account is 'broken' AND still within its re-probe backoff — schedulers
+    call this to skip it entirely (no token attempt, no work) until the backoff elapses."""
+    h = _load_health(user_id)
+    if h.get("status") != "broken":
+        return False
+    last = h.get("last_refresh_attempt_at")
+    if not last:
+        return False
+    try:
+        return datetime.now(timezone.utc) - datetime.fromisoformat(last) < _QUARANTINE_BACKOFF
+    except Exception:
+        return False
+
+
 def _health_path(user_id: str) -> Path:
     return user_data_dir(user_id) / ".auth_health.json"
 
@@ -278,13 +351,7 @@ def _save_health(user_id: str, health: dict):
 
 
 def _append_diag_log(user_id: str, line: str):
-    try:
-        path = _diag_log_path(user_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+    _capped_append(_diag_log_path(user_id), line)
 
 
 def _record_auth_success(user_id: str, op: str):
@@ -296,6 +363,7 @@ def _record_auth_success(user_id: str, op: str):
         "consecutive_failures": 0,
         "last_success_at": now,
         "broken_since": None,
+        "last_refresh_attempt_at": None,   # clear the quarantine stamp on recovery
     })
     # On recovery, clear the notification history so the NEXT break gets a
     # fresh "first" email, not a stale "skip" from the previous broken cycle.
