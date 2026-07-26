@@ -16,7 +16,8 @@ from dotenv import load_dotenv
 _PRESERVE_ENV = {k: os.environ[k]
                  for k in ("GEMINI_API_KEY", "GEMINI_MODEL", "GEMINI_SEARCH_TIMEOUT_SECS", "DATA_DIR",
                            "FALLBACK_API_KEY", "FALLBACK_MODEL", "FALLBACK_BASE_URL",
-                           "KIMI_API_KEY", "KIMI_MODEL", "AI_DEFAULT_PROVIDER")
+                           "KIMI_API_KEY", "KIMI_MODEL", "AI_DEFAULT_PROVIDER",
+                           "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL")
                  if k in os.environ}
 load_dotenv(override=True)
 os.environ.update(_PRESERVE_ENV)
@@ -41,6 +42,14 @@ PROVIDERS = {
         "key_env": "KIMI_API_KEY",
         "key_env_fallback": "FALLBACK_API_KEY",   # prod has carried the Kimi key here since the bot-fallback rollout
         "model": os.getenv("KIMI_MODEL", "kimi-k2.6"),
+    },
+    "deepseek": {
+        "api": "openai",
+        "base_url": "https://api.deepseek.com/v1",
+        "key_env": "DEEPSEEK_API_KEY",
+        # deepseek-v4-flash = the cheap tier ($0.14/$0.28); legacy deepseek-chat alias
+        # was deprecated 2026-07-24. deepseek-v4-pro is the stronger/pricier option.
+        "model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
     },
     "gemini": {"api": "genai", "model": DEFAULT_GEMINI_MODEL},
 }

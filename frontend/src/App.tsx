@@ -543,6 +543,7 @@ function SettingsPage({ user, onBrandingChange }: { user: AuthUser; onBrandingCh
               className="self-start px-2 py-1.5 text-xs bg-executive-bg border border-executive-border rounded-lg focus:outline-none focus:border-executive-accent/60"
             >
               <option value="">Platform default</option>
+              <option value="deepseek">DeepSeek (cheapest)</option>
               <option value="kimi">Kimi (Moonshot)</option>
               <option value="gemini">Gemini (Google)</option>
             </select>

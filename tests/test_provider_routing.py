@@ -99,3 +99,28 @@ def test_kimi_pricing_row_no_longer_falls_back_to_gemini35():
     assert kimi is _MODEL_PRICING["kimi-k2.6"]                 # dedicated row, not fallback
     assert kimi["search"] == 0.0                               # no search SKU on Kimi
     assert _pricing_for("unknown-model") is _MODEL_PRICING["gemini-3.5-flash"]  # fallback intact
+
+
+def test_deepseek_provider_registered_and_priced(monkeypatch):
+    from src.ai import PROVIDERS
+    from src.modules.token_usage import _pricing_for, _MODEL_PRICING
+    ds = PROVIDERS["deepseek"]
+    assert ds["api"] == "openai" and "deepseek.com" in ds["base_url"]
+    assert ds["model"] == "deepseek-v4-flash"
+    # priced from its own row, not the pricey gemini fallback (would over-report by ~10x)
+    assert _pricing_for("deepseek-v4-flash") is _MODEL_PRICING["deepseek-v4-flash"]
+    assert _MODEL_PRICING["deepseek-v4-flash"]["in"] < _MODEL_PRICING["gemini-2.5-flash"]["in"]
+
+
+def test_deepseek_selectable_and_routes_openai(monkeypatch):
+    fake = FakeOAI(content="deepseek routed")
+    monkeypatch.setattr(ai_mod, "_openai_client", lambda prov: fake)
+    from src.modules import token_usage
+    rec = {}
+    monkeypatch.setattr(token_usage, "record",
+                        lambda f, u, p, o, t, **k: rec.update(model=k.get("model")))
+    c = AIClient(settings={"ai_provider": "deepseek"})
+    assert c.provider == "deepseek" and c.generate("hi") == "deepseek routed"
+    assert fake.calls[0]["model"] == "deepseek-v4-flash"
+    assert rec["model"] == "deepseek-v4-flash"                 # priced as DeepSeek
+    assert c.client is not None                                # gemini pinned surface intact
