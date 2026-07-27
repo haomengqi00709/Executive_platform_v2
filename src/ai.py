@@ -313,7 +313,16 @@ class AIClient:
 
     def generate(self, prompt: str) -> str:
         if PROVIDERS[self.provider]["api"] == "openai":
-            return self._generate_openai(prompt)
+            try:
+                return self._generate_openai(prompt)
+            except Exception as e:
+                # DeepSeek/Kimi down or refusing → cover with Gemini so a provider outage
+                # never breaks a section/briefing. The genai client is always constructed.
+                print(f"  [{self.provider}] text generate failed ({e}) — falling back to Gemini")
+                return self._generate_gemini(prompt)
+        return self._generate_gemini(prompt)
+
+    def _generate_gemini(self, prompt: str) -> str:
         _budget_guard()
         _late = _late_usage_recorder(dict(_usage_ctx.get()), self.model, is_search=False)
         for attempt in range(2):

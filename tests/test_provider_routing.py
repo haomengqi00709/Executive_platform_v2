@@ -112,6 +112,18 @@ def test_deepseek_provider_registered_and_priced(monkeypatch):
     assert _MODEL_PRICING["deepseek-v4-flash"]["in"] < _MODEL_PRICING["gemini-2.5-flash"]["in"]
 
 
+def test_openai_failure_falls_back_to_gemini(monkeypatch):
+    """DeepSeek/Kimi outage must not break a section — generate() covers with Gemini."""
+    monkeypatch.setattr(ai_mod, "_openai_client",
+                        lambda prov: (_ for _ in ()).throw(RuntimeError("provider down")))
+    from src.modules import token_usage
+    monkeypatch.setattr(token_usage, "record", lambda *a, **k: None)
+    c = AIClient(settings={"ai_provider": "deepseek"})
+    resp = SimpleNamespace(text="gemini rescued", usage_metadata=None, candidates=[])
+    c.client = SimpleNamespace(models=SimpleNamespace(generate_content=lambda **k: resp))
+    assert c.generate("hi") == "gemini rescued"      # fell back to the pinned genai client
+
+
 def test_deepseek_selectable_and_routes_openai(monkeypatch):
     fake = FakeOAI(content="deepseek routed")
     monkeypatch.setattr(ai_mod, "_openai_client", lambda prov: fake)
