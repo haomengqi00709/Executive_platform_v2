@@ -124,6 +124,44 @@ def test_openai_failure_falls_back_to_gemini(monkeypatch):
     assert c.generate("hi") == "gemini rescued"      # fell back to the pinned genai client
 
 
+def test_search_routes_to_deepseek_and_parses_sources(monkeypatch):
+    """generate_with_search on a deepseek provider hits _search_deepseek, not Gemini grounding."""
+    called = {"deepseek": 0}
+    def _fake_ds(self, prompt, timeout_secs=None):
+        called["deepseek"] += 1
+        return "market summary", [{"title": "ENR", "url": "https://enr.com/x"}]
+    monkeypatch.setattr(AIClient, "_search_deepseek", _fake_ds)
+    c = AIClient(settings={"ai_provider": "deepseek"})
+    assert c.generate_with_search("news?") == "market summary"
+    txt, srcs = c.generate_with_search_cited("news?")
+    assert txt == "market summary" and srcs[0]["url"] == "https://enr.com/x"
+    assert called["deepseek"] == 2                    # both search methods routed to DeepSeek
+
+
+def test_search_falls_back_to_gemini_when_deepseek_search_errors(monkeypatch):
+    monkeypatch.setattr(AIClient, "_search_deepseek",
+                        lambda self, p, t=None: (_ for _ in ()).throw(RuntimeError("ds search down")))
+    c = AIClient(settings={"ai_provider": "deepseek"})
+    # fake the pinned genai client to answer the fallback grounded call
+    resp = SimpleNamespace(text="gemini grounded", usage_metadata=None, candidates=[])
+    c.client = SimpleNamespace(models=SimpleNamespace(generate_content=lambda **k: resp))
+    from src.modules import token_usage
+    monkeypatch.setattr(token_usage, "record", lambda *a, **k: None)
+    assert c.generate_with_search("news?") == "gemini grounded"   # fell back to Gemini search
+
+
+def test_gemini_user_search_stays_on_gemini(monkeypatch):
+    monkeypatch.setattr(ai_mod, "AI_DEFAULT_PROVIDER", "gemini")
+    monkeypatch.setattr(AIClient, "_search_deepseek",
+                        lambda self, p, t=None: (_ for _ in ()).throw(AssertionError("should not call deepseek")))
+    c = AIClient(settings={"ai_provider": "gemini"})
+    resp = SimpleNamespace(text="g", usage_metadata=None, candidates=[])
+    c.client = SimpleNamespace(models=SimpleNamespace(generate_content=lambda **k: resp))
+    from src.modules import token_usage
+    monkeypatch.setattr(token_usage, "record", lambda *a, **k: None)
+    assert c.generate_with_search("q") == "g"          # gemini provider never touches DeepSeek search
+
+
 def test_deepseek_selectable_and_routes_openai(monkeypatch):
     fake = FakeOAI(content="deepseek routed")
     monkeypatch.setattr(ai_mod, "_openai_client", lambda prov: fake)

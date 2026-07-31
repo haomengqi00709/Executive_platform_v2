@@ -50,9 +50,18 @@ PROVIDERS = {
         # deepseek-v4-flash = the cheap tier ($0.14/$0.28); legacy deepseek-chat alias
         # was deprecated 2026-07-24. deepseek-v4-pro is the stronger/pricier option.
         "model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+        # DeepSeek DOES have native web search — but only via its Anthropic-compatible
+        # endpoint (server-side web_search tool), not the OpenAI chat path above. So search
+        # routes through _search_deepseek. Validated accurate + no-hallucination vs Gemini.
+        "search": "deepseek",
     },
-    "gemini": {"api": "genai", "model": DEFAULT_GEMINI_MODEL},
+    "gemini": {"api": "genai", "model": DEFAULT_GEMINI_MODEL, "search": "gemini"},
 }
+# DeepSeek native web search (Anthropic Messages protocol). Only vision/transcription and
+# the bot's search_web tool stay on Gemini now; market/company-intel search can use DeepSeek.
+_DEEPSEEK_ANTHROPIC_URL = "https://api.deepseek.com/anthropic/v1/messages"
+_SEARCH_MAX_TOKENS = int(os.getenv("DEEPSEEK_SEARCH_MAX_TOKENS", "2500"))
+_SEARCH_MAX_USES = int(os.getenv("DEEPSEEK_SEARCH_MAX_USES", "4"))   # cap internal searches/call
 # Platform default provider. Ships as "gemini" (zero behavior change); flipped to "kimi" on
 # Railway once the graduated rollout validates. Per-user settings.ai_provider overrides it.
 AI_DEFAULT_PROVIDER = os.getenv("AI_DEFAULT_PROVIDER", "gemini")
@@ -528,12 +537,67 @@ class AIClient:
         that don't go through the metered generate* methods."""
         _record_usage(response, is_search=is_search, model=self.model)
 
+    def _search_deepseek(self, prompt: str, timeout_secs: int | None = None) -> tuple[str, list]:
+        """Web search via DeepSeek's Anthropic-compatible endpoint (server-side web_search
+        tool). Returns (text, [{title,url}]). Records token + web-search-request usage under
+        the DeepSeek model so search volume stays visible (the June-bill lesson)."""
+        import json as _json
+        import urllib.request
+        _budget_guard()
+        prov = PROVIDERS[self.provider]
+        key = (os.getenv(prov.get("key_env") or "", "")
+               or os.getenv(prov.get("key_env_fallback") or "", "")).strip()
+        eff_timeout = timeout_secs or _GEMINI_SEARCH_TIMEOUT_SECS
+        body = {
+            "model": prov["model"], "max_tokens": _SEARCH_MAX_TOKENS,
+            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": _SEARCH_MAX_USES}],
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        req = urllib.request.Request(
+            _DEEPSEEK_ANTHROPIC_URL, data=_json.dumps(body).encode(),
+            headers={"content-type": "application/json", "x-api-key": key,
+                     "anthropic-version": "2023-06-01"}, method="POST")
+        with urllib.request.urlopen(req, timeout=eff_timeout) as r:
+            data = _json.loads(r.read())
+        text_parts, sources, seen = [], [], set()
+        def _add(url, title):
+            if url and url not in seen:
+                seen.add(url); sources.append({"title": title or "", "url": url})
+        for b in data.get("content", []):
+            t = b.get("type")
+            if t == "text":
+                text_parts.append(b.get("text", ""))
+                for c in (b.get("citations") or []):
+                    _add(c.get("url"), c.get("title"))
+            elif t == "web_search_tool_result":
+                for res in (b.get("content") or []):
+                    if isinstance(res, dict):
+                        _add(res.get("url"), res.get("title"))
+        self._record_deepseek_search_usage(data.get("usage") or {}, prov["model"])
+        return "".join(text_parts).strip(), sources
+
+    def _record_deepseek_search_usage(self, usage: dict, model: str) -> None:
+        try:
+            from src.modules import token_usage
+            tag = _usage_ctx.get()
+            pin = usage.get("input_tokens", 0) or 0
+            out = usage.get("output_tokens", 0) or 0
+            reqs = (usage.get("server_tool_use") or {}).get("web_search_requests", 0) or 0
+            token_usage.record(tag.get("feature", "unknown"), tag.get("uid", "unknown"),
+                               pin, out, pin + out, is_search=True, search_queries=reqs, model=model)
+        except Exception:
+            pass
+
     def generate_with_search(self, prompt: str, timeout_secs: int | None = None) -> str:
-        """Generate content with Google Search grounding (real-time web search).
-        Search-grounded calls can be slower than plain generate; defaults to the
-        same 60s budget as generate() with one retry on timeout. Callers running a
-        single rich instruction-driven search (market_intelligence) pass a larger
-        timeout_secs so the search isn't chopped into generic batches to fit 60s."""
+        """Generate content with real-time web search grounding. Routes to DeepSeek's native
+        web search when the provider supports it (cheaper, off the Gemini spend cap), else
+        Google Search grounding. Callers running a single rich instruction-driven search
+        (market_intelligence) pass a larger timeout_secs."""
+        if PROVIDERS[self.provider].get("search") == "deepseek":
+            try:
+                return self._search_deepseek(prompt, timeout_secs)[0]
+            except Exception as e:
+                print(f"  deepseek search failed ({e}) — falling back to Gemini search")
         _budget_guard()
         eff_timeout = timeout_secs or _GEMINI_SEARCH_TIMEOUT_SECS
         _late = _late_usage_recorder(dict(_usage_ctx.get()), self.model, is_search=True)
@@ -590,6 +654,11 @@ class AIClient:
         IPs; Gemini grounding is the same reliable path the main search uses). Returns
         (text, [{title, url}]); ("", []) on failure is a legitimate 'nothing found' outcome —
         enrich is best-effort and must never crash the run."""
+        if PROVIDERS[self.provider].get("search") == "deepseek":
+            try:
+                return self._search_deepseek(prompt, timeout_secs)
+            except Exception as e:
+                print(f"  deepseek cited search failed ({e}) — falling back to Gemini")
         _budget_guard()
         eff_timeout = timeout_secs or _GEMINI_SEARCH_TIMEOUT_SECS
         _late = _late_usage_recorder(dict(_usage_ctx.get()), self.model, is_search=True)

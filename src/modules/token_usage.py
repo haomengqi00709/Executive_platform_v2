@@ -34,10 +34,12 @@ _MODEL_PRICING = {
     # bot_fallback's Kimi rows silently fell back to gemini-3.5-flash pricing.
     "kimi-k2.6": {"in": 0.95 / 1e6, "out": 4.00 / 1e6, "search_unit": "request", "search": 0.0},
     # DeepSeek V4 (OpenAI-compatible, api.deepseek.com), official list price 2026-07.
-    # No search SKU. Cache-hit input is far cheaper ($0.0028/M Flash) but we price at the
-    # cache-miss rate so we never under-estimate.
-    "deepseek-v4-flash": {"in": 0.14 / 1e6, "out": 0.28 / 1e6, "search_unit": "request", "search": 0.0},
-    "deepseek-v4-pro":   {"in": 0.435 / 1e6, "out": 0.87 / 1e6, "search_unit": "request", "search": 0.0},
+    # Cache-hit input is far cheaper ($0.0028/M Flash) but we price at the cache-miss rate so
+    # we never under-estimate. DeepSeek doesn't publish a web-search-request price, so we bill
+    # search per web_search_request at the Anthropic reference ($10/1000 = $0.01) — a HIGH
+    # estimate flagged for reconciliation, so search volume stays visible (June-bill lesson).
+    "deepseek-v4-flash": {"in": 0.14 / 1e6, "out": 0.28 / 1e6, "search_unit": "query", "search": 10 / 1000},
+    "deepseek-v4-pro":   {"in": 0.435 / 1e6, "out": 0.87 / 1e6, "search_unit": "query", "search": 10 / 1000},
 }
 # Records that predate model tracking (or use an unknown model) are priced as the pricier
 # 3.5 so we never UNDER-estimate (3.5 was the 2026-06 incident default).
