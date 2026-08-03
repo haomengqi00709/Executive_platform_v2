@@ -33,7 +33,8 @@ export default function ExpensesTab() {
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [categoryFilter, setCategoryFilter] = useState<string>('all');
-  const [docType, setDocType] = useState<'receipt' | 'invoice' | 'contract'>('receipt');
+  // Expenses are reimbursable receipts only (invoices/contracts are no longer captured).
+  const docType = 'receipt' as const;
   const [savingId, setSavingId] = useState<string | null>(null);
   const [edit, setEdit] = useState<EditState | null>(null);
   const [viewingPhotoId, setViewingPhotoId] = useState<string | null>(null);
@@ -80,15 +81,6 @@ export default function ExpensesTab() {
     setEdit(null);
   };
 
-  const counts = useMemo(() => {
-    const c = { receipt: 0, invoice: 0, contract: 0 };
-    for (const r of rows) {
-      const dt = (r.document_type as 'receipt' | 'invoice' | 'contract') || 'receipt';
-      if (dt in c) c[dt]++;
-    }
-    return c;
-  }, [rows]);
-
   const visible = useMemo(() => {
     return rows.filter(r => {
       if (((r.document_type as string) || 'receipt') !== docType) return false;
@@ -119,22 +111,6 @@ export default function ExpensesTab() {
   return (
     <div className="space-y-4">
       <HistoricalScanBanner onRowsChanged={refresh} initialRowCount={rows.length} />
-
-      <div className="flex items-center gap-1 border-b border-executive-border">
-        {([['receipt', 'Receipts'], ['invoice', 'Invoices'], ['contract', 'Contracts']] as const).map(([t, label]) => (
-          <button
-            key={t}
-            onClick={() => setDocType(t)}
-            className={`px-3 py-1.5 text-xs font-medium border-b-2 -mb-px transition-colors ${
-              docType === t
-                ? 'border-executive-accent text-executive-text'
-                : 'border-transparent text-executive-muted hover:text-executive-text'
-            }`}
-          >
-            {label} <span className="text-executive-muted">({counts[t]})</span>
-          </button>
-        ))}
-      </div>
 
       <header className="flex flex-wrap items-center gap-3 justify-between">
         <div className="text-xs text-executive-muted">
@@ -191,14 +167,6 @@ export default function ExpensesTab() {
         <div className="text-center text-sm text-executive-muted py-12">
           No {docType}s captured yet, or none match the filter.
         </div>
-      ) : docType !== 'receipt' ? (
-        <DocTable
-          rows={visible}
-          docType={docType}
-          savingId={savingId}
-          onView={setViewingPhotoId}
-          onDelete={remove}
-        />
       ) : (
         <div className="bg-executive-card border border-executive-border rounded-xl overflow-hidden overflow-x-auto">
           <table className="w-full text-sm min-w-[900px]">
@@ -314,77 +282,6 @@ export default function ExpensesTab() {
   );
 }
 
-// ───────────────────────────────────────────────────────────
-
-function DocTable({
-  rows, docType, savingId, onView, onDelete,
-}: {
-  rows: ExpenseRow[]; docType: 'invoice' | 'contract';
-  savingId: string | null; onView: (id: string) => void; onDelete: (id: string) => void;
-}) {
-  const isInvoice = docType === 'invoice';
-  const today = new Date().toISOString().slice(0, 10);
-  return (
-    <div className="bg-executive-card border border-executive-border rounded-xl overflow-hidden overflow-x-auto">
-      <table className="w-full text-sm min-w-[800px]">
-        <thead className="bg-executive-bg border-b border-executive-border">
-          <tr className="text-xs text-executive-muted uppercase tracking-wider">
-            <th className="text-left px-3 py-2 font-medium">Date</th>
-            <th className="text-left px-3 py-2 font-medium">{isInvoice ? 'Vendor' : 'Counterparty'}</th>
-            <th className="text-left px-3 py-2 font-medium">{isInvoice ? 'Description' : 'Agreement'}</th>
-            {isInvoice && <th className="text-right px-3 py-2 font-medium">Amount</th>}
-            {isInvoice && <th className="text-left px-3 py-2 font-medium">Due</th>}
-            <th className="text-center px-3 py-2 font-medium">File</th>
-            <th className="text-right px-3 py-2 font-medium"></th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map(r => {
-            const hasAttachment = !!r.Attachment && String(r.Attachment).trim() !== '';
-            const overdue = isInvoice && !!r.Due_Date && String(r.Due_Date) < today;
-            return (
-              <tr key={r.id} className="border-b border-executive-border/60 last:border-b-0 hover:bg-executive-border/10">
-                <td className="px-3 py-2 text-xs text-executive-muted whitespace-nowrap">{r.Date || '—'}</td>
-                <td className="px-3 py-2">{(isInvoice ? r.Vendor : r.Counterparty) || '—'}</td>
-                <td className="px-3 py-2 text-executive-muted truncate max-w-[20rem]">{r.Subject || '—'}</td>
-                {isInvoice && <td className="px-3 py-2 text-right tabular-nums">{r.Amount ?? '—'} {r.Currency || ''}</td>}
-                {isInvoice && (
-                  <td className={`px-3 py-2 text-xs whitespace-nowrap ${overdue ? 'text-rose-400 font-medium' : 'text-executive-muted'}`}>
-                    {r.Due_Date || '—'}{overdue ? ' · overdue' : ''}
-                  </td>
-                )}
-                <td className="px-3 py-2 text-center">
-                  {hasAttachment ? (
-                    <button
-                      onClick={() => onView(r.id)}
-                      className="text-xs p-1 rounded-md text-executive-muted hover:text-executive-accent hover:bg-executive-accent/10 transition-colors"
-                      title={`View ${r.Attachment}`}
-                    >
-                      <ImageIcon size={14} />
-                    </button>
-                  ) : <span className="text-xs text-executive-muted/40">—</span>}
-                </td>
-                <td className="px-3 py-2 text-right">
-                  {savingId === r.id ? (
-                    <Loader2 size={12} className="inline animate-spin text-executive-muted" />
-                  ) : (
-                    <button
-                      onClick={() => onDelete(r.id)}
-                      className="text-xs p-1 rounded-md text-executive-muted hover:text-rose-400 hover:bg-rose-400/10 transition-colors"
-                      title="Delete"
-                    >
-                      <Trash2 size={12} />
-                    </button>
-                  )}
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
-  );
-}
 
 function PhotoModal({
   rowId, row, onClose,

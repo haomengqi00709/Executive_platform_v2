@@ -389,7 +389,7 @@ function Step2Confirm({
             'Schedule a daily morning briefing in Teams',
             'Push new important emails to Teams as they arrive',
             'Watch OneDrive for meeting recordings — summarize automatically',
-            'Capture invoices and receipts from email attachments',
+            'Capture reimbursable receipts from email attachments',
           ].map(t => (
             <li key={t} className="flex items-start gap-2">
               <ChevronRight size={11} className="mt-0.5 text-executive-accent shrink-0" />

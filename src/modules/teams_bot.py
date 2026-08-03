@@ -219,23 +219,10 @@ def _store_incoming_file(owner_graph, filename, file_bytes, mime, doc_type="file
 
 
 def _expense_summary(item: dict) -> str:
-    dt = item.get("document_type")
-    if dt == "invoice":
-        return (f"invoice from {item.get('vendor','?')} for {item.get('amount','?')} "
-                f"{item.get('currency','')} due {item.get('due_date') or '?'}")
-    if dt == "contract":
-        return f"contract with {item.get('counterparty','?')} — {item.get('subject','')}"
     return f"receipt from {item.get('vendor','?')} for {item.get('amount','?')} {item.get('currency','')}"
 
 
 def _expense_capture_reply(item: dict) -> str:
-    dt = item.get("document_type")
-    if dt == "invoice":
-        return (f"🧾 Invoice saved — {item.get('vendor','?')} | {item.get('amount','?')} "
-                f"{item.get('currency','CAD')} | due {item.get('due_date') or '?'}. It's in your dashboard under Invoices.")
-    if dt == "contract":
-        return (f"📄 Contract saved — {item.get('counterparty','?')} · {item.get('subject','')}. "
-                f"It's in your dashboard under Contracts.")
     return (f"✅ Receipt captured — {item.get('vendor','?')} | {item.get('amount','?')} "
             f"{item.get('currency','CAD')} [{item.get('category','Other')}]. Added to your expense report.")
 
@@ -244,8 +231,9 @@ def _handle_teams_receipt(msg: dict, chat_id: str, graph, ai,
                            owner_graph=None, data_dir=None, settings=None, bot_state=None) -> tuple:
     """
     Route a Teams attachment to the right pipeline.
-    AI classifies the document — receipt/invoice/contract → expenses store (all three persist now);
-    business_card → CRM ingest + auto-draft outreach. The file is also stored to OneDrive and a handle
+    AI classifies the document — receipt → expenses store (invoices/contracts are recognized but
+    not reimbursable, so not recorded); business_card → CRM ingest + auto-draft outreach. The file
+    is also stored to OneDrive and a handle
     is put on bot_state["pending_file"] so the agent can act on it ("forward this to X").
     Returns (reply_str | None, pending_expense | None).
     """
@@ -449,24 +437,24 @@ def _handle_teams_receipt(msg: dict, chat_id: str, graph, ai,
 
         return "\n".join(lines), None
 
-    # ── receipt / invoice / contract → expenses store (ALL THREE persist now) ──
-    if doc_type not in ("receipt", "invoice", "contract"):
-        # A file we can't file as an expense or a card — still keep it so the agent can act on it.
+    # ── receipt → expenses store. Invoices (bills to pay) and contracts (agreements) are not
+    #    reimbursable expenses, so they are recognized but NOT recorded. ──
+    if doc_type != "receipt":
+        # Not a reimbursable receipt — keep the file so the agent can still act on it
+        # (forward etc.), but don't record it as an expense.
         if bot_state is not None:
             bot_state["pending_file"] = _store_incoming_file(owner_graph, filename, img_bytes, mime, "file", "")
-        return ("I saved that file. Tell me what you'd like me to do with it — forward it to someone, "
-                "or file it as a receipt / invoice / contract."), None
+        return ("I saved that file. Tell me what you'd like me to do with it — forward it to "
+                "someone, or file it as a receipt."), None
 
     today  = datetime.now().strftime("%Y-%m-%d")
     amount = result.get("amount") or 0
     gst    = result.get("gst_hst") or 0
     net    = result.get("net_amount") or (round(amount - gst, 2) if gst else "")
     item = {
-        "document_type": doc_type,
+        "document_type": "receipt",
         "vendor":        result.get("vendor", ""),
-        "counterparty":  result.get("counterparty", ""),
         "date":          result.get("date", today),
-        "due_date":      result.get("due_date"),
         "amount":        amount,
         "currency":      result.get("currency", "CAD"),
         "gst_hst":       gst or "",

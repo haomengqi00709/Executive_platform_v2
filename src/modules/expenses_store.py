@@ -143,7 +143,7 @@ def _maybe_import(con, data_dir) -> None:
     now = _now_iso()
     items = _excel_rows(data_dir / "expenses" / "expenses_master.xlsx")   # receipts (cumulative)
     for it in (_read_json(data_dir / "results" / "expenses.json").get("items") or []):
-        if it.get("document_type") in ("receipt", "invoice", "contract"):
+        if (it.get("document_type") or "receipt") == "receipt":   # expenses = receipts only
             items.append({**it, "source_type": it.get("source_type") or "email"})
     try:
         for it in items:
@@ -162,13 +162,14 @@ def _maybe_import(con, data_dir) -> None:
 
 
 def _verify_import(con, data_dir: Path) -> bool:
-    """Best-effort self-check: store expense count must equal (xlsx receipts + json invoices/contracts,
-    de-duplicated by id). Writes a durable verdict to expenses_meta + logs. Never raises."""
+    """Best-effort self-check: store expense count must equal xlsx receipts (+ any receipt rows
+    still in results/expenses.json), de-duplicated by id. Writes a durable verdict to
+    expenses_meta + logs. Never raises."""
     try:
         data_dir = Path(data_dir)
         src = _excel_rows(data_dir / "expenses" / "expenses_master.xlsx")
         for it in (_read_json(data_dir / "results" / "expenses.json").get("items") or []):
-            if it.get("document_type") in ("receipt", "invoice", "contract"):
+            if (it.get("document_type") or "receipt") == "receipt":
                 src.append(it)
         src_ids = {expense_id(it) for it in src}
         store_ids = {r["id"] for r in con.execute("SELECT id FROM expenses")}
@@ -319,16 +320,33 @@ def load_expenses(data_dir, doc_type=None) -> list[dict]:
 
 
 def write_projection(data_dir) -> None:
-    """Regenerate expenses_master.xlsx (receipts only — reimbursement export) + results/expenses.json
-    (all types — section route / legacy readers) from the store. Best-effort, atomic."""
+    """Regenerate expenses_master.xlsx + results/expenses.json from the store. Expenses are
+    reimbursable RECEIPTS only — any invoice/contract rows captured before that policy are
+    purged here so they disappear everywhere (dashboard/API/xlsx all read this store).
+    Best-effort, atomic."""
     data_dir = Path(data_dir)
-    items = load_expenses(data_dir)
     con = _conn(data_dir)
     try:
+        # Purge legacy invoice/contract rows. document_type lives inside the JSON `data` blob
+        # (the table is id/data/updated_at), so scan + delete by id. A missing/NULL type
+        # predates the field and is treated as a receipt everywhere, so it's kept.
+        stale = []
+        for row in con.execute("SELECT id, data FROM expenses"):
+            try:
+                dt = (json.loads(row["data"]) or {}).get("document_type") or "receipt"
+            except Exception:
+                dt = "receipt"
+            if dt != "receipt":
+                stale.append(row["id"])
+        for rid in stale:
+            con.execute("DELETE FROM expenses WHERE id = ?", (rid,))
+        if stale:
+            con.commit()
         last_run = _meta(con, "last_run")
     finally:
         con.close()
-    # results/expenses.json — ALL types
+    items = load_expenses(data_dir)   # receipts only after the purge
+    # results/expenses.json — receipts only
     try:
         res = {
             "id":       "expenses",

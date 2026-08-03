@@ -1,5 +1,7 @@
 """
-Expense capture section — scans email attachments for receipts and invoices.
+Expense capture section — scans email attachments for reimbursable receipts only.
+Invoices (bills to pay) and contracts (legal agreements) are classified so a bill is never
+mistaken for a receipt, then dropped — they are not reimbursable expenses.
 
 Does NOT use the screener. Screener answers "should CEO read this email?".
 This section answers "is this attachment a receipt?" — only Gemini looking at the
@@ -59,6 +61,11 @@ _EXTRACT_PROMPT = """Analyze this document and classify it. Return JSON with the
 
 If "other", return only: {"document_type": "other"}
 
+Still classify invoices and contracts correctly (do NOT relabel a bill-to-pay or an
+agreement as a "receipt") — they are just skipped, not recorded. Only a PAID receipt is a
+reimbursable expense. For "invoice", "contract", or "other", return only their document_type,
+e.g. {"document_type": "invoice"}.
+
 If "business_card", look carefully — a single image may contain MULTIPLE cards laid out together
 or a roster page may list many people. Return an array of contacts, one per visible card/row:
 {
@@ -71,17 +78,15 @@ or a roster page may list many people. Return an array of contacts, one per visi
 }
 If a card has NO email visible, do NOT include it (we need email for follow-up).
 
-If "receipt" / "invoice" / "contract", also include:
-- "vendor": string (company or store name; for contracts use empty string)
-- "counterparty": string (for contracts only — the other party in the agreement; for receipts/invoices use empty string)
-- "date": string (YYYY-MM-DD; document date, invoice issue date, or contract effective date)
-- "due_date": string or null (for invoices only — when payment is due, YYYY-MM-DD)
-- "amount": number or null (total amount; null for contracts without explicit value)
+If "receipt", also include:
+- "vendor": string (company or store name)
+- "date": string (YYYY-MM-DD; the receipt date)
+- "amount": number or null (total amount paid)
 - "currency": string (CAD / USD / EUR / etc., or empty if N/A)
-- "gst_hst": number or null (receipts only)
-- "net_amount": number or null (before tax, receipts only)
+- "gst_hst": number or null (tax portion)
+- "net_amount": number or null (before tax)
 - "category": one of ["Travel", "Meals", "Software", "Services", "Equipment", "Utilities", "Legal", "Other"]
-- "subject": string (short title — for contracts use the agreement name; for invoices the bill description)
+- "subject": string (short title of the purchase)
 - "confidence": "high" | "medium" | "low"
 
 Respond with valid JSON only."""
@@ -214,7 +219,7 @@ def run(
     progress=None,
 ) -> dict:
     """
-    Scan email attachments for receipts and invoices.
+    Scan email attachments for reimbursable receipts only.
 
     Returns standard section result dict.
     """
@@ -324,17 +329,20 @@ def run(
             if not extracted:
                 continue
             doc_type = extracted.get("document_type", "other")
-            if doc_type not in ("receipt", "invoice", "contract"):
+            # Mark the content hash seen for any classified business document (incl. invoice/
+            # contract) so the SAME file arriving from another email isn't re-classified — even
+            # though only receipts are recorded now.
+            if doc_type in ("receipt", "invoice", "contract"):
+                store.mark_seen(data_dir, f"sha256:{file_hash}")
+            # Only PAID receipts are captured. Invoices (bills to pay) and contracts (legal
+            # agreements) are recognized then dropped — they are not reimbursable expenses.
+            if doc_type != "receipt":
                 continue
 
-            store.mark_seen(data_dir, f"sha256:{file_hash}")
-
             item = {
-                "document_type": doc_type,
+                "document_type": "receipt",
                 "vendor":        extracted.get("vendor", ""),
-                "counterparty":  extracted.get("counterparty", ""),
                 "date":          extracted.get("date", ""),
-                "due_date":      extracted.get("due_date"),
                 "amount":        extracted.get("amount", ""),
                 "currency":      extracted.get("currency", ""),
                 "gst_hst":       extracted.get("gst_hst"),
@@ -353,34 +361,26 @@ def run(
             }
 
             # Receipts get uploaded to OneDrive so the photo endpoint can render them; keep the path.
-            if doc_type == "receipt":
-                ext_up = Path(att_name).suffix.lower() or ".bin"
-                mime_for_upload = {
-                    ".pdf":  "application/pdf",
-                    ".jpg":  "image/jpeg", ".jpeg": "image/jpeg",
-                    ".png":  "image/png",  ".gif":  "image/gif",
-                    ".webp": "image/webp", ".bmp":  "image/bmp",
-                    ".tiff": "image/tiff", ".tif":  "image/tiff",
-                }.get(ext_up, "application/octet-stream")
-                item["onedrive_path"] = f"CEO Platform/Receipts/{att_name}"
-                try:
-                    graph.upload_to_onedrive(item["onedrive_path"], file_bytes, mime_for_upload)
-                except Exception as up_err:
-                    log(f"    OneDrive upload failed (kept expense row): {up_err}")
+            ext_up = Path(att_name).suffix.lower() or ".bin"
+            mime_for_upload = {
+                ".pdf":  "application/pdf",
+                ".jpg":  "image/jpeg", ".jpeg": "image/jpeg",
+                ".png":  "image/png",  ".gif":  "image/gif",
+                ".webp": "image/webp", ".bmp":  "image/bmp",
+                ".tiff": "image/tiff", ".tif":  "image/tiff",
+            }.get(ext_up, "application/octet-stream")
+            item["onedrive_path"] = f"CEO Platform/Receipts/{att_name}"
+            try:
+                graph.upload_to_onedrive(item["onedrive_path"], file_bytes, mime_for_upload)
+            except Exception as up_err:
+                log(f"    OneDrive upload failed (kept expense row): {up_err}")
 
-            # Every type persists to the store now (receipt/invoice/contract) — project once at the end.
             store.upsert_expense(data_dir, item, project=False)
             new_items.append(item)
-
-            if doc_type == "receipt":
-                log(f"    Receipt: {item['vendor']} {item['amount']} {item['currency']} [{item['category']}]")
-            elif doc_type == "invoice":
-                log(f"    Invoice: {item['vendor']} {item['amount']} {item['currency']} due {item.get('due_date') or '?'}")
-            elif doc_type == "contract":
-                log(f"    Contract: {item['counterparty']} — {item['subject']}")
+            log(f"    Receipt: {item['vendor']} {item['amount']} {item['currency']} [{item['category']}]")
 
     store.set_last_run(data_dir)
-    store.write_projection(data_dir)   # regenerate xlsx (receipts) + results/expenses.json (all types)
+    store.write_projection(data_dir)   # regenerate xlsx + results/expenses.json (receipts only)
 
     # Return ONLY what THIS run newly captured. The 10-min expense poll pushes "N new receipts" to
     # Teams when items is non-empty (server.py _poll_expense_scan_all_users) — returning all stored
@@ -395,8 +395,5 @@ def run(
         "empty":    len(new_items) == 0,
     }
 
-    counts = {"receipt": 0, "invoice": 0, "contract": 0}
-    for it in new_items:
-        counts[it.get("document_type", "")] = counts.get(it.get("document_type", ""), 0) + 1
-    log(f"Expenses done — {counts['receipt']} receipt(s), {counts['invoice']} invoice(s), {counts['contract']} contract(s)")
+    log(f"Expenses done — {len(new_items)} receipt(s)")
     return result

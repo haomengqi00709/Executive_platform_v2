@@ -343,7 +343,7 @@ SECTION_IDS = {
     "meeting_action_items": "Meeting Action Items — open action items extracted from meeting recordings",
     "relationship_health":  "Relationship Health — health scores and alerts for key business contacts",
     "business_insights":    "Business Insights — AI-generated analysis of business patterns and opportunities",
-    "expenses":             "Document Capture — receipts (→ Excel), invoices, and contracts from email attachments",
+    "expenses":             "Expense Capture — reimbursable receipts from email attachments (→ reimbursement Excel)",
     "email_monitor":        "Email Monitor Triage — custom rules for classifying incoming emails as priority, review, or skip",
     "project_status":              "Project Status — portfolio view of all active projects with status and momentum",
     "projects_needing_attention":  "Projects Needing Attention — projects flagged as needs_attention or early_stage",
@@ -602,7 +602,7 @@ def reply(
         _fn  = pending_file.get("filename", "a file")
         _dt  = pending_file.get("doc_type", "file")
         _sum = pending_file.get("summary") or ""
-        _saved = " as an expense" if _dt in ("receipt", "invoice", "contract") else ""
+        _saved = " as an expense" if _dt == "receipt" else ""
         pending_note += (
             f"\n\n📎 A FILE THE USER JUST SENT is available: '{_fn}' ({_dt})"
             f"{(' — ' + _sum) if _sum else ''}. It has already been saved{_saved}. "

@@ -3818,7 +3818,7 @@ def _expense_row_id(row: dict) -> str:
 
 
 # The frontend renders capitalised Excel-style keys; the store keeps lowercase item keys. This maps a
-# store expense item → the row shape the UI already reads, plus document_type + invoice/contract fields.
+# store expense item → the row shape the UI already reads. Expenses are reimbursable receipts only.
 _EXPENSE_FIELD_MAP = {"Vendor": "vendor", "Date": "date", "Amount": "amount", "Currency": "currency",
                       "Category": "category", "GST_HST": "gst_hst", "Net_Amount": "net_amount"}
 
@@ -3826,7 +3826,7 @@ _EXPENSE_FIELD_MAP = {"Vendor": "vendor", "Date": "date", "Amount": "amount", "C
 def _expense_item_to_row(it: dict) -> dict:
     return {
         "id":             it.get("id"),
-        "document_type":  it.get("document_type", "receipt"),
+        "document_type":  "receipt",
         "Date":           it.get("date", ""),
         "Vendor":         it.get("vendor", ""),
         "Amount":         it.get("amount", ""),
@@ -3840,16 +3840,15 @@ def _expense_item_to_row(it: dict) -> dict:
         "Msg_ID":         it.get("msg_id", ""),
         "Att_ID":         it.get("att_id", ""),
         "Processed_Date": it.get("processed_at", ""),
-        "Counterparty":   it.get("counterparty", ""),
-        "Due_Date":       it.get("due_date"),
         "Subject":        it.get("subject", ""),
     }
 
 
 @app.get("/api/expenses/all")
 def get_all_expenses(session: dict = Depends(require_session)):
-    """All expenses (receipts + invoices + contracts) from the store, each with a stable id and
-    document_type. Row shape mirrors the old Excel columns so the receipt table is unchanged."""
+    """All reimbursable receipts from the store, each with a stable id. Row shape mirrors the
+    old Excel columns so the receipt table is unchanged. Invoices/contracts are no longer
+    captured (and legacy ones are purged by the store's projection)."""
     from src.modules import expenses_store
     uid = session["user_id"]
     return [_expense_item_to_row(it) for it in expenses_store.load_expenses(_udir(uid))]
